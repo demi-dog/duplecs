@@ -5,9 +5,12 @@
 # created with a workflow's GITHUB_TOKEN never trigger other workflows, so a
 # separate publish workflow on `push: tags:` would never fire.
 #
-# the whole job is gated on the RELEASE_ENABLED repository variable, so the
-# same file can sit inert in a repo that must never release (leave the
-# variable unset) while running verbatim in one that does.
+# everything past the tag is gated on the RELEASE_ENABLED repository variable,
+# so the same file can run verbatim in a repo that must never publish (leave
+# the variable unset): a push there still tags an untagged release version --
+# a ref a git dependency can pin, so a release can be consumed from git before
+# anything publishes -- but the registry publishes and the github release
+# never run.
 #
 # the job is structured to fix forward: every step checks its own work rather
 # than exiting early -- the tag-exists check skips only the tagging, and each
@@ -33,36 +36,12 @@ permissions:
 
 jobs:
   release:
-    if: ${{ vars.RELEASE_ENABLED == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install toolchain
-        uses: CompeyDev/setup-rokit@v0.2.1
-
-      - name: Install pesde
-        uses: pesde-pkg/setup@v1
-
-      # ---- the inline CI gate (mirrors ci.yml) ----
-
-      - name: Fetch jecs
-        run: lune run tests/setup.luau
-
-      - name: Run verification suite
-        run: lune run tests/verification_suite.luau
-
-      - name: Check formatting
-        run: stylua --check .
-
-      - name: Typecheck
-        run: luau-lsp analyze --flag:LuauSolverV2=true --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
-
-      - name: Typecheck (old solver)
-        run: luau-lsp analyze --flag:LuauSolverV2=false --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
-
-      # ---- the release itself ----
-
+      # resolved before the toolchain so a push with nothing to tag or publish
+      # skips everything below and costs seconds
       - name: Resolve the release version
         id: version
         run: |
@@ -78,11 +57,54 @@ jobs:
             echo "CHANGELOG.md has no [${version}] section; refusing to release v${version}" >&2
             exit 1
           fi
+          if [ -n "$(git ls-remote --tags origin "refs/tags/v${version}")" ]; then
+            echo "v${version} already exists; nothing to tag"
+            tag_exists=true
+          else
+            tag_exists=false
+          fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag_exists=${tag_exists}" >> "$GITHUB_OUTPUT"
+
+      # ---- the inline CI gate (mirrors ci.yml) ----
+      #
+      # runs whenever the push could still do something lasting: always where
+      # RELEASE_ENABLED is set (publishes fix forward even when the tag
+      # exists), and only for an untagged version where it is not -- an
+      # ordinary push in a tag-only repo skips the gate, since ci.yml already
+      # covers the push itself
+
+      - name: Install toolchain
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        uses: CompeyDev/setup-rokit@v0.2.1
+
+      - name: Fetch jecs
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        run: lune run tests/setup.luau
+
+      - name: Run verification suite
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        run: lune run tests/verification_suite.luau
+
+      - name: Check formatting
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        run: stylua --check .
+
+      - name: Typecheck
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        run: luau-lsp analyze --flag:LuauSolverV2=true --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
+
+      - name: Typecheck (old solver)
+        if: ${{ vars.RELEASE_ENABLED == 'true' || steps.version.outputs.tag_exists == 'false' }}
+        run: luau-lsp analyze --flag:LuauSolverV2=false --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
+
+      # ---- the release itself ----
 
       - name: Create the release tag
+        if: ${{ steps.version.outputs.tag_exists == 'false' }}
         run: |
           tag="v${{ steps.version.outputs.version }}"
+          # re-checked in case a concurrent run tagged since the resolve step
           if [ -n "$(git ls-remote --tags origin "refs/tags/${tag}")" ]; then
             echo "${tag} already exists; skipping the tagging"
           else
@@ -91,9 +113,15 @@ jobs:
           fi
 
       # each publish step checks its own registry, so a rerun after a partial
-      # failure publishes exactly what is missing and nothing twice
+      # failure publishes exactly what is missing and nothing twice; all of it
+      # runs only where RELEASE_ENABLED is set
+
+      - name: Install pesde
+        if: ${{ vars.RELEASE_ENABLED == 'true' }}
+        uses: pesde-pkg/setup@v1
 
       - name: Publish to pesde
+        if: ${{ vars.RELEASE_ENABLED == 'true' }}
         run: |
           version="${{ steps.version.outputs.version }}"
           if grep -q '^private = true' pesde.toml; then
@@ -118,6 +146,7 @@ jobs:
           pesde publish -y
 
       - name: Publish to wally
+        if: ${{ vars.RELEASE_ENABLED == 'true' }}
         run: |
           if grep -q '^private = true' wally.toml; then
             echo "wally.toml carries private = true; tag-only release, skipping the wally publish"
@@ -153,6 +182,7 @@ jobs:
           exit 1
 
       - name: Attach the studio rbxm to the GitHub release
+        if: ${{ vars.RELEASE_ENABLED == 'true' }}
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
