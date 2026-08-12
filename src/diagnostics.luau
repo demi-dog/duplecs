@@ -37,9 +37,11 @@ end
 
 -- renders one id under the convention above. everything here runs only while composing a warn/error message,
 -- so it deliberately calls the jecs originals -- don't "deduplicate" server.luau's inlined hot-path id-math
--- mirrors into this module (see the mirrors' comment there). world is optional: pass the id's own world to
--- verify liveness and gen-qualify pair halves; omit it for ids no world can vouch for (wire and server ids).
-local function id_to_string(id: number, world: World?): string
+-- mirrors into this module (see the mirrors' comment there). id takes jecs's branded id types and plain
+-- numbers alike (every id is a number at runtime), so call sites don't cast. world is optional: pass the
+-- id's own world to verify liveness and gen-qualify pair halves; omit it for ids no world can vouch for
+-- (wire and server ids).
+local function id_to_string(id: unknown, world: World?): string
 	if jecs.IS_PAIR(id :: any) then
 		local relation_dense = jecs.ECS_PAIR_FIRST(id :: any)
 		local target_dense = jecs.ECS_PAIR_SECOND(id :: any)

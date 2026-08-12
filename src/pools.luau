@@ -89,7 +89,7 @@ return function()
 		if removed then
 			release_scratch(removed)
 		end
-		table.clear(run :: any)
+		table.clear(run)
 		run_pool_count += 1
 		run_pool[run_pool_count] = run
 	end

@@ -39,7 +39,7 @@ return function(world: types.World)
 		if id == Serdes then
 			return entity
 		end
-		return pair(entity, jecs.ECS_PAIR_SECOND(id) :: any)
+		return pair(entity, jecs.ECS_PAIR_SECOND(id))
 	end
 
 	-- tag-ness of one key, matching how jecs types a pair's data: the relation carries the value unless it is a
@@ -60,28 +60,25 @@ return function(world: types.World)
 		local key = serdes_key(entity, id)
 		if serdes ~= nil and is_tag_key(entity, id) then
 			world:remove(entity, id)
-			fail(`serdes hooks cannot be assigned to tags! ({id_to_string(key :: any, world)})`)
+			fail(`serdes hooks cannot be assigned to tags! ({id_to_string(key, world)})`)
 		end
 		if serdes ~= nil then
-			local hooks = serdes :: any
-			if type(hooks.encode) ~= "function" or type(hooks.decode) ~= "function" then
+			if type(serdes.encode) ~= "function" or type(serdes.decode) ~= "function" then
 				world:remove(entity, id)
-				fail(`serdes registrations must provide encode and decode hooks! ({id_to_string(key :: any, world)})`)
+				fail(`serdes registrations must provide encode and decode hooks! ({id_to_string(key, world)})`)
 			end
 			-- sizing runs through encode's buffers; size only ever declares a static byte length
-			if hooks.size ~= nil and type(hooks.size) ~= "number" then
+			if serdes.size ~= nil and type(serdes.size) ~= "number" then
 				world:remove(entity, id)
 				fail(
-					`serdes size must be a static byte length (a plain number) when present! ({id_to_string(
-						key :: any,
-						world
-					)})`
+					`serdes size must be a static byte length (a plain number) when present! ({id_to_string(key, world)})`
 				)
 			end
 			-- frozen like Private values: the store caches by reference, so a registration mutated after assignment
-			-- can't silently change wire behavior
-			if table.isfrozen(hooks) ~= true then
-				table.freeze(hooks)
+			-- can't silently change wire behavior. the cast keeps the new solver from refining serdes read-only
+			-- here, which the store's read-write value type below would reject
+			if table.isfrozen(serdes) ~= true then
+				table.freeze(serdes :: any)
 			end
 		end
 		serdes_hooks[key] = serdes

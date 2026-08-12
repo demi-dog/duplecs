@@ -45,12 +45,12 @@ type RemovedCallback<T> = (entity: Entity, id: Id<T>, delete: boolean?) -> ()
 -- the unpaired id's component record, or nil while the id has never been added to an entity -- in which case
 -- there is nothing to repair, since the record jecs creates later reads the hook off the component itself
 local function unpaired_record<T>(world: World, component: Component<T>): jecs.ComponentRecord?
-	return jecs.component_record(world, component :: any)
+	return jecs.component_record(world, component)
 end
 
 local function added<T>(world: World, component: Component<T>, callback: ValueCallback<T>): () -> ()
 	local previous = world:get(component, jecs.OnAdd)
-	local disconnect = world:added(component, callback :: any)
+	local disconnect = world:added(component, callback)
 
 	local broadcast = world:get(component, jecs.OnAdd)
 	if broadcast ~= previous then
@@ -65,7 +65,7 @@ end
 
 local function changed<T>(world: World, component: Component<T>, callback: ValueCallback<T>): () -> ()
 	local previous = world:get(component, jecs.OnChange)
-	local disconnect = world:changed(component, callback :: any)
+	local disconnect = world:changed(component, callback)
 
 	local broadcast = world:get(component, jecs.OnChange)
 	if broadcast ~= previous then
@@ -80,7 +80,7 @@ end
 
 local function removed<T>(world: World, component: Component<T>, callback: RemovedCallback<T>): () -> ()
 	local previous = world:get(component, jecs.OnRemove)
-	local disconnect = world:removed(component, callback :: any)
+	local disconnect = world:removed(component, callback)
 
 	local broadcast = world:get(component, jecs.OnRemove)
 	if broadcast ~= previous then

@@ -51,6 +51,7 @@ type Entity = types.Entity
 type Component<T = any> = types.Component<T>
 type Id<T = any> = types.Id<T>
 type Packet = types.Packet
+type Serdes<T = any> = types.Serdes<T>
 
 export type ChangedOverride<T = any> = (Entity, T) -> ()
 export type RemovedOverride = (Entity) -> ()
@@ -71,7 +72,12 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- GENERAL FUNCTIONS
 
-	local dense = (jecs.ECS_ID :: any) :: (entity_gen: number) -> number
+	-- retyped views of two jecs id-math originals, following names.luau's dense: they take branded ids and
+	-- plain numbers alike (every id is a number at runtime) and return the plain-number domain their call
+	-- sites compare in, so the call sites don't cast. neither sits on the per-cell reconcile loops, so they
+	-- call the jecs originals rather than mirroring the id math the way server.luau's hot paths do.
+	local dense = (jecs.ECS_ID :: any) :: (entity_gen: unknown) -> number
+	local ECS_PAIR_SECOND = (jecs.ECS_PAIR_SECOND :: any) :: (id: unknown) -> number
 
 	-- jecs never replaces this container on a live world (unlike world.archetypes, which world:cleanup
 	-- rebuilds), so the sweep's record walks share one fetch
@@ -94,7 +100,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- dense server ids already reported for arriving unmapped (see warn_unmapped): one warning per id per
 	-- unmapped stretch rather than one per section, cleared when the id maps so a later regression warns anew.
-	local skip_warned = {} :: { [number]: true }
+	local unmapped_warned = {} :: { [number]: true }
 
 	-- wire-facing: server_entity is a dense id straight off the wire
 	local function get_client_entity_from_dense(server_entity: number): Entity?
@@ -105,7 +111,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		local dense_id = dense(server_entity_gen)
 		client_entity_map[dense_id] = client_entity
 		server_entity_map[client_entity] = server_entity_gen
-		skip_warned[dense_id] = nil
+		unmapped_warned[dense_id] = nil
 		world:add(client_entity, Imported)
 	end
 
@@ -122,10 +128,10 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- afterward), so silence would hide the bug indefinitely. the unreliable path stays silent instead: chunks
 	-- legitimately outrun the reliable packet that maps their ids (see reconcile_chunk).
 	local function warn_unmapped(dense_id: number, role: string)
-		if skip_warned[dense_id] ~= nil then
+		if unmapped_warned[dense_id] ~= nil then
 			return
 		end
-		skip_warned[dense_id] = true
+		unmapped_warned[dense_id] = true
 		warn(
 			`a received section's {role} (server {id_to_string(dense_id)}) has no client mapping! its cells were skipped -- map the id before the server first references it: give the matching client entity the shared jecs.Name, or map it with set_client_entity at startup`
 		)
@@ -243,16 +249,11 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	local function on_imported_added(client_entity: Entity, id: Id)
 		if id ~= Imported then
 			world:remove(client_entity, id)
-			fail(`Imported is not meant to be paired! ({id_to_string(client_entity :: any, world)})`)
+			fail(`Imported is not meant to be paired! ({id_to_string(client_entity, world)})`)
 		end
 		if not get_server_entity(client_entity) then
 			world:remove(client_entity, Imported)
-			fail(
-				`Imported cannot be added to entities with no server mapping! ({id_to_string(
-					client_entity :: any,
-					world
-				)})`
-			)
+			fail(`Imported cannot be added to entities with no server mapping! ({id_to_string(client_entity, world)})`)
 		end
 	end
 
@@ -324,19 +325,19 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	end
 
 	hooks.added(world, jecs.Name, function(client_entity: Entity, id: Id, name: unknown)
-		if id == (jecs.Name :: any) then
+		if id == jecs.Name then
 			index_name(client_entity, name)
 		end
 	end)
 
 	hooks.changed(world, jecs.Name, function(client_entity: Entity, id: Id, name: unknown)
-		if id == (jecs.Name :: any) then
+		if id == jecs.Name then
 			index_name(client_entity, name)
 		end
 	end)
 
 	hooks.removed(world, jecs.Name, function(client_entity: Entity, id: Id)
-		if id == (jecs.Name :: any) then
+		if id == jecs.Name then
 			deindex_name(client_entity)
 		end
 	end)
@@ -470,7 +471,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- removals are collected before any is applied, since applying moves subjects between archetypes under
 	-- the walk.
 	function sweep_imported_cells(client_target: Entity)
-		local target_dense = dense(client_target :: any)
+		local target_dense = dense(client_target)
 		local subjects: { Entity } = {}
 		local cell_ids: { Id } = {}
 		local count = 0
@@ -484,7 +485,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- not contiguous in types (pair ids pack relation-major, and types is sorted by id), so unlike the
 		-- relation-wildcard walk below this scans each archetype's types, with the record's count as an early
 		-- exit once every targeting pair has been seen.
-		local idr_target = component_index[pair(jecs.Wildcard, client_target) :: any]
+		local idr_target = component_index[pair(jecs.Wildcard, client_target)]
 		if idr_target ~= nil then
 			local target_counts = idr_target.counts
 			for archetype_id in idr_target.records do
@@ -495,14 +496,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				end
 				local remaining = target_counts[archetype_id]
 				for _, id in archetype.types do
-					if jecs.IS_PAIR(id :: any) and (jecs.ECS_PAIR_SECOND(id :: any) :: any) == target_dense then
-						local relation = jecs.pair_first(world, id :: any)
-						if server_entity_map[relation :: any] ~= nil then
+					if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
+						local relation = jecs.pair_first(world, id)
+						if server_entity_map[relation] ~= nil then
 							for _, subject in entities do
-								if server_entity_map[subject :: any] ~= nil then
+								if server_entity_map[subject] ~= nil then
 									count += 1
-									subjects[count] = subject :: any
-									cell_ids[count] = id :: any
+									subjects[count] = subject
+									cell_ids[count] = id
 								end
 							end
 						end
@@ -520,7 +521,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- mapping ended just before this sweep, so the target check must allow the entity itself alongside
 		-- imported targets -- which also collects a self-targeting pair exactly once, the walk above having
 		-- skipped it for its no-longer-imported relation.
-		local idr_relation = component_index[pair(client_target, jecs.Wildcard) :: any]
+		local idr_relation = component_index[pair(client_target, jecs.Wildcard)]
 		if idr_relation ~= nil then
 			local relation_counts = idr_relation.counts
 			for archetype_id, slice_start in idr_relation.records do
@@ -532,16 +533,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				local archetype_types = archetype.types
 				for i = slice_start, slice_start + relation_counts[archetype_id] - 1 do
 					local id = archetype_types[i]
-					local pair_target = jecs.pair_second(world, id :: any)
-					if
-						(pair_target :: any) == (client_target :: any)
-						or server_entity_map[pair_target :: any] ~= nil
-					then
+					-- cast: jecs.pair_second's return is Component<unknown>, unrelated to Entity either way
+					local pair_target: Entity = jecs.pair_second(world, id) :: any
+					if pair_target == client_target or server_entity_map[pair_target] ~= nil then
 						for _, subject in entities do
-							if server_entity_map[subject :: any] ~= nil then
+							if server_entity_map[subject] ~= nil then
 								count += 1
-								subjects[count] = subject :: any
-								cell_ids[count] = id :: any
+								subjects[count] = subject
+								cell_ids[count] = id
 							end
 						end
 					end
@@ -550,14 +549,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		-- unpaired cells using the entity as the component
-		local idr_unpaired = component_index[client_target :: any]
+		local idr_unpaired = component_index[client_target]
 		if idr_unpaired ~= nil then
 			for archetype_id in idr_unpaired.records do
 				for _, subject in world_archetypes[archetype_id].entities do
-					if server_entity_map[subject :: any] ~= nil then
+					if server_entity_map[subject] ~= nil then
 						count += 1
-						subjects[count] = subject :: any
-						cell_ids[count] = client_target :: any
+						subjects[count] = subject
+						cell_ids[count] = client_target
 					end
 				end
 			end
@@ -610,11 +609,12 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				local serdes = resolve_serdes(component, relation)
 				if serdes == nil then
 					fail(
-						`received serialized values for {id_to_string(component :: any, world)} but no serdes hooks are assigned!`
+						`received serialized values for {id_to_string(component, world)} but no serdes hooks are assigned!`
 					)
 				end
-				local hooks = serdes :: any
-				local decode = hooks.decode
+				-- cast: fail never returns, but the solver doesn't treat user functions as diverging
+				local serdes_hooks = serdes :: Serdes
+				local decode = serdes_hooks.decode
 				-- ids and values advance in lockstep: ids at offset, values past them. each value decodes from a fresh
 				-- value-sized buffer, its length read off the u16 prefix unless the registration declares a static size;
 				-- unmapped entities hop the value by its length without decoding it. decode runs under pcall: the
@@ -622,7 +622,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				-- keeping the stream aligned for the rest of the packet, which a mid-reconcile unwind would lose
 				-- unrecoverably (deltas are exactly-once and applied entries aren't safely re-appliable) -- with one
 				-- warning per list carrying the first error
-				local static: number? = hooks.size
+				local static: number? = serdes_hooks.size
 				local value_offset = offset + ids_count * id_width
 				local skipped = 0
 				local first_error: any = nil
@@ -682,7 +682,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				offset = value_offset
 				if skipped > 0 then
 					warn(
-						`a serdes decode hook threw while decoding {id_to_string(component :: any, world)}! {skipped} value(s) were skipped and their cells will not update until they next change server-side: {first_error}`
+						`a serdes decode hook threw while decoding {id_to_string(component, world)}! {skipped} value(s) were skipped and their cells will not update until they next change server-side: {first_error}`
 					)
 				end
 			else
@@ -918,18 +918,19 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			local serdes = resolve_serdes(component, relation)
 			if serdes == nil then
 				fail(
-					`received serialized values for {id_to_string(component :: any, world)} but no serdes hooks are assigned!`
+					`received serialized values for {id_to_string(component, world)} but no serdes hooks are assigned!`
 				)
 			end
-			local hooks = serdes :: any
-			local decode = hooks.decode
+			-- cast: fail never returns, but the solver doesn't treat user functions as diverging
+			local serdes_hooks = serdes :: Serdes
+			local decode = serdes_hooks.decode
 			-- ids and values advance in lockstep: ids at offset, values past them. each value decodes from a fresh
 			-- value-sized buffer, its length read off the u16 prefix unless the registration declares a static size;
 			-- skipped entities hop the value by its length without decoding it. decode runs under pcall like
 			-- apply_lists': a throwing hook skips exactly its own value with a warning -- a poisoned value would
 			-- otherwise error every chunk carrying it, taking the whole unreliable channel down until the value
 			-- changes -- and chunks are self-healing frame to frame, so the skipped cell is only stale, never lost
-			local static: number? = hooks.size
+			local static: number? = serdes_hooks.size
 			local value_offset = offset + ids_count * id_width
 			local skipped = 0
 			local first_error: any = nil
@@ -989,7 +990,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			offset = value_offset
 			if skipped > 0 then
 				warn(
-					`a serdes decode hook threw while decoding {id_to_string(component :: any, world)}! {skipped} value(s) were skipped from this chunk; they re-send next frame: {first_error}`
+					`a serdes decode hook threw while decoding {id_to_string(component, world)}! {skipped} value(s) were skipped from this chunk; they re-send next frame: {first_error}`
 				)
 			end
 		end

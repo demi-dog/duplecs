@@ -35,15 +35,15 @@ type Entity = types.Entity
 
 -- the generation-stripping jecs.ECS_ID, under the name its call sites use. every path here runs at schema-edit
 -- rate or once per packet call, so it calls the jecs original rather than mirroring the id math the way
--- server.luau's hot paths do.
-local dense = (jecs.ECS_ID :: any) :: (entity_gen: number) -> number
+-- server.luau's hot paths do. like the mirrors, it takes branded ids and plain numbers alike.
+local dense = (jecs.ECS_ID :: any) :: (entity_gen: unknown) -> number
 
 return function(world: World, warn: (message: string) -> ())
 	-- the announced set, keyed by dense id: names holds each announced name, ids the gen-qualified id it was
 	-- announced under, and staged the transitions since the last drain (see the module comment for the states).
 	local names = {} :: { [number]: string }
-	local ids = {} :: { [number]: number }
-	local staged = {} :: { [number]: true | number }
+	local ids = {} :: { [number]: Entity }
+	local staged = {} :: { [number]: true | Entity }
 
 	local function announce(entity: Entity)
 		local name = world:get(entity, jecs.Name)
@@ -51,18 +51,18 @@ return function(world: World, warn: (message: string) -> ())
 			return
 		end
 		if #name == 0 then
-			warn(`shared names must not be empty! ({id_to_string(entity :: any, world)})`)
+			warn(`shared names must not be empty! ({id_to_string(entity, world)})`)
 			return
 		end
 		if #name > 255 then
-			warn(`shared names must be at most 255 bytes! ({id_to_string(entity :: any, world)})`)
+			warn(`shared names must be at most 255 bytes! ({id_to_string(entity, world)})`)
 			return
 		end
-		local dense_id = dense(entity :: any)
-		if ids[dense_id] == (entity :: any) and names[dense_id] == name then
+		local dense_id = dense(entity)
+		if ids[dense_id] == entity and names[dense_id] == name then
 			return
 		end
-		ids[dense_id] = entity :: any
+		ids[dense_id] = entity
 		names[dense_id] = name
 		staged[dense_id] = true
 	end
@@ -84,7 +84,7 @@ return function(world: World, warn: (message: string) -> ())
 
 	-- the gen-qualified id currently announced under a dense id, nil when nothing is: what the callers whose
 	-- retraction depends on *which* tenant holds the announcement test against.
-	local function announced_id(dense_id: number): number?
+	local function announced_id(dense_id: number): Entity?
 		return ids[dense_id]
 	end
 
@@ -95,7 +95,7 @@ return function(world: World, warn: (message: string) -> ())
 	-- the whole live set as (gen-qualified id -> name), for a joiner's full packet
 	local function collect_live(collected: { [number]: string })
 		for dense_id, name in names do
-			collected[ids[dense_id]] = name
+			collected[ids[dense_id] :: any] = name
 		end
 	end
 
@@ -110,9 +110,9 @@ return function(world: World, warn: (message: string) -> ())
 		if collected ~= nil then
 			for dense_id, state in staged do
 				if state == true then
-					collected[ids[dense_id]] = names[dense_id]
+					collected[ids[dense_id] :: any] = names[dense_id]
 				else
-					collected[state :: number] = ""
+					collected[state :: any] = ""
 				end
 			end
 		end

@@ -26,7 +26,7 @@ local fail = diagnostics.fail
 local id_to_string = diagnostics.id_to_string
 
 -- private frozen-table sentinel marking a cell that is present on the entity but holds no value (a tag, or a
--- value of nil), distinct from an absent entry in a StagedValues table. compared only by table identity,
+-- value of nil), distinct from an absent entry in a ChangedValues table. compared only by table identity,
 -- never against the string "_nulled", so a component whose legitimate value happens to be that string can't
 -- be misrouted into a packet's nulled list. the sentinel itself never crosses the wire (nulled cells travel
 -- in their own list), so only these internal comparisons ever observe it.
@@ -66,24 +66,27 @@ local max_chunk_bytes = wire.max_chunk_bytes
 
 -- JECS ID MATH MIRRORS (so the compiler inlines)
 
+-- the parameters take jecs's branded id types (and plain numbers) directly -- every id is a number at
+-- runtime -- so the call sites don't cast per call; the one number assertion lives inside each mirror.
+
 local ECS_ENTITY_MASK = 2 ^ 24
 local ECS_PAIR_OFFSET = 2 ^ 48
 
-local function IS_PAIR(id: number): boolean
-	return id > ECS_PAIR_OFFSET
+local function IS_PAIR(id: unknown): boolean
+	return (id :: number) > ECS_PAIR_OFFSET
 end
 
-local function ECS_PAIR_FIRST(id: number): number
-	return (id - ECS_PAIR_OFFSET) // ECS_ENTITY_MASK
+local function ECS_PAIR_FIRST(id: unknown): number
+	return ((id :: number) - ECS_PAIR_OFFSET) // ECS_ENTITY_MASK
 end
 
-local function ECS_PAIR_SECOND(id: number): number
-	return (id - ECS_PAIR_OFFSET) % ECS_ENTITY_MASK
+local function ECS_PAIR_SECOND(id: unknown): number
+	return ((id :: number) - ECS_PAIR_OFFSET) % ECS_ENTITY_MASK
 end
 
 -- the generation-stripping jecs.ECS_ID, under the name its server call sites use
-local function dense(id: number): number
-	return id % ECS_ENTITY_MASK
+local function dense(id: unknown): number
+	return (id :: number) % ECS_ENTITY_MASK
 end
 
 -- TYPES
@@ -98,7 +101,7 @@ type Id<T = any> = types.Id<T>
 type Client = types.Client
 type Packet = types.Packet
 
-type StagedValues = { [Entity]: _Nulled | unknown }
+type ChangedValues = { [Entity]: _Nulled | unknown }
 
 -- one node of the mask trie: children keyed by run (word + shard * 2^32), appended in ascending shard order
 -- with zero words skipped, so a cell's cross-shard visibility resolves to exactly one node. contents are
@@ -142,7 +145,7 @@ type PacketGroup = {
 	is_tag: boolean,
 	relation: number?,
 	targets: { number }?,
-	pair_rows: { [number]: { [Entity]: number } }?,
+	pair_rows: { [Id]: { [Entity]: number } }?,
 }
 
 -- accumulation shape shared by full_packet and the bucket pass, encoded into one section of the packet buffer
@@ -152,6 +155,7 @@ type PacketGroup = {
 -- left by reference and is never pooled.
 type SectionDraft = wire.SectionDraft
 
+-- bit-packed number where each bit represents the visibility to the client allocated to that bit.
 type VisibilityMask = number
 
 -- per-shard mask words, sparse: a missing shard's word is 0.
@@ -159,7 +163,7 @@ type ShardMasks = { [number]: VisibilityMask }
 
 -- one shard's visibility tree: mask words keyed [component][entity]. the next_visibilities /
 -- last_visibilities stores hold one per occupied shard.
-type ShardVisibility = { [Id]: { [Entity]: VisibilityMask } }
+type ShardVisibilities = { [Id]: { [Entity]: VisibilityMask } }
 
 -- one privacy filter (see types.luau for the polarity rules)
 type Privacy = types.Privacy
@@ -200,8 +204,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local component_index = world.component_index
 
 	local function get_components(entity_gen: Entity): { Id }
-		local dense_id = dense(entity_gen :: any)
-		return entity_index.sparse_array[dense_id].archetype.types :: any
+		local dense_id = dense(entity_gen)
+		return entity_index.sparse_array[dense_id].archetype.types
 	end
 
 	local function no_targets(): Entity?
@@ -216,8 +220,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- the slice is snapshotted up front where world:target reads live state per index; no caller moves the
 	-- entity mid-iteration. like world:target, a dead target resolves to nil and ends the caller's loop.
 	local function each_target(entity: Entity, relation: Id): () -> Entity?
-		local record = entity_index.sparse_array[dense(entity :: any)]
-		local idr = component_index[pair(relation, jecs.Wildcard) :: any]
+		local record = entity_index.sparse_array[dense(entity)]
+		local idr = component_index[pair(relation, jecs.Wildcard)]
 		if record == nil or idr == nil then
 			return no_targets
 		end
@@ -235,7 +239,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 			local pair_id = archetype_types[index]
 			index += 1
-			return jecs.entity_index_get_alive(entity_index :: any, ECS_PAIR_SECOND(pair_id :: any) :: any) :: any
+			return jecs.entity_index_get_alive(entity_index :: any, ECS_PAIR_SECOND(pair_id)) :: any
 		end
 	end
 
@@ -294,8 +298,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- briefly name the dying target, but its replicated / named mirrors clear before their hooks restage, so
 	-- eligibility still resolves false. deindexing a target's last pair moves its entry to retired_target_gens,
 	-- which the resolve passes read for gone targets and generate_packets clears once those passes finish.
-	local tracked_target_gens = {} :: { [number]: number }
-	local retired_target_gens = {} :: { [number]: number }
+	local tracked_target_gens = {} :: { [number]: Entity }
+	local retired_target_gens = {} :: { [number]: Entity }
 
 	-- latest privacy filter of every Private cell, keyed [entity][key]: key is the paired component, or
 	-- Existence for an un-paired Private, which gates the entire entity above the per-component filters. a
@@ -383,13 +387,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- covering that shard's 32 clients -- while staged values stay client-agnostic, keyed [component][entity]
 	-- (values are staged once per change no matter how many shards can see the cell). next_visibilities: current
 	-- masks of cells whose visibility changed this frame (presence is the dirty flag); last_visibilities: masks
-	-- last sent, diffed against at packet generation; component_changes: staged values of changed cells visible
+	-- last sent, diffed against at packet generation; changed_values: staged values of changed cells visible
 	-- to someone. rule: next ?? last must *always* reflect the current visibility. entity existence is itself a
 	-- cell keyed by Existence (a present 0 is a pending delete): a bit gained is a create, a bit cleared is a
 	-- delete.
-	local next_visibilities = {} :: { [number]: ShardVisibility }
-	local last_visibilities = {} :: { [number]: ShardVisibility }
-	local component_changes = {} :: { [Id]: StagedValues }
+	local next_visibilities = {} :: { [number]: ShardVisibilities }
+	local last_visibilities = {} :: { [number]: ShardVisibilities }
+	local changed_values = {} :: { [Id]: ChangedValues }
 
 	-- VISIBILITY CHECKERS
 
@@ -402,18 +406,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- jecs.pair_first/pair_second: every pair that reaches here is indexed, so a missing entry is a dead half or
 	-- an untracked relation -- ineligible either way.
 	local function resolve_component_eligibility(component: Id): (boolean, Id, Entity?)
-		if IS_PAIR(component :: any) then
-			local target = tracked_target_gens[ECS_PAIR_SECOND(component :: any)]
-			if target == nil or is_pair_target_replicable(target :: any) ~= true then
+		if IS_PAIR(component) then
+			local target = tracked_target_gens[ECS_PAIR_SECOND(component)]
+			if target == nil or is_pair_target_replicable(target) ~= true then
 				return false, component, nil
 			end
 
-			local relation = tracked_relation_gens[ECS_PAIR_FIRST(component :: any)]
+			local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
 			if relation == nil then
 				return false, component, nil
 			end
 
-			return true, relation, target :: any
+			return true, relation, target
 		end
 
 		if tracked_by[component] == nil then
@@ -428,11 +432,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- id (the hooks branch on id == component first, and the catch-up walks construct theirs), and an unpaired
 	-- id's low bits would misread as a target.
 	local function is_pair_replicable(pair_id: Id)
-		local target = tracked_target_gens[ECS_PAIR_SECOND(pair_id :: any)]
+		local target = tracked_target_gens[ECS_PAIR_SECOND(pair_id)]
 		if target == nil then
 			return false
 		end
-		return is_pair_target_replicable(target :: any)
+		return is_pair_target_replicable(target)
 	end
 
 	-- the entity-level allow words gating an entity, nil when unrestricted: the derived effective words when it
@@ -503,32 +507,32 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- CHANGE STAGING
 
-	local function get_component_changes(component: Id): StagedValues
-		local storage = component_changes[component]
+	local function get_changed_values(component: Id): ChangedValues
+		local storage = changed_values[component]
 		if storage == nil then
 			storage = {}
-			component_changes[component] = storage
+			changed_values[component] = storage
 		end
 		return storage
 	end
 
 	local function get_next_visibility(shard: number, component: Id): { [Entity]: VisibilityMask }
-		local shard_next = next_visibilities[shard]
-		if shard_next == nil then
-			shard_next = {}
-			next_visibilities[shard] = shard_next
+		local shard_next_visibilities = next_visibilities[shard]
+		if shard_next_visibilities == nil then
+			shard_next_visibilities = {}
+			next_visibilities[shard] = shard_next_visibilities
 		end
-		local visibility = shard_next[component]
+		local visibility = shard_next_visibilities[component]
 		if visibility == nil then
 			visibility = {}
-			shard_next[component] = visibility
+			shard_next_visibilities[component] = visibility
 		end
 		return visibility
 	end
 
 	local function last_visibility_of(shard: number, component: Id, entity: Entity): VisibilityMask
-		local shard_last = last_visibilities[shard]
-		local last = if shard_last then shard_last[component] else nil
+		local shard_last_visibilities = last_visibilities[shard]
+		local last = if shard_last_visibilities then shard_last_visibilities[component] else nil
 		return if last then last[entity] or 0 else 0
 	end
 
@@ -538,12 +542,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- instead.
 	local function set_visibility(shard: number, component: Id, entity: Entity, cur: VisibilityMask)
 		if cur == last_visibility_of(shard, component, entity) then
-			local shard_next = next_visibilities[shard]
-			local visibility = if shard_next then shard_next[component] else nil
+			local shard_next_visibilities = next_visibilities[shard]
+			local visibility = if shard_next_visibilities then shard_next_visibilities[component] else nil
 			if visibility then
 				visibility[entity] = nil
 				if next(visibility) == nil then
-					(shard_next :: any)[component] = nil
+					(shard_next_visibilities :: any)[component] = nil
 				end
 			end
 		else
@@ -600,11 +604,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- hit. a present entry is always a nonzero word: the resolve merges and the freed-slot sweep all prune
 	-- entries that zero.
 	local function stage_value(component: Id, entity: Entity, value: any)
-		for _, shard_last in last_visibilities do
-			local last = shard_last[component]
+		for _, shard_last_visibilities in last_visibilities do
+			local last = shard_last_visibilities[component]
 			if last ~= nil then
 				if last[entity] ~= nil then
-					get_component_changes(component)[entity] = value
+					get_changed_values(component)[entity] = value
 					return
 				end
 			end
@@ -620,7 +624,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 			set_visibility(shard, component, entity, 0)
 		end
-		local storage = component_changes[component]
+		local storage = changed_values[component]
 		if storage then
 			storage[entity] = nil
 		end
@@ -636,8 +640,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local shard = shard_of(client_index)
 		-- next ?? last is the cell's current mask (see the staging rule), sparing a fresh resolve-and-word-math
 		-- recompute. a present 0 means a pending hide, so distinguish it from an absent entry before falling back.
-		local shard_next = next_visibilities[shard]
-		local next_visibility = if shard_next then shard_next[component] else nil
+		local shard_next_visibilities = next_visibilities[shard]
+		local next_visibility = if shard_next_visibilities then shard_next_visibilities[component] else nil
 		local staged = if next_visibility then next_visibility[entity] else nil
 		local mask = if staged ~= nil then staged else last_visibility_of(shard, component, entity)
 		return bit32.band(mask, slot_bit_of(client_index)) ~= 0
@@ -670,12 +674,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	-- enumerator core of the two client walks below: yields each client whose bit is set in the entity's
-	-- existence words, shard by shard -- the slot -> client reverse walk of the point queries above. staged
+	-- existence words, shard by shard -- the slot -> client reverse walk of the point queries above. use_staged
 	-- picks the current mask (next ?? last, is_entity_visible's read) over the last-sent one
 	-- (was_entity_visible's). each shard's word resolves as the walk reaches it, banded with the allocated word --
 	-- freed slots' stale marks linger in the persistent masks until reuse, and a swept bit must not enumerate a
 	-- departed client -- so a set bit always resolves through clients_by_index.
-	local function clients_seeing_iterator(entity: Entity, staged: boolean): () -> Client?
+	local function clients_seeing_iterator(entity: Entity, use_staged: boolean): () -> Client?
 		local shard = 0
 		local base_index = 0
 		local word = 0
@@ -690,9 +694,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					continue
 				end
 				local mask: VisibilityMask
-				if staged then
-					local shard_next = next_visibilities[shard]
-					local next_visibility = if shard_next then shard_next[Existence] else nil
+				if use_staged then
+					local shard_next_visibilities = next_visibilities[shard]
+					local next_visibility = if shard_next_visibilities then shard_next_visibilities[Existence] else nil
 					local staged_mask = if next_visibility then next_visibility[entity] else nil
 					mask = if staged_mask ~= nil then staged_mask else last_visibility_of(shard, Existence, entity)
 				else
@@ -746,19 +750,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local networked_cleanup = {} :: { [Component]: { () -> () } }
 
 	local function index_tracked_pair(pair_id: Id)
-		local target = ECS_PAIR_SECOND(pair_id :: any)
+		local target = ECS_PAIR_SECOND(pair_id)
 		local bucket = tracked_pairs_by_target[target]
 		if bucket == nil then
 			bucket = {}
 			tracked_pairs_by_target[target] = bucket
-			local target_gen = jecs.pair_second(world, pair_id)
+			local target_gen: Entity = jecs.pair_second(world, pair_id) :: any
 			if (target_gen :: any) ~= 0 then
 				-- capture the gen-qualified id while the target is alive, for removals that resolve after its death
-				tracked_target_gens[target] = target_gen :: any
+				tracked_target_gens[target] = target_gen
 				-- the target's first tracked pair: a named, unreplicated target is a shared definition clients should map
 				-- by name (replicated targets map through their creation entry instead)
-				if replicated_entities[target_gen :: any] == nil then
-					shared_names.announce(target_gen :: any)
+				if replicated_entities[target_gen] == nil then
+					shared_names.announce(target_gen)
 				end
 			end
 		end
@@ -766,7 +770,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	local function deindex_tracked_pair(pair_id: Id)
-		local target = ECS_PAIR_SECOND(pair_id :: any)
+		local target = ECS_PAIR_SECOND(pair_id)
 		local bucket = tracked_pairs_by_target[target]
 		if bucket == nil then
 			return
@@ -791,7 +795,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- the target's last tracked pair is gone: withdraw its announced name unless it is also a tracked
 				-- component definition
 				local announced = shared_names.announced_id(target)
-				if announced ~= nil and tracked_by[announced :: any] == nil then
+				if announced ~= nil and tracked_by[announced] == nil then
 					shared_names.retract(target)
 				end
 			end
@@ -808,7 +812,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if tag == NetworkedUnreliable then
 			networked_unreliable[component] = true
 		end
-		local dense_id = dense(component :: any)
+		local dense_id = dense(component)
 		tracked_relation_gens[dense_id] = component
 		tracked_relation_tags[dense_id] = jecs.is_tag(world, component)
 
@@ -851,8 +855,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					-- mirrors clear), so this keeps the live pair_second death check. a client that never imported the
 					-- target (a name-mapped one) has nothing else removing the cells locally, and the target's prior
 					-- replicability is unknowable here -- staging a pair that was never visible is a no-op
-					local target = jecs.pair_second(world, id)
-					if (target :: any) == 0 or is_pair_target_replicable(target :: any) then
+					local target: Entity = jecs.pair_second(world, id) :: any
+					if (target :: any) == 0 or is_pair_target_replicable(target) then
 						stage_removed(id, entity)
 					end
 					return
@@ -898,7 +902,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		tracked_by[component] = nil
 		networked_unreliable[component] = nil
-		local dense_id = dense(component :: any)
+		local dense_id = dense(component)
 		-- retire the gen until the next generate_packets: the removals staged above resolve later, when the
 		-- relation may be dead and the live resolve could no longer name it on the wire
 		retired_relation_gens[dense_id] = tracked_relation_gens[dense_id]
@@ -907,7 +911,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- withdraw the announced name unless the definition doubles as a named pair target of another tracked
 		-- relation
-		if shared_names.announced_id(dense_id) == (component :: any) and tracked_pairs_by_target[dense_id] == nil then
+		if shared_names.announced_id(dense_id) == component and tracked_pairs_by_target[dense_id] == nil then
 			shared_names.retract(dense_id)
 		end
 	end
@@ -923,7 +927,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function guard_networked_added(component: Component, id: Id, tag: Component, tag_name: string)
 		if id ~= tag then
 			world:remove(component, id)
-			fail(`{tag_name} is not meant to be paired! ({id_to_string(component :: any, world)})`)
+			fail(`{tag_name} is not meant to be paired! ({id_to_string(component, world)})`)
 		end
 
 		if
@@ -932,12 +936,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			or (tag ~= NetworkedUnreliable and world:has(component, NetworkedUnreliable))
 		then
 			world:remove(component, tag)
-			fail(
-				`Networked, NetworkedOnce, and NetworkedUnreliable are exclusive! ({id_to_string(
-					component :: any,
-					world
-				)})`
-			)
+			fail(`Networked, NetworkedOnce, and NetworkedUnreliable are exclusive! ({id_to_string(component, world)})`)
 		end
 
 		if world:has(component, Replicated) then
@@ -1005,7 +1004,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		if jecs.is_tag(world, component) then
 			world:remove(component, NetworkedUnreliable)
-			fail(`NetworkedUnreliable cannot be added to tags! ({id_to_string(component :: any, world)})`)
+			fail(`NetworkedUnreliable cannot be added to tags! ({id_to_string(component, world)})`)
 		end
 
 		start_tracking_component(component, NetworkedUnreliable)
@@ -1057,14 +1056,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function restage_own_cells(entity: Entity)
 		local entity_masks = allow_masks[entity]
 		for _, component in get_components(entity) do
-			if IS_PAIR(component :: any) then
-				local relation = tracked_relation_gens[ECS_PAIR_FIRST(component :: any)]
-				local target = tracked_target_gens[ECS_PAIR_SECOND(component :: any)]
-				if relation ~= nil and target ~= nil and is_pair_target_replicable(target :: any) then
+			if IS_PAIR(component) then
+				local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
+				local target = tracked_target_gens[ECS_PAIR_SECOND(component)]
+				if relation ~= nil and target ~= nil and is_pair_target_replicable(target) then
 					local cell_masks = if entity_masks then entity_masks[relation] else nil
 					local target_masks: ShardMasks? = nil
-					if replicated_entities[target :: any] ~= nil then
-						target_masks = entity_gate_masks(target :: any)
+					if replicated_entities[target] ~= nil then
+						target_masks = entity_gate_masks(target)
 					end
 					stage_restaged_cell(component, entity, cell_masks, target_masks)
 				end
@@ -1083,7 +1082,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- component record directly (the world:each scheme without its per-call closure or per-subject call);
 	-- staging never moves a subject between archetypes, so the walk is iteration-safe.
 	local function restage_pairs_targeting(entity: Entity)
-		local bucket = tracked_pairs_by_target[dense(entity :: any)]
+		local bucket = tracked_pairs_by_target[dense(entity)]
 		if bucket == nil then
 			return
 		end
@@ -1094,21 +1093,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			if target ~= nil and replicated_entities[target] ~= nil then
 				target_masks = entity_gate_masks(target)
 			end
-			local idr = component_index[pair_id :: any]
+			local idr = component_index[pair_id]
 			if idr == nil then
 				continue
 			end
 			for archetype_id in idr.records do
 				for _, subject in world_archetypes[archetype_id].entities do
-					local replicated, subject_masks = entity_vis_masks(subject :: any)
+					local replicated, subject_masks = entity_vis_masks(subject)
 					local cell_masks: ShardMasks? = nil
 					if replicated and eligible then
-						local subject_allow_masks = allow_masks[subject :: any]
+						local subject_allow_masks = allow_masks[subject]
 						cell_masks = if subject_allow_masks then subject_allow_masks[privacy_key] else nil
 					end
 					stage_visibility_masks(
 						pair_id,
-						subject :: any,
+						subject,
 						replicated and eligible,
 						subject_masks,
 						cell_masks,
@@ -1135,7 +1134,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function on_replicated_added(entity: Entity, id: Id)
 		if id ~= Replicated then
 			world:remove(entity, id)
-			fail(`Replicated is not meant to be paired! ({id_to_string(entity :: any, world)})`)
+			fail(`Replicated is not meant to be paired! ({id_to_string(entity, world)})`)
 		end
 
 		-- any of the three tracking tags refuses Replicated (see guard_networked_added for the mirror direction),
@@ -1158,8 +1157,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- reaches them, and a lingering name mapping would misbind the dense id's next tenant -- while a client
 		-- receiving the creation adopts the mapping out of name provenance first, so the same retraction leaves
 		-- them untouched.
-		local dense_id = dense(entity :: any)
-		if shared_names.announced_id(dense_id) == (entity :: any) then
+		local dense_id = dense(entity)
+		if shared_names.announced_id(dense_id) == entity then
 			shared_names.retract(dense_id)
 		end
 
@@ -1178,7 +1177,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		replicated_entities[entity] = nil
 
 		-- an unreplicated entity still targeted by tracked pairs is back to mapping by name (if it has one)
-		if tracked_pairs_by_target[dense(entity :: any)] ~= nil then
+		if tracked_pairs_by_target[dense(entity)] ~= nil then
 			shared_names.announce(entity)
 		end
 
@@ -1193,7 +1192,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- walk seeds the mirror.
 
 	local function on_name_added(entity: Entity, id: Id)
-		if id ~= (jecs.Name :: any) then
+		if id ~= jecs.Name then
 			return
 		end
 		named_entities[entity] = true
@@ -1203,14 +1202,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- targets map through their creation entry instead)
 		if
 			tracked_by[entity] ~= nil
-			or (tracked_pairs_by_target[dense(entity :: any)] ~= nil and replicated_entities[entity] == nil)
+			or (tracked_pairs_by_target[dense(entity)] ~= nil and replicated_entities[entity] == nil)
 		then
 			shared_names.announce(entity)
 		end
 	end
 
 	local function on_name_changed(entity: Entity, id: Id)
-		if id ~= (jecs.Name :: any) then
+		if id ~= jecs.Name then
 			return
 		end
 		-- a rename doesn't change replicability; announce-relevance is re-derived (the same condition as
@@ -1218,21 +1217,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- too long) leaves the id unannounced, and its fix arrives through this hook
 		if
 			tracked_by[entity] ~= nil
-			or (tracked_pairs_by_target[dense(entity :: any)] ~= nil and replicated_entities[entity] == nil)
+			or (tracked_pairs_by_target[dense(entity)] ~= nil and replicated_entities[entity] == nil)
 		then
 			shared_names.announce(entity)
 		end
 	end
 
 	local function on_name_removed(entity: Entity, id: Id)
-		if id ~= (jecs.Name :: any) then
+		if id ~= jecs.Name then
 			return
 		end
 		named_entities[entity] = nil
 		-- pairs targeting the entity may just have lost their replicable target
 		restage_pairs_targeting(entity)
-		local dense_id = dense(entity :: any)
-		if shared_names.announced_id(dense_id) == (entity :: any) then
+		local dense_id = dense(entity)
+		if shared_names.announced_id(dense_id) == entity then
 			shared_names.retract(dense_id)
 		end
 	end
@@ -1405,15 +1404,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function on_inherits_added(entity: Entity, id: Id)
 		if id == InheritsPrivacy then
 			world:remove(entity, InheritsPrivacy)
-			fail(`InheritsPrivacy must be paired with a group entity! ({id_to_string(entity :: any, world)})`)
+			fail(`InheritsPrivacy must be paired with a group entity! ({id_to_string(entity, world)})`)
 		end
 
 		local group = jecs.pair_second(world, id) :: Entity
 		if delegation_reaches(group, entity, {}) then
 			world:remove(entity, id)
 			fail(
-				`InheritsPrivacy delegation cannot contain cycles! ({id_to_string(entity :: any, world)} -> {id_to_string(
-					group :: any,
+				`InheritsPrivacy delegation cannot contain cycles! ({id_to_string(entity, world)} -> {id_to_string(
+					group,
 					world
 				)})`
 			)
@@ -1424,7 +1423,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			parents = {}
 			delegation_parents[entity] = parents
 		end
-		parents[dense(group :: any)] = group
+		parents[dense(group)] = group
 		index_delegation_child(group, entity)
 		if recompute_effective(entity) then
 			restage_entity(entity)
@@ -1442,7 +1441,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		-- the pair id only packs the group's dense half (and the group may already be dead mid-cascade), so the
 		-- edge resolves through the dense-keyed mirror; a missing edge is the cycle guard undoing its own add
-		local dense_group = ECS_PAIR_SECOND(id :: any)
+		local dense_group = ECS_PAIR_SECOND(id)
 		local group = parents[dense_group]
 		if group == nil then
 			return
@@ -1473,8 +1472,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- it, pair(Private, component) values leave the archetype columns and this write needs whatever sparse-pair
 	-- storage api jecs exposes instead.
 	local function write_filter_value(entity: Entity, id: Id, filter: Privacy)
-		local record = entity_index.sparse_array[dense(entity :: any)]
-		record.archetype.columns_map[id :: any][record.row] = filter
+		local record = entity_index.sparse_array[dense(entity)]
+		record.archetype.columns_map[id][record.row] = filter
 	end
 
 	-- resolves a privacy filter into the table + per-shard words the caches store, erroring on mixed polarities.
@@ -1653,7 +1652,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if sanitized == nil then
 			warn(
 				`a Private blacklist named only untracked clients! it was removed outright, since it restricted nobody -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
-					entity :: any,
+					entity,
 					world
 				)})`
 			)
@@ -1668,7 +1667,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		warn(
 			`a Private filter named {pruned} untracked client(s)! they were pruned from it, since filters only carry tracked clients -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
-				entity :: any,
+				entity,
 				world
 			)})`
 		)
@@ -1700,7 +1699,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if privacy == nil then
 			warn(
 				`Private filters cannot have a nil value! it now blocks every client, as an empty filter -- set one explicitly, since world:add leaves an existing filter untouched instead. ({id_to_string(
-					entity :: any,
+					entity,
 					world
 				)})`
 			)
@@ -1859,7 +1858,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if salvage_error ~= nil then
 			local section_id = draft.relation or draft.component
 			warn(
-				`a serdes encode hook threw while encoding {id_to_string(section_id :: any, world)}! {pruned} value(s) were dropped from this frame's packets and will not replicate until their cells next change: {salvage_error}`
+				`a serdes encode hook threw while encoding {id_to_string(section_id, world)}! {pruned} value(s) were dropped from this frame's packets and will not replicate until their cells next change: {salvage_error}`
 			)
 		end
 		return size
@@ -2029,9 +2028,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- present last word is always nonzero.
 	local function sweep_freed_slots(shard: number, bits: VisibilityMask)
 		local clear = bit32.bnot(bits)
-		local shard_last = last_visibilities[shard]
-		if shard_last then
-			for _, last_component in shard_last do
+		local shard_last_visibilities = last_visibilities[shard]
+		if shard_last_visibilities then
+			for _, last_component in shard_last_visibilities do
 				for entity, last in last_component do
 					local cleared = bit32.band(last, clear)
 					if cleared == 0 then
@@ -2130,18 +2129,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local shard = shard_of(client_index)
 		local bit = slot_bit_of(client_index)
 		local sections: { SectionDraft } = fetch_scratch()
-		local section_of: { [number]: SectionDraft } = fetch_scratch()
+		local section_of: { [Id]: SectionDraft } = fetch_scratch()
 		-- pair drafts collect per relation (their cells landing in per-target runs), in their own map: both maps
 		-- key gen-qualified ids here, so one definition serving as an unpaired component and as a relation shares
 		-- a key between the two roles at any generation, and the two must draft separate sections
-		local pair_section_of: { [number]: SectionDraft } = fetch_scratch()
+		local pair_section_of: { [Entity]: SectionDraft } = fetch_scratch()
 
-		local shard_last = last_visibilities[shard]
-		if shard_last == nil then
-			shard_last = {}
-			last_visibilities[shard] = shard_last
+		local shard_last_visibilities = last_visibilities[shard]
+		if shard_last_visibilities == nil then
+			shard_last_visibilities = {}
+			last_visibilities[shard] = shard_last_visibilities
 		end
-		local last_existence = shard_last[Existence]
+		local last_existence = shard_last_visibilities[Existence]
 
 		local replicated: { number } = fetch_scratch()
 		local replicated_count = 0
@@ -2150,27 +2149,27 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- below, already gen-qualified, so pair cells never pay a pair_first/pair_second here; value is the cell's
 		-- column read (nil for tags and nulled values).
 		local function emit(component: Id, entity: Entity, relation: Entity?, target: Entity?, value: any)
-			local last_component = shard_last[component]
+			local last_component = shard_last_visibilities[component]
 			if last_component == nil then
 				last_component = {}
-				shard_last[component] = last_component
+				shard_last_visibilities[component] = last_component
 			end
 			last_component[entity] = bit32.bor(last_component[entity] or 0, bit)
 
 			local lists: any
 			if relation ~= nil then
-				local data = pair_section_of[relation :: any]
+				local data = pair_section_of[relation]
 				if data == nil then
 					data = fetch_draft(nil, relation :: any)
-					pair_section_of[relation :: any] = data
+					pair_section_of[relation] = data
 					table.insert(sections, data)
 				end
 				lists = get_run(data, target :: any)
 			else
-				local data = section_of[component :: any]
+				local data = section_of[component]
 				if data == nil then
 					data = fetch_draft(component :: any)
-					section_of[component :: any] = data
+					section_of[component] = data
 					table.insert(sections, data)
 				end
 				lists = data
@@ -2182,7 +2181,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					nulled = fetch_scratch()
 					lists.nulled = nulled
 				end
-				table.insert(nulled :: { number }, entity :: any)
+				table.insert(nulled, entity)
 			else
 				local ids = lists.ids
 				local values = lists.values
@@ -2192,8 +2191,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					lists.ids = ids
 					lists.values = values
 				end
-				table.insert(ids :: { number }, entity :: any)
-				table.insert(values :: { any }, value)
+				table.insert(ids, entity)
+				table.insert(values, value)
 			end
 		end
 
@@ -2205,9 +2204,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local cell_ids: { number } = fetch_scratch()
 		local cell_keys: { number } = fetch_scratch()
 		local cell_columns: { { any } } = fetch_scratch()
-		local cell_targets: { [number]: number } = fetch_scratch()
+		local cell_targets: { [number]: Entity } = fetch_scratch()
 
-		local idr_replicated = component_index[Replicated :: any]
+		local idr_replicated = component_index[Replicated]
 		local replicated_records = (if idr_replicated ~= nil then idr_replicated.records else empty_records) :: {
 			[number]: number,
 		}
@@ -2227,25 +2226,25 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local cell_count = 0
 			for _, component in archetype.types do
 				local privacy_key: number
-				local target: number? = nil
-				if IS_PAIR(component :: any) then
-					local relation = tracked_relation_gens[ECS_PAIR_FIRST(component :: any)]
+				local target: Entity? = nil
+				if IS_PAIR(component) then
+					local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
 					if relation == nil then
 						continue
 					end
-					local target_gen = tracked_target_gens[ECS_PAIR_SECOND(component :: any)]
-					if target_gen == nil or is_pair_target_replicable(target_gen :: any) ~= true then
+					local target_gen = tracked_target_gens[ECS_PAIR_SECOND(component)]
+					if target_gen == nil or is_pair_target_replicable(target_gen) ~= true then
 						continue
 					end
-					if replicated_entities[target_gen :: any] ~= nil then
-						local gate = entity_gate_masks(target_gen :: any)
+					if replicated_entities[target_gen] ~= nil then
+						local gate = entity_gate_masks(target_gen)
 						if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
 							continue
 						end
 					end
 					privacy_key = relation :: any
 					target = target_gen
-				elseif tracked_by[component :: any] ~= nil then
+				elseif tracked_by[component] ~= nil then
 					privacy_key = component :: any
 				else
 					continue
@@ -2253,7 +2252,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				cell_count += 1
 				cell_ids[cell_count] = component :: any
 				cell_keys[cell_count] = privacy_key
-				cell_columns[cell_count] = columns_map[component :: any]
+				cell_columns[cell_count] = columns_map[component]
 				-- assigned even when nil, clearing whatever the previous archetype left at this row
 				cell_targets[cell_count] = target :: any
 			end
@@ -2261,8 +2260,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			for row, entity in entities do
 				-- the entity's own gate: entity_gate_masks inlined so the allow-mask fetch is shared with the cell loop
 				-- below
-				local entity_masks = allow_masks[entity :: any]
-				local gate = effective_masks[entity :: any]
+				local entity_masks = allow_masks[entity]
+				local gate = effective_masks[entity]
 				if gate == nil and entity_masks ~= nil then
 					gate = entity_masks[Existence]
 				end
@@ -2274,9 +2273,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				replicated[replicated_count] = entity :: any
 				if last_existence == nil then
 					last_existence = {}
-					shard_last[Existence] = last_existence
+					shard_last_visibilities[Existence] = last_existence
 				end
-				last_existence[entity :: any] = bit32.bor(last_existence[entity :: any] or 0, bit)
+				last_existence[entity] = bit32.bor(last_existence[entity] or 0, bit)
 
 				for i = 1, cell_count do
 					local privacy_key = cell_keys[i]
@@ -2289,9 +2288,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local target = cell_targets[i]
 					emit(
 						cell_ids[i] :: any,
-						entity :: any,
+						entity,
 						if target ~= nil then privacy_key :: any else nil,
-						target :: any,
+						target,
 						cell_columns[i][row]
 					)
 				end
@@ -2357,7 +2356,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- population hovering at a shard boundary never churns. at most one shard is reclaimed per call; a large
 	-- drop reclaims over successive calls. a move is a pure server-side bit transfer, invisible to clients:
 	-- packets are keyed by client object and deltas diff against whatever last words carry the bit. must run at
-	-- the tail of generate_packets -- next_visibilities and component_changes are empty there, leaving the last
+	-- the tail of generate_packets -- next_visibilities and changed_values are empty there, leaving the last
 	-- trees, the allow words, and the slot bookkeeping as the only stores carrying slot bits.
 	local function compact_shards()
 		local reclaimed = shard_count
@@ -2412,15 +2411,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					while moved ~= 0 do
 						local old_index = bit32.countrz(moved)
 						moved = bit32.band(moved, moved - 1)
-						local shard_last = last_visibilities[moved_shards[old_index]]
-						if shard_last == nil then
-							shard_last = {}
-							last_visibilities[moved_shards[old_index]] = shard_last
+						local shard_last_visibilities = last_visibilities[moved_shards[old_index]]
+						if shard_last_visibilities == nil then
+							shard_last_visibilities = {}
+							last_visibilities[moved_shards[old_index]] = shard_last_visibilities
 						end
-						local target_component = shard_last[component]
+						local target_component = shard_last_visibilities[component]
 						if target_component == nil then
 							target_component = {}
-							shard_last[component] = target_component
+							shard_last_visibilities[component] = target_component
 						end
 						target_component[entity] = bit32.bor(target_component[entity] or 0, moved_bits[old_index])
 					end
@@ -2498,7 +2497,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- dense id, and the two must stay distinct groups. dirty_groups lists the groups touched this frame so the
 	-- bucket pass never walks the historical set; group_frame stamps first touches, and last_group_sweep
 	-- schedules the eviction sweep that keeps both stores bounded by the recently-live id set.
-	local groups = {} :: { [number]: PacketGroup }
+	local groups = {} :: { [Id]: PacketGroup }
 	local pair_groups = {} :: { [number]: PacketGroup }
 	local dirty_groups = {} :: { PacketGroup }
 	local dirty_group_count = 0
@@ -2598,11 +2597,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	local function get_group(component: number): PacketGroup
+	local function get_group(component: Id): PacketGroup
 		local group = groups[component]
 		if group == nil then
 			group = {
-				key = component,
+				key = component :: any,
 				frame = group_frame,
 				count = 0,
 				entities = {},
@@ -2610,7 +2609,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				send_nodes = {},
 				removed_nodes = {},
 				row_of = if multi_shard then {} else nil,
-				is_tag = jecs.is_tag(world, component :: any),
+				is_tag = jecs.is_tag(world, component),
 			} :: PacketGroup
 			groups[component] = group
 			dirty_group_count += 1
@@ -2632,18 +2631,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- untracked relation (a stop_tracking_component or a relation death resolving its staged removals) recovered
 	-- from the retired store, and the live resolve as a last resort for cells no retirement covers; the targets
 	-- resolve per pair id in the resolve passes, since one group now spans every target of the relation.
-	local function get_pair_group(component: number): PacketGroup
-		local relation_dense = ECS_PAIR_FIRST(component :: any) :: any
+	local function get_pair_group(component: Id): PacketGroup
+		local relation_dense = ECS_PAIR_FIRST(component)
 		local group = pair_groups[relation_dense]
 		if group == nil then
 			local relation = (
 				tracked_relation_gens[relation_dense]
 				or retired_relation_gens[relation_dense]
-				or jecs.pair_first(world, component :: any)
+				or jecs.pair_first(world, component)
 			) :: any
 			local is_tag = tracked_relation_tags[relation_dense]
 			if is_tag == nil then
-				is_tag = if (relation :: any) == 0 then false else jecs.is_tag(world, relation)
+				is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
 			end
 			group = {
 				key = relation_dense,
@@ -2668,12 +2667,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local relation = (
 				tracked_relation_gens[relation_dense]
 				or retired_relation_gens[relation_dense]
-				or jecs.pair_first(world, component :: any)
+				or jecs.pair_first(world, component)
 			) :: any
 			group.relation = relation
 			local is_tag = tracked_relation_tags[relation_dense]
 			if is_tag == nil then
-				is_tag = if (relation :: any) == 0 then false else jecs.is_tag(world, relation)
+				is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
 			end
 			group.is_tag = is_tag
 			if multi_shard and group.pair_rows == nil then
@@ -2705,18 +2704,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- per-component removals the client applies wholesale when deleting the entity (or pair target) locally.
 	-- masks are shard-relative, so the diff and the record are both per-shard.
 	local function resolve_existence_diff(
-		shard_next: ShardVisibility,
-		shard_last: ShardVisibility,
+		shard_next_visibilities: ShardVisibilities,
+		shard_last_visibilities: ShardVisibilities,
 		allocated: VisibilityMask,
 		base_index: number
 	): { [Entity]: VisibilityMask }
 		-- pooled; the caller releases it once the component cells resolve
-		local entity_unreplicate_mask: { [Entity]: VisibilityMask } = fetch_scratch()
+		local entity_unreplicate_masks: { [Entity]: VisibilityMask } = fetch_scratch()
 
-		local existence_visibility = shard_next[Existence]
+		local existence_visibility = shard_next_visibilities[Existence]
 		if existence_visibility then
-			shard_next[Existence] = nil
-			local last_existence = shard_last[Existence]
+			shard_next_visibilities[Existence] = nil
+			local last_existence = shard_last_visibilities[Existence]
 
 			for entity, new in existence_visibility do
 				local old = if last_existence then last_existence[entity] or 0 else 0
@@ -2736,7 +2735,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 
 				if removed ~= 0 then
-					entity_unreplicate_mask[entity] = removed
+					entity_unreplicate_masks[entity] = removed
 					local r = removed
 					while r ~= 0 do
 						local index = bit32.countrz(r)
@@ -2758,18 +2757,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				else
 					if last_existence == nil then
 						last_existence = {}
-						shard_last[Existence] = last_existence
+						shard_last_visibilities[Existence] = last_existence
 					end
 					last_existence[entity] = new
 				end
 			end
 
 			if last_existence and next(last_existence) == nil then
-				shard_last[Existence] = nil
+				shard_last_visibilities[Existence] = nil
 			end
 		end
 
-		return entity_unreplicate_mask
+		return entity_unreplicate_masks
 	end
 
 	-- visibility cells of one shard: fold every dirty cell into its component's cross-shard group, its send /
@@ -2777,18 +2776,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- one of them per cell. a cell whose value also changed emits only its removals here; its sends defer to
 	-- resolve_value_cells, run against the post-merge mask so every viewer gets the new value exactly once.
 	local function resolve_visibility_cells(
-		shard_next: ShardVisibility,
-		shard_last: ShardVisibility,
+		shard_next_visibilities: ShardVisibilities,
+		shard_last_visibilities: ShardVisibilities,
 		allocated: VisibilityMask,
 		shard_key_base: number,
-		entity_unreplicate_mask: { [Entity]: VisibilityMask }
+		entity_unreplicate_masks: { [Entity]: VisibilityMask }
 	)
-		for component, new_visibility in shard_next do
-			local value_changes = component_changes[component]
-			local old_visibility = shard_last[component]
+		for component, new_visibility in shard_next_visibilities do
+			local changed = changed_values[component]
+			local old_visibility = shard_last_visibilities[component]
 
-			local is_pair = IS_PAIR(component :: any)
-			local group = if is_pair then get_pair_group(component :: any) else get_group(component :: any)
+			local is_pair = IS_PAIR(component)
+			local group = if is_pair then get_pair_group(component) else get_group(component)
 			local is_tag = group.is_tag
 			local count = group.count
 			local entities = group.entities
@@ -2805,7 +2804,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- keeps the skip generation-precise across a same-frame recycle. the target-side drops are loop-invariant,
 			-- so they narrow removed_allowed -- the word removals compute against in place of the raw allocated word --
 			-- once, outside the entity loop; the subject's own drop stays per entity.
-			local target: number? = nil
+			local target: Entity? = nil
 			local removed_allowed = allocated
 			if is_pair then
 				-- the relation-level recycle signature: the relation's dense id retired one definition and re-tracked
@@ -2814,7 +2813,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- before sections apply, so a shipped removal would misresolve to the new definition. drop them; the
 				-- client's mapping-teardown sweep owns the cleanup (see sweep_imported_cells in client.luau). the
 				-- target-level signature below is the same check one level down.
-				local relation_dense = ECS_PAIR_FIRST(component :: any) :: any
+				local relation_dense = ECS_PAIR_FIRST(component)
 				local retired_relation = retired_relation_gens[relation_dense]
 				if retired_relation ~= nil then
 					local live_relation = tracked_relation_gens[relation_dense]
@@ -2823,7 +2822,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					end
 				end
 
-				local dense_target = ECS_PAIR_SECOND(component :: any) :: any
+				local dense_target = ECS_PAIR_SECOND(component)
 				local retired = retired_target_gens[dense_target]
 				target = tracked_target_gens[dense_target]
 				if target == nil then
@@ -2837,7 +2836,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						-- a tag relation's pairs follow their target's tag-ness, and the relation half is already known to be
 						-- a tag here, so only the target needs the check (jecs.is_tag on the packed pair id would re-resolve
 						-- and re-check both halves); gone targets never send, so the check is moot for them
-						is_tag = jecs.is_tag(world, target :: any)
+						is_tag = jecs.is_tag(world, target)
 					end
 					if retired ~= nil and retired ~= target then
 						-- the target-level recycle signature: the dense id retired one tenant and re-indexed as another since
@@ -2854,7 +2853,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					-- removal ships
 					removed_allowed = 0
 				elseif removed_allowed ~= 0 then
-					local target_unrep = entity_unreplicate_mask[target :: any]
+					local target_unrep = entity_unreplicate_masks[target]
 					if target_unrep ~= nil then
 						removed_allowed = bit32.band(allocated, bit32.bnot(target_unrep))
 					end
@@ -2863,10 +2862,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- nest per pair id
 				local pair_rows = group.pair_rows
 				if pair_rows then
-					local pair_id_rows = pair_rows[component :: any]
+					local pair_id_rows = pair_rows[component]
 					if pair_id_rows == nil then
 						pair_id_rows = fetch_scratch()
-						pair_rows[component :: any] = pair_id_rows
+						pair_rows[component] = pair_id_rows
 					end
 					rows = pair_id_rows
 				end
@@ -2879,10 +2878,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- aliased on the wire, would race on shared subjects). drop them; the sweep owns the cleanup. a live
 				-- entry equal to the component is a same-frame re-track of the same definition, whose genuine removals
 				-- must ship.
-				local component_dense = dense(component :: any)
+				local component_dense = dense(component)
 				if retired_relation_gens[component_dense] == component then
 					local live_relation = tracked_relation_gens[component_dense]
-					if live_relation ~= nil and (live_relation :: any) ~= (component :: any) then
+					if live_relation ~= nil and live_relation ~= component then
 						removed_allowed = 0
 					end
 				end
@@ -2890,7 +2889,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 			for entity, new in new_visibility do
 				local old = if old_visibility then old_visibility[entity] or 0 else 0
-				local deferred = value_changes ~= nil and value_changes[entity] ~= nil
+				local deferred = changed ~= nil and changed[entity] ~= nil
 				local send = if deferred then 0 else bit32.band(new, bit32.bnot(old), allocated)
 				local removed = bit32.band(old, bit32.bnot(new), removed_allowed)
 
@@ -2898,7 +2897,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- target's, being loop-invariant, already narrowed removed_allowed above). per-client, so only the
 				-- coinciding bits clear; send is already 0 for those slots.
 				if removed ~= 0 then
-					local subj_unrep = entity_unreplicate_mask[entity]
+					local subj_unrep = entity_unreplicate_masks[entity]
 					if subj_unrep then
 						removed = bit32.band(removed, bit32.bnot(subj_unrep))
 					end
@@ -2913,7 +2912,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						send_nodes[row] = 0
 						removed_nodes[row] = 0
 						if targets then
-							targets[row] = target :: number
+							targets[row] = target :: any
 						end
 						if rows then
 							rows[entity] = row
@@ -2955,7 +2954,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				else
 					if old_visibility == nil then
 						old_visibility = {}
-						shard_last[component] = old_visibility
+						shard_last_visibilities[component] = old_visibility
 					end
 					old_visibility[entity] = new
 				end
@@ -2964,7 +2963,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			group.count = count
 
 			if old_visibility and next(old_visibility) == nil then
-				shard_last[component] = nil
+				shard_last_visibilities[component] = nil
 			end
 		end
 	end
@@ -2972,15 +2971,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- value cells of one shard: every slot that currently sees the cell (post-merge mask) receives the new
 	-- value. pure removals never reach here. values stay staged for the remaining shards; generate_packets
 	-- clears the shared store after the shard loop.
-	local function resolve_value_cells(shard_last: ShardVisibility, allocated: VisibilityMask, shard_key_base: number)
-		for component, changed_values in component_changes do
-			local visibility = shard_last[component]
+	local function resolve_value_cells(
+		shard_last_visibilities: ShardVisibilities,
+		allocated: VisibilityMask,
+		shard_key_base: number
+	)
+		for component, changed in changed_values do
+			local visibility = shard_last_visibilities[component]
 			if visibility == nil then
 				continue
 			end
 
-			local is_pair = IS_PAIR(component :: any)
-			local group = if is_pair then get_pair_group(component :: any) else get_group(component :: any)
+			local is_pair = IS_PAIR(component)
+			local group = if is_pair then get_pair_group(component) else get_group(component)
 			local count = group.count
 			local entities = group.entities
 			local values = group.values
@@ -2992,21 +2995,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- the gen-qualified target this pair id's rows carry, read from the live-target gen cache (staged values
 			-- never outlive their target: its death stages removals that drop them, so a live entry always exists),
 			-- plus the per-pair-id row map (see resolve_visibility_cells)
-			local target: number? = nil
+			local target: Entity? = nil
 			if is_pair then
-				target = tracked_target_gens[ECS_PAIR_SECOND(component :: any) :: any]
+				target = tracked_target_gens[ECS_PAIR_SECOND(component)]
 				local pair_rows = group.pair_rows
 				if pair_rows then
-					local pair_id_rows = pair_rows[component :: any]
+					local pair_id_rows = pair_rows[component]
 					if pair_id_rows == nil then
 						pair_id_rows = fetch_scratch()
-						pair_rows[component :: any] = pair_id_rows
+						pair_rows[component] = pair_id_rows
 					end
 					rows = pair_id_rows
 				end
 			end
 
-			for entity, value in changed_values do
+			for entity, value in changed do
 				local mask = visibility[entity]
 				if mask == nil then
 					continue
@@ -3023,7 +3026,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					send_nodes[row] = 0
 					removed_nodes[row] = 0
 					if targets then
-						targets[row] = target :: number
+						targets[row] = target :: any
 					end
 					if rows then
 						rows[entity] = row
@@ -3096,7 +3099,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 							nulled = fetch_scratch()
 							lists.nulled = nulled
 						end
-						table.insert(nulled :: any, entity)
+						table.insert(nulled, entity)
 					else
 						local ids = lists.ids
 						local values
@@ -3108,7 +3111,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						else
 							values = lists.values :: { any }
 						end
-						table.insert(ids :: any, entity)
+						table.insert(ids, entity)
 						table.insert(values, value)
 					end
 				end
@@ -3130,7 +3133,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						removed_entities = fetch_scratch()
 						lists.removed = removed_entities
 					end
-					table.insert(removed_entities :: any, entity)
+					table.insert(removed_entities, entity)
 				end
 			end
 
@@ -3342,47 +3345,58 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			frame_names = collected
 		end
 
-		local has_value_changes = next(component_changes) ~= nil
+		local has_changed_values = next(changed_values) ~= nil
 
 		-- resolve passes, per occupied shard: the existence diff first (the component cells drop removals against
 		-- its record), then the dirty visibility cells, then the staged values.
 		for shard = 1, shard_count do
-			local shard_next = next_visibilities[shard]
+			local shard_next_visibilities = next_visibilities[shard]
 			local allocated = allocated_masks[shard]
 			local existing_last = last_visibilities[shard]
 			-- a shard resolves if it has staged visibility, or if a staged value could land in it -- which takes
 			-- allocated clients, a last tree for the value's mask to match, and staged values at all
-			if shard_next == nil and (allocated == 0 or existing_last == nil or not has_value_changes) then
+			if
+				shard_next_visibilities == nil and (allocated == 0 or existing_last == nil or not has_changed_values)
+			then
 				continue
 			end
 
 			-- the shard's last tree is ensured up front so the resolve passes merge through it directly; it's pruned
 			-- again at the end of the iteration if nothing landed.
-			local shard_last = existing_last
-			if shard_last == nil then
-				shard_last = {}
-				last_visibilities[shard] = shard_last
+			local shard_last_visibilities = existing_last
+			if shard_last_visibilities == nil then
+				shard_last_visibilities = {}
+				last_visibilities[shard] = shard_last_visibilities
 			end
 
 			local base_index = (shard - 1) * 32
 			local shard_key_base = shard * shard_key_span
 
-			if shard_next then
-				local entity_unreplicate_mask = resolve_existence_diff(shard_next, shard_last, allocated, base_index)
-				resolve_visibility_cells(shard_next, shard_last, allocated, shard_key_base, entity_unreplicate_mask)
-				release_scratch(entity_unreplicate_mask)
+			if shard_next_visibilities then
+				local entity_unreplicate_masks =
+					resolve_existence_diff(shard_next_visibilities, shard_last_visibilities, allocated, base_index)
+
+				resolve_visibility_cells(
+					shard_next_visibilities,
+					shard_last_visibilities,
+					allocated,
+					shard_key_base,
+					entity_unreplicate_masks
+				)
+
+				release_scratch(entity_unreplicate_masks)
 				next_visibilities[shard] = nil
 			end
 
 			if allocated ~= 0 then
-				resolve_value_cells(shard_last, allocated, shard_key_base)
+				resolve_value_cells(shard_last_visibilities, allocated, shard_key_base)
 			end
 
-			if next(shard_last) == nil then
+			if next(shard_last_visibilities) == nil then
 				last_visibilities[shard] = nil
 			end
 		end
-		component_changes = {}
+		changed_values = {}
 		-- the resolve passes above were the last readers of the gens retired since the previous call
 		table.clear(retired_target_gens)
 		table.clear(retired_relation_gens)
@@ -3442,7 +3456,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- the finalize loop turns each node's drafts into its shared chunk list. both maps are cleared at entry so
 	-- an errored call's stranded tables are abandoned to the GC, mirroring reset_frame_state's policy (the
 	-- salvage guard contains user encode throws, but an internal error can still unwind mid-call).
-	local unreliable_node_drafts = {} :: { [VisibilityNode]: { [number]: SectionDraft } }
+	local unreliable_node_drafts = {} :: { [VisibilityNode]: { [Id]: SectionDraft } }
 	local unreliable_node_chunks = {} :: { [VisibilityNode]: { buffer } }
 
 	-- the running call's escaping result map, held as an upvalue only while the expansion pass scatters into it
@@ -3462,11 +3476,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local unreliable_cached_node: VisibilityNode = 0
 	local unreliable_cached_draft: SectionDraft? = nil
 
-	local function prefetch_unreliable_visibility(cell: number): boolean
+	local function prefetch_unreliable_visibility(cell: Id): boolean
 		local any_visible = false
 		for shard = 1, shard_count do
-			local shard_last = last_visibilities[shard]
-			local visibility = if shard_last then shard_last[cell :: any] else nil
+			local shard_last_visibilities = last_visibilities[shard]
+			local visibility = if shard_last_visibilities then shard_last_visibilities[cell] else nil
 			if visibility ~= nil then
 				unreliable_cell_visibility[shard] = visibility
 				any_visible = true
@@ -3491,7 +3505,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function accumulate_unreliable_archetype(
 		entities: { any },
 		column: { any },
-		cell: number,
+		cell: Id,
 		component: number?,
 		relation: number?,
 		target: number?
@@ -3692,16 +3706,16 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		for component in networked_unreliable do
 			-- unpaired cells: the component's own archetype records
-			local idr = component_index[component :: any]
-			if idr ~= nil and prefetch_unreliable_visibility(component :: any) then
+			local idr = component_index[component]
+			if idr ~= nil and prefetch_unreliable_visibility(component) then
 				for archetype_id in idr.records do
 					local archetype = archetypes[archetype_id]
 					local entities = archetype.entities
 					if #entities > 0 then
 						accumulate_unreliable_archetype(
-							entities :: any,
-							archetype.columns_map[component :: any] :: any,
-							component :: any,
+							entities,
+							archetype.columns_map[component],
+							component,
 							component :: any,
 							nil,
 							nil
@@ -3714,7 +3728,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- this relation, and same-relation pairs sit contiguously in archetype.types (see each_target), so the
 			-- record's records/counts hand each archetype its exact pair slice with no types scan. the target gen
 			-- resolves through the pair index, which covers every live pair of a tracked relation.
-			local idr_pair = component_index[pair(component, jecs.Wildcard) :: any]
+			local idr_pair = component_index[pair(component, jecs.Wildcard)]
 			if idr_pair ~= nil then
 				local pair_counts = idr_pair.counts
 				for archetype_id, slice_start in idr_pair.records do
@@ -3726,15 +3740,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local archetype_types = archetype.types
 					for i = slice_start, slice_start + pair_counts[archetype_id] - 1 do
 						local cell = archetype_types[i]
-						local target = tracked_target_gens[ECS_PAIR_SECOND(cell :: any) :: any]
-						if target ~= nil and prefetch_unreliable_visibility(cell :: any) then
+						local target = tracked_target_gens[ECS_PAIR_SECOND(cell)]
+						if target ~= nil and prefetch_unreliable_visibility(cell) then
 							accumulate_unreliable_archetype(
-								entities :: any,
-								archetype.columns_map[cell :: any] :: any,
-								cell :: any,
+								entities,
+								archetype.columns_map[cell],
+								cell,
 								nil,
 								component :: any,
-								target
+								target :: any
 							)
 						end
 					end
@@ -3760,7 +3774,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				finalize_chunks(chunk_frame, drafts, budget, resolve_serdes, chunk_scratch, chunks)
 			if salvage_error ~= nil then
 				warn(
-					`a serdes encode failed while chunking {id_to_string(salvage_id :: any, world)}! {pruned} value(s) were dropped from this call's chunks and will not replicate until the hook or value is fixed: {salvage_error}`
+					`a serdes encode failed while chunking {id_to_string(salvage_id, world)}! {pruned} value(s) were dropped from this call's chunks and will not replicate until the hook or value is fixed: {salvage_error}`
 				)
 			end
 			for _, draft in drafts do
@@ -3861,7 +3875,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		for index, entity in private_subjects do
 			local id = private_pair_ids[index]
-			on_private_set(entity, id, world:get(entity, id :: any))
+			on_private_set(entity, id, world:get(entity, id))
 		end
 
 		local inherits_holders = collect_holders(InheritsPrivacy)

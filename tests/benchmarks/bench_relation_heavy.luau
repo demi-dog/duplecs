@@ -19,7 +19,7 @@
 -- pure grouping shape, undiluted by mask splits. P clients, no serdes hooks.
 
 -- Modes, each swept across TARGET_COUNTS:
---   value churn — every pair's value changes per tick, so component_changes
+--   value churn — every pair's value changes per tick, so changed_values
 --     carries T distinct pair ids per relation; times generate_packets.
 --   retarget    — RETARGET subjects per relation rotate to their next target
 --     per tick (a pair removed + a pair added, staging visibility cells on

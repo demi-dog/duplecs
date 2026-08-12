@@ -148,6 +148,11 @@
 
 local jecs = require("../roblox_packages/jecs")
 
+-- jecs.pair under the plain-number domain this module works in (draft and wire ids are numbers, and the
+-- packed pair id they combine into is one too), so the serdes-key and record-view call sites don't cast
+-- per call. every id is a number at runtime, so this is a retyped view of the original, not a copy.
+local pair = (jecs.pair :: any) :: (relation: number, target: number) -> number
+
 local types = require("./types")
 local diagnostics = require("./diagnostics")
 
@@ -218,25 +223,25 @@ local max_chunk_bytes = narrow_limit
 -- the split points of the ids' wire halves. the dense encoding leans on jecs' index/generation split at 2^24:
 -- a dense id is a gen-qualified id's low 24 bits, so write_id truncates the generation of whatever id it is
 -- handed and gets the dense half for free.
-local id_span = 2 ^ 16
-local gen_id_span = 2 ^ 32
+local id_split = 2 ^ 16
+local gen_id_split = 2 ^ 32
 
 local function write_id(data: buffer, offset: number, id: number)
-	buffer.writeu16(data, offset, id % id_span)
-	buffer.writeu8(data, offset + 2, id // id_span % 256)
+	buffer.writeu16(data, offset, id % id_split)
+	buffer.writeu8(data, offset + 2, id // id_split % 256)
 end
 
 local function read_id(data: buffer, offset: number): number
-	return buffer.readu16(data, offset) + buffer.readu8(data, offset + 2) * id_span
+	return buffer.readu16(data, offset) + buffer.readu8(data, offset + 2) * id_split
 end
 
 local function write_gen_id(data: buffer, offset: number, id: number)
-	buffer.writeu32(data, offset, id % gen_id_span)
-	buffer.writeu8(data, offset + 4, id // gen_id_span)
+	buffer.writeu32(data, offset, id % gen_id_split)
+	buffer.writeu8(data, offset + 4, id // gen_id_split)
 end
 
 local function read_gen_id(data: buffer, offset: number): number
-	return buffer.readu32(data, offset) + buffer.readu8(data, offset + 4) * gen_id_span
+	return buffer.readu32(data, offset) + buffer.readu8(data, offset + 4) * gen_id_split
 end
 
 -- reads a packet buffer's leading wire format version byte. it sits at offset 0 ahead of every other field
@@ -610,16 +615,21 @@ local function measure_grouped_section(draft: SectionDraft, resolve_serdes: Reso
 		local serdes: Serdes? = nil
 		if ids_count > 0 then
 			gated_counts += 1
-			local pair_id = jecs.pair(relation :: any, run.target :: any)
+			local pair_id = pair(relation, run.target)
 			serdes = resolve_serdes(pair_id, relation)
 			if serdes then
 				inline_runs += 1
-				local hooks = serdes :: any
 				local stash: { buffer } = encoded_values or {}
 				encoded_values = stash
 				local values_size
-				values_size, encoded_count =
-					encode_buffer_values(pair_id, hooks.encode, hooks.size, run.values :: { any }, stash, encoded_count)
+				values_size, encoded_count = encode_buffer_values(
+					pair_id,
+					serdes.encode,
+					serdes.size,
+					run.values :: { any },
+					stash,
+					encoded_count
+				)
 				size += values_size
 				run.values_size = values_size
 			else
@@ -752,7 +762,7 @@ local function write_grouped_section(data: buffer, section_offset: number, draft
 			offset, encoded_cursor = write_buffer_values(
 				data,
 				offset,
-				(serdes :: any).size == nil,
+				serdes.size == nil,
 				ids_count,
 				encoded_values :: { buffer },
 				encoded_cursor
@@ -814,7 +824,7 @@ local function measure_plain_section(draft: SectionDraft, resolve_serdes: Resolv
 	local nulled_count = if nulled then #nulled else 0
 	local removed_count = if removed then #removed else 0
 
-	local serdes_key: any = if relation ~= nil then jecs.pair(relation :: any, target :: any) else draft.component
+	local serdes_key: any = if relation ~= nil then pair(relation :: number, target :: number) else draft.component
 	local serdes = if values then resolve_serdes(serdes_key, relation) else nil
 
 	local flags = 0
@@ -843,10 +853,9 @@ local function measure_plain_section(draft: SectionDraft, resolve_serdes: Resolv
 	if serdes then
 		flags += flag_inline_values
 		size += 2
-		local hooks = serdes :: any
 		local stash = table.create(ids_count) :: { buffer }
 		encoded_values = stash
-		local values_size = encode_buffer_values(serdes_key, hooks.encode, hooks.size, values :: { any }, stash, 0)
+		local values_size = encode_buffer_values(serdes_key, serdes.encode, serdes.size, values :: { any }, stash, 0)
 		size += values_size
 	end
 	-- only an encoded length can overflow: with no prefix, counts alone decide the width however many bytes the
@@ -939,8 +948,7 @@ local function write_plain_section(data: buffer, section_offset: number, draft: 
 		end
 	end
 	if serdes then
-		offset =
-			write_buffer_values(data, offset, (serdes :: any).size == nil, ids_count, draft.encoded :: { buffer }, 0)
+		offset = write_buffer_values(data, offset, serdes.size == nil, ids_count, draft.encoded :: { buffer }, 0)
 	end
 	if nulled then
 		for _, id in nulled do
@@ -996,20 +1004,22 @@ local function prune_failing_values(
 	values: { any },
 	limit: number?
 ): (number, any)
-	local hooks = serdes :: any
-	local encode = hooks.encode
-	local static: number? = hooks.size
+	local encode = serdes.encode
+	local static: number? = serdes.size
 	local count = #ids
 	local kept = 0
 	local first_error: any = nil
 	for i = 1, count do
-		local ok, result = pcall(encode, values[i])
+		-- result is unknown rather than pcall's inferred buffer: it holds whatever the user hook actually
+		-- returned until the check below, and the error strings the checks swap in after
+		local ok, result: unknown = pcall(encode, values[i])
 		if ok and type(result) ~= "buffer" then
 			ok = false
 			result = `serdes encode hooks must return a buffer! ({id_to_string(component)} returned a {type(result)})`
 		end
 		if ok then
-			local length = buffer.len(result)
+			-- cast: ok surviving the buffer check above is what refines result, which the solver can't track
+			local length = buffer.len(result :: buffer)
 			if static ~= nil then
 				if length ~= static then
 					ok = false
@@ -1058,7 +1068,7 @@ local function salvage_section_values(draft: SectionDraft, resolve_serdes: Resol
 			if ids == nil or #ids == 0 then
 				continue
 			end
-			local pair_id = jecs.pair(relation :: any, run.target :: any)
+			local pair_id = pair(relation :: number, run.target)
 			local serdes = resolve_serdes(pair_id, relation)
 			if serdes == nil then
 				continue
@@ -1197,7 +1207,8 @@ end
 -- copied out of it into an exactly-sized buffer, so pooled draft lists never escape.
 local function finalize_chunks(
 	frame: number,
-	drafts: { [number]: SectionDraft },
+	-- keyed by cell id; the keys are ignored here (the server's accumulators key by their branded id types)
+	drafts: { [any]: SectionDraft },
 	budget: number,
 	resolve_serdes: ResolveSerdes,
 	scratch: buffer,
@@ -1226,19 +1237,19 @@ local function finalize_chunks(
 		local nulled_count = if nulled then #nulled else 0
 
 		-- bytes every section of this draft pays, continuations included: flags + length + the naming ids
-		local header = 3 + id_width
+		local header_bytes = 3 + id_width
 		if relation ~= nil then
-			header += id_width
+			header_bytes += id_width
 		end
 
 		local serdes_key: any = if relation ~= nil
-			then jecs.pair(relation :: any, draft.target :: any)
+			then pair(relation :: number, draft.target :: number)
 			else draft.component
 		local static: number? = nil
 		local stash: { buffer }? = nil
 		if ids_count > 0 then
 			-- the largest value the budget can pack behind an empty chunk's header and count fields
-			local limit = budget - chunk_header_width - header - 4 - id_width
+			local limit = budget - chunk_header_width - header_bytes - 4 - id_width
 			if limit > narrow_limit then
 				limit = narrow_limit
 			end
@@ -1254,8 +1265,7 @@ local function finalize_chunks(
 				end
 				ids_count = 0
 			else
-				local hooks = serdes :: any
-				static = hooks.size
+				static = serdes.size
 				local encoded: { buffer }
 				if shared_stash == nil then
 					encoded = table.create(ids_count) :: { buffer }
@@ -1268,7 +1278,7 @@ local function finalize_chunks(
 				local ok, encode_error = pcall(
 					encode_chunk_values :: any,
 					serdes_key,
-					hooks.encode,
+					serdes.encode,
 					static,
 					values :: { any },
 					ids_count,
@@ -1290,7 +1300,7 @@ local function finalize_chunks(
 					ok, encode_error = pcall(
 						encode_chunk_values :: any,
 						serdes_key,
-						hooks.encode,
+						serdes.encode,
 						static,
 						values :: { any },
 						ids_count,
@@ -1325,7 +1335,7 @@ local function finalize_chunks(
 				offset = chunk_header_width
 			end
 
-			local remaining = budget - offset - header
+			local remaining = budget - offset - header_bytes
 
 			-- fit pass: how many value cells the open chunk takes, the u16 ids_count field charged with the first
 			local take_ids = 0
@@ -1381,7 +1391,7 @@ local function finalize_chunks(
 			end
 
 			local flags = 0
-			local section_size = header
+			local section_size = header_bytes
 			if take_ids > 0 then
 				flags = flag_has_ids
 				section_size += 2 + take_ids * id_width + values_size
@@ -1611,9 +1621,8 @@ export type DecodedPacket = {
 -- u16 prefix unless the registration declares a static size (see the Serdes type in types.luau).
 local function decode_values(data: buffer, offset: number, serdes: Serdes, count: number): ({ any }, number)
 	local decoded: { any } = table.create(count)
-	local hooks = serdes :: any
-	local decode = hooks.decode
-	local static: number? = hooks.size
+	local decode = serdes.decode
+	local static: number? = serdes.size
 	for i = 1, count do
 		local length: number
 		if static ~= nil then
@@ -1674,7 +1683,7 @@ local function decode_section(
 				read_run_header(data, offset, wide)
 			offset = list_offset
 
-			local component = jecs.pair(relation :: any, run_target :: any) :: any
+			local component = pair(relation, run_target)
 			local ids = read_ids(run_ids_count)
 			local values: { any }? = nil
 			if run_ids_count > 0 then
@@ -1712,7 +1721,7 @@ local function decode_section(
 	local relation: number? = nil
 	if target_id ~= nil then
 		relation = first_id
-		component = jecs.pair(first_id :: any, target_id :: any) :: any
+		component = pair(first_id, target_id)
 	end
 
 	local ids = read_ids(ids_count)
@@ -1850,7 +1859,7 @@ local function decode_chunk(chunk: buffer, resolve_serdes: ResolveSerdes?): Deco
 		local relation: number? = nil
 		if target_id ~= nil then
 			relation = first_id
-			component = jecs.pair(first_id :: any, target_id :: any) :: any
+			component = pair(first_id, target_id)
 		end
 
 		offset = list_offset

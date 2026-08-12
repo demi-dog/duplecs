@@ -9402,7 +9402,7 @@ test("mapping a previously-unmapped component with set_client_entity lets its la
 	expect_equal(c2.world:get(le1, c2.defs.Health), nil, "the second skipped cell never applied either")
 
 	-- map the id after the fact, as the caller is meant to before the server first references it; this also
-	-- clears the id's skip_warned entry, re-arming the warning for a later skip
+	-- clears the id's unmapped_warned entry, re-arming the warning for a later skip
 	c2.net.set_client_entity(s.defs.Health, c2.defs.Health)
 
 	s.world:set(e1, s.defs.Health, 3)
