@@ -1,0 +1,4 @@
+{
+	// match CI's primary typecheck (see .github/workflows/ci.yml): analyze with the new Luau type solver
+	"luau-lsp.fflags.enableNewSolver": true
+}

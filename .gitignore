@@ -1,0 +1,8 @@
+# installed/fetched dependencies (see tests/setup.luau)
+/roblox_packages/
+/luau_packages/
+/lune_packages/
+
+# pesde state
+/.pesde/
+pesde.lock

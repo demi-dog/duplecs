@@ -1,0 +1,36 @@
+# wally manifest for the Wally-registry release. pesde.toml stays authoritative:
+# the release workflow reads `version` from there and refuses to run when this
+# file's version disagrees, and this file's `exclude` list mirrors pesde.toml's
+# `includes` -- wally packs everything on disk that no glob prunes (dot-prefixed
+# entries are excluded by default), so anything pesde's includes leave out is
+# named here. never run `wally package` or `wally publish` against the live
+# tree: the archive must carry the wally-only consumption arrangement (a
+# project file, a redirect root, and a jecs shim under roblox_packages), so
+# both always run against a staged copy built by .github/scripts/wally_stage.sh
+# -- which is also why roblox_packages must NOT be excluded here.
+
+# the scope is demi-dog here but demidog on pesde: wally scope claims require
+# scope == the publisher's github username lowercased, `demidog` the account is
+# taken, and the two registries' name alphabets are exact inverses on -/_ so no
+# punctuated scope can match across both (decided 2026-08-11).
+[package]
+name = "demi-dog/duplecs"
+version = "1.0.0"
+description = "Generalized per-world replication for jecs"
+license = "MIT"
+repository = "https://github.com/demi-dog/duplecs"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+
+exclude = [
+	"CONTRIBUTING.md",
+	"globals.d.luau",
+	"pesde.lock",
+	"pesde.toml",
+	"rokit.toml",
+	"stylua.toml",
+	"tests",
+]
+
+[dependencies]
+jecs = "ukendio/jecs@^0.11.0"

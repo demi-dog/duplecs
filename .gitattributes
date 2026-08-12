@@ -1,0 +1,3 @@
+# checkout every text file with LF endings on all platforms so formatting
+# and CI checks behave identically everywhere.
+* text=auto eol=lf

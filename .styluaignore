@@ -1,0 +1,7 @@
+# fetched dependencies, not ours to format
+roblox_packages/
+luau_packages/
+lune_packages/
+
+# definition-file syntax (`declare`) is not parseable Luau source
+globals.d.luau

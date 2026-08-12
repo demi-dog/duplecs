@@ -1,0 +1,34 @@
+name = "demidog/duplecs"
+version = "1.0.0"
+description = "Generalized per-world replication for jecs"
+license = "MIT"
+repository = "https://github.com/demi-dog/duplecs"
+
+# directory entries in `includes` match only the entry itself, not its
+# contents -- the `/**` globs are what carry the files (found 2026-08-11 by
+# the release rig's dry run: bare "src" shipped an init.luau-only package).
+includes = [
+	"pesde.toml",
+	"README.md",
+	"LICENSE",
+	"CHANGELOG.md",
+	"src/**",
+	"docs/**",
+]
+
+[target]
+environment = "roblox"
+lib = "src/init.luau"
+build_files = ["src"]
+
+[indices]
+default = "https://github.com/pesde-pkg/index"
+
+[wally_indices]
+default = "https://github.com/UpliftGames/wally-index"
+
+[dependencies]
+jecs = { wally = "ukendio/jecs", version = "^0.11.0" }
+
+[engines]
+pesde = "^0.7.3"

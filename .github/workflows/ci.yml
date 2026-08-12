@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: CompeyDev/setup-rokit@v0.2.1
+
+      - name: Fetch jecs
+        run: lune run tests/setup.luau
+
+      - name: Run verification suite
+        run: lune run tests/verification_suite.luau
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: CompeyDev/setup-rokit@v0.2.1
+
+      - name: Check formatting
+        run: stylua --check .
+
+      # the analyzer resolves duplecs' jecs require against roblox_packages/
+      - name: Fetch jecs
+        run: lune run tests/setup.luau
+
+      - name: Typecheck
+        run: luau-lsp analyze --flag:LuauSolverV2=true --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
+
+      # consumers analyze the shipped sources with whatever solver their tooling defaults to, so the old
+      # solver must stay green until the ecosystem finishes migrating (pinned false explicitly, so a
+      # luau-lsp bump that flips the default can't silently turn this into a second new-solver run)
+      - name: Typecheck (old solver)
+        run: luau-lsp analyze --flag:LuauSolverV2=false --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src

@@ -1,0 +1,153 @@
+# tags and publishes releases automatically: whenever main carries a `version`
+# in pesde.toml with no matching v<version> tag, this creates and pushes that
+# tag -- the ref consumers pin (see README.md) -- and chains the registry
+# publishes after it. the publish steps live in this same workflow because refs
+# created with a workflow's GITHUB_TOKEN never trigger other workflows, so a
+# separate publish workflow on `push: tags:` would never fire.
+#
+# the whole job is gated on the RELEASE_ENABLED repository variable, so the
+# same file can sit inert in a repo that must never release (leave the
+# variable unset) while running verbatim in one that does.
+#
+# the job is structured to fix forward: every step checks its own work rather
+# than exiting early -- the tag-exists check skips only the tagging, and each
+# publish step skips only when its registry already carries this version (or
+# while its manifest still says `private = true`, which turns a push into a
+# tag-only release). a push that tags and then fails to publish is retried by
+# simply pushing again once the cause is fixed.
+#
+# before anything irreversible, the job re-runs CI's checks inline (kept in
+# sync with .github/workflows/ci.yml by hand): registry publishes cannot be
+# unpublished, so a red push must never reach them, and awaiting ci.yml's own
+# result from here would take workflow_run wiring this avoids.
+
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    if: ${{ vars.RELEASE_ENABLED == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        uses: CompeyDev/setup-rokit@v0.2.1
+
+      - name: Install pesde
+        uses: pesde-pkg/setup@v1
+
+      # ---- the inline CI gate (mirrors ci.yml) ----
+
+      - name: Fetch jecs
+        run: lune run tests/setup.luau
+
+      - name: Run verification suite
+        run: lune run tests/verification_suite.luau
+
+      - name: Check formatting
+        run: stylua --check .
+
+      - name: Typecheck
+        run: luau-lsp analyze --flag:LuauSolverV2=true --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
+
+      - name: Typecheck (old solver)
+        run: luau-lsp analyze --flag:LuauSolverV2=false --platform standard --definitions=globals.d.luau --ignore "roblox_packages/**" src
+
+      # ---- the release itself ----
+
+      - name: Resolve the release version
+        id: version
+        run: |
+          version="$(grep -m 1 '^version = ' pesde.toml | cut -d '"' -f 2)"
+          # the two manifests release in lockstep; refuse to release a drifted pair
+          wally_version="$(grep -m 1 '^version = ' wally.toml | cut -d '"' -f 2)"
+          if [ "${version}" != "${wally_version}" ]; then
+            echo "pesde.toml says ${version} but wally.toml says ${wally_version}; refusing to release" >&2
+            exit 1
+          fi
+          # changelog discipline, enforced: a release must document itself
+          if ! grep -q "^## \[${version}\]" CHANGELOG.md; then
+            echo "CHANGELOG.md has no [${version}] section; refusing to release v${version}" >&2
+            exit 1
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Create the release tag
+        run: |
+          tag="v${{ steps.version.outputs.version }}"
+          if [ -n "$(git ls-remote --tags origin "refs/tags/${tag}")" ]; then
+            echo "${tag} already exists; skipping the tagging"
+          else
+            git tag "${tag}"
+            git push origin "${tag}"
+          fi
+
+      # each publish step checks its own registry, so a rerun after a partial
+      # failure publishes exactly what is missing and nothing twice
+
+      - name: Publish to pesde
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          if grep -q '^private = true' pesde.toml; then
+            echo "pesde.toml carries private = true; tag-only release, skipping the pesde publish"
+            exit 0
+          fi
+          name="$(grep -m 1 '^name = ' pesde.toml | cut -d '"' -f 2)"
+          scope="${name%%/*}"
+          bare="${name##*/}"
+          # the api host the default index's config.toml names; the version+target
+          # read answers 200 when published and 404 when not, no auth needed
+          if curl -fso /dev/null "https://registry.pesde.daimond113.com/v1/packages/${scope}%2F${bare}/${version}/roblox"; then
+            echo "${name}@${version} already on the pesde registry; skipping the pesde publish"
+            exit 0
+          fi
+          pesde auth login --token "${{ secrets.PESDE_TOKEN }}"
+          # publish refuses without a lockfile in sync with the manifest, and
+          # pesde.lock is gitignored. the install also rewrites the fetched
+          # roblox_packages/jecs.luau into a roblox linker stub, which is why
+          # this step must stay after the inline CI gate
+          pesde install
+          pesde publish -y
+
+      - name: Publish to wally
+        run: |
+          if grep -q '^private = true' wally.toml; then
+            echo "wally.toml carries private = true; tag-only release, skipping the wally publish"
+            exit 0
+          fi
+          # wally packs whatever sits on disk, so the publish runs against a
+          # staged pristine copy of the tracked tree (the live workspace carries
+          # fetched jecs, pesde install output, and action logs) with the
+          # wally-only consumption arrangement added on top -- the project file,
+          # redirect root, and jecs shim wally consumers need. the script
+          # documents the arrangement; local free checks run through it too
+          staging="$(mktemp -d)"
+          bash .github/scripts/wally_stage.sh "${staging}"
+          # wally 0.3.2's publish has no --token flag (that flag is unreleased
+          # main-branch code); auth goes through `wally login`, which stores the
+          # token under the api url of the manifest's registry index
+          wally login --token "${{ secrets.WALLY_TOKEN }}"
+          # `wally publish` exits 0 even when the server refuses the publish, so
+          # success is asserted on its output instead of its exit code, with the
+          # already-published refusal tolerated for reruns (the || true keeps a
+          # nonzero cli failure from killing the `-e` step before its output
+          # prints -- exactly what hid the --token failure this fixed)
+          output="$(wally publish --project-path "${staging}" 2>&1)" || true
+          echo "${output}"
+          if echo "${output}" | grep -q "Package published successfully!"; then
+            exit 0
+          fi
+          if echo "${output}" | grep -q "package already exists in index"; then
+            echo "already on the wally registry; skipping the wally publish"
+            exit 0
+          fi
+          echo "wally publish failed" >&2
+          exit 1
