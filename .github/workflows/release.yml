@@ -151,3 +151,27 @@ jobs:
           fi
           echo "wally publish failed" >&2
           exit 1
+
+      - name: Attach the studio rbxm to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if grep -q '^private = true' wally.toml; then
+            echo "wally.toml carries private = true; tag-only release, skipping the rbxm"
+            exit 0
+          fi
+          tag="v${{ steps.version.outputs.version }}"
+          name="$(grep -m 1 '^name = ' wally.toml | cut -d '"' -f 2)"
+          asset="${name##*/}.rbxm"
+          # fix-forward: skip only what already exists -- the asset check covers
+          # the release too, since an asset can't exist without its release
+          if gh release view "${tag}" --json assets --jq '.assets[].name' 2>/dev/null | grep -qx "${asset}"; then
+            echo "${asset} already attached to ${tag}; skipping the rbxm"
+            exit 0
+          fi
+          bash .github/scripts/build_rbxm.sh "${asset}"
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release upload "${tag}" "${asset}"
+          else
+            gh release create "${tag}" --title "${tag}" --notes "See [CHANGELOG.md](CHANGELOG.md) for what changed." "${asset}"
+          fi

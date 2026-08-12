@@ -108,6 +108,8 @@ jecs = "ukendio/jecs@^0.11.0"
 
 duplecs resolves jecs `^0.11.0` transitively (from the Wally registry, `ukendio/jecs`), but your project needs jecs anyway to create the world — keep the versions compatible so both resolve to a single installation.
 
+For Studio-only workflows, every release also attaches a ready-to-insert `duplecs.rbxm` to its [GitHub release](https://github.com/demi-dog/duplecs/releases). Insert it somewhere both sides can reach (typically `ReplicatedStorage`), then open `duplecs > roblox_packages > jecs` and replace its error line with a require of your project's jecs module, as its comment instructs — until then, requiring duplecs raises that same instruction. The artifact deliberately bundles no jecs of its own, because duplecs and your own code must share one jecs installation; if your place doesn't have jecs yet, jecs attaches its own `.rbxm` to [its releases](https://github.com/Ukendio/jecs/releases) (use a `0.11.x` version).
+
 Before upgrading duplecs, check the [changelog](CHANGELOG.md): every entry states whether the wire format changed, and both sides of the wire must run the same duplecs build, so a wire change means upgrading the server and its clients together.
 
 ## Documentation
