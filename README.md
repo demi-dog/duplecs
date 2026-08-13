@@ -114,8 +114,8 @@ Before upgrading duplecs, check the [changelog](CHANGELOG.md): every entry state
 
 ## Documentation
 
-- [`docs/guides/`](docs/guides/README.md) — task-oriented guides, each built around working code: a [getting started](docs/guides/001-getting-started.md) setup guide plus per-feature guides readable in any order.
 - [`docs/api.md`](docs/api.md) — the public API listing: every export with a short description.
+- [`docs/guides/`](docs/guides/README.md) — task-oriented guides, each built around working code: a [getting started](docs/guides/001-getting-started.md) setup guide plus per-feature guides readable in any order.
 - [`docs/spec.md`](docs/spec.md) — the complete specification: exact guarantees, edge cases, and performance notes behind every behavior.
 - [`CHANGELOG.md`](CHANGELOG.md) — per-release change history.
 

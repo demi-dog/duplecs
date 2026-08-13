@@ -1,6 +1,10 @@
 # duplecs Guides
 
-Task-oriented guides for using duplecs, each built around working code. Start with [Getting started](001-getting-started.md) if you're new; the rest are per-feature and readable in any order. For the complete contract behind any behavior — exact guarantees, edge cases, performance notes — see the [specification](../spec.md); for a compact listing of every export, the [API reference](../api.md).
+Task-oriented guides for using duplecs, each built around working code.
+
+The [API reference](../api.md) — a compact listing of every export with a short description — is worth scanning first, to see the whole surface these guides walk through.
+
+Start with [Getting started](001-getting-started.md) if you're new; the rest are per-feature and readable in any order. For the complete contract behind any behavior — exact guarantees, edge cases, performance notes — see the [specification](../spec.md).
 
 ## Setup
 

@@ -2,6 +2,8 @@
 
 This guide takes you from an empty project to entities replicating from a server world into client worlds. It assumes you know [jecs](https://github.com/Ukendio/jecs) basics — worlds, entities, components, and pairs — but nothing about duplecs.
 
+A scan of the [API reference](../api.md) — a compact listing of every export with a short description — is a worthwhile first stop, to see the whole surface before this guide walks parts of it.
+
 The code below forms three complete scripts — a shared component module, one server script, and one client script. It requires packages by string path; substitute however your project resolves packages.
 
 Install duplecs following the [installation instructions](../../README.md#installation) before starting if you haven't yet.
