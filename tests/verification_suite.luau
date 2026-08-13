@@ -1635,6 +1635,45 @@ test("recycled server ids resolve to the new entity", function(env)
 	)
 end)
 
+test("a stale client entity reference resolves no server mapping across a dense-id recycle", function(env)
+	-- the reverse map keys by the client entity's *dense* id, so a recycled dense slot already holds the next
+	-- tenant's mapping; get_server_entity's generation-aware liveness guard is what keeps a caller's stale
+	-- reference from being handed it
+	local s, c = env.server, env.client
+	local e1 = s.world:entity()
+	s.world:add(e1, s.net.Replicated)
+	s.world:set(e1, s.defs.Health, 1)
+	env.sync(env.player_a)
+
+	local stale_ref = c.net.get_client_entity(e1)
+	expect(stale_ref ~= nil, "precondition: the first server entity is mapped to a client entity")
+
+	-- the deletion ends the mapping and kills the client entity, freeing its dense id
+	s.world:delete(e1)
+	env.sync(env.player_a)
+	expect_equal(c.world:contains(stale_ref), false, "the client entity died with the server entity")
+
+	local e2 = s.world:entity()
+	s.world:add(e2, s.net.Replicated)
+	s.world:set(e2, s.defs.Health, 2)
+	env.sync(env.player_a)
+
+	-- exactly one client entity was freed, so jecs's free list hands its dense id to the next creation
+	local le2 = c.net.get_client_entity(e2)
+	expect(le2 ~= nil, "the second server entity is mapped to a fresh client entity")
+	expect(
+		jecs.ECS_ID(le2) == jecs.ECS_ID(stale_ref) and le2 ~= stale_ref,
+		"precondition: the client did not recycle the freed dense id, scenario cannot be tested"
+	)
+
+	expect_equal(
+		c.net.get_server_entity(stale_ref),
+		nil,
+		"the stale reference resolves nothing, not the dense slot's new tenant's mapping"
+	)
+	expect_equal(c.net.get_server_entity(le2), e2, "the live client entity still resolves its own server id")
+end)
+
 test("locally cascade-deleting an imported entity tears down its mapping", function(env)
 	local s, c = env.server, env.client
 	local e = s.world:entity()

@@ -85,13 +85,26 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- ENTITY MAPPING
 
-	-- client entities key by the *dense* half of their server id -- all a section wire id carries -- while
-	-- server_entity_map (and both maps' values) keeps the full gen-qualified id: the creation and names lists
-	-- are where a client learns the generation, which get_server_entity must expose for client->server requests.
-	-- dense keys stay unambiguous because the server never holds two live entities on one dense id and reconcile
-	-- applies deletes before creates, so a recycled id's old mapping always ends before its new tenant arrives.
+	-- both maps key by *dense* ids -- client_entity_map by the dense half of the server id (all a section wire
+	-- id carries), server_entity_map by the dense half of its own client entity -- while both maps' *values*
+	-- keep full gen-qualified ids: the creation and names lists are where a client learns the server
+	-- generation, which get_server_entity must expose for client->server requests. dense keys are deliberate:
+	-- churn respawns recycled dense ids under bumped generations, so gen-qualified keys would be brand new on
+	-- every insert, and a luau table churning fresh keys rehashes O(live) per insert whenever its live count
+	-- sits at (or one below) a power of two -- recycled dense keys keep the key set stable instead (nil then
+	-- re-set of the same key revives its slot in place, never rehashing at steady state). server-dense keys
+	-- stay unambiguous because the server never holds two live entities on one dense id and reconcile applies
+	-- deletes before creates, so a recycled id's old mapping always ends before its new tenant arrives.
+	-- client-dense keys stay unambiguous because an entry can never outlive its tenant: every mapped entity
+	-- carries Imported, and every mapping-ending path clears the entry (the unreplicated list via
+	-- delete_client_entity, and the Imported removed hook behind deletions, clears, and manual removes). the
+	-- one thing dense keys give up is stale-reference rejection by key identity, so reads split by caller:
+	-- internal reads index the table directly with entities known live (archetype walks, contains-guarded
+	-- lookups, or the removed hook's mid-teardown entity, whose dense slot cannot have been recycled yet),
+	-- while the public get_server_entity guards with the generation-aware world:contains so a caller's stale
+	-- reference resolves to nil rather than to the dense slot's next tenant's mapping.
 	local client_entity_map = {} :: { [number]: Entity }
-	local server_entity_map = {} :: { [Entity]: number }
+	local server_entity_map = {} :: { [number]: number }
 
 	-- dense server ids whose mapping was established by a shared-name announcement (see map_shared_name): a name
 	-- retraction may only end these -- a creation-established mapping ends through the unreplicated list, and a
@@ -110,13 +123,19 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	local function set_client_entity(server_entity_gen: number, client_entity: Entity)
 		local dense_id = dense(server_entity_gen)
 		client_entity_map[dense_id] = client_entity
-		server_entity_map[client_entity] = server_entity_gen
+		server_entity_map[dense(client_entity)] = server_entity_gen
 		unmapped_warned[dense_id] = nil
 		world:add(client_entity, Imported)
 	end
 
+	-- the liveness guard is what makes a caller's stale reference safe under dense keys (see the maps above):
+	-- world:contains is generation-aware, so a dead reference resolves to nil here even when its dense slot
+	-- already holds a next tenant's mapping
 	local function get_server_entity(client_entity: Entity): number?
-		return server_entity_map[client_entity]
+		if world:contains(client_entity) ~= true then
+			return nil
+		end
+		return server_entity_map[dense(client_entity)]
 	end
 
 	-- warns when a reliable section references an unmapped component, relation, or pair target. unresolvable
@@ -156,8 +175,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		local dense_id = dense(server_entity_gen)
 		local existing_entity = client_entity_map[dense_id]
 		if existing_entity ~= nil and world:contains(existing_entity) then
-			if name_mapped[dense_id] == nil or server_entity_map[existing_entity] == server_entity_gen then
-				server_entity_map[existing_entity] = server_entity_gen
+			local existing_dense = dense(existing_entity)
+			if name_mapped[dense_id] == nil or server_entity_map[existing_dense] == server_entity_gen then
+				server_entity_map[existing_dense] = server_entity_gen
 				name_mapped[dense_id] = nil
 				return
 			end
@@ -175,7 +195,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- get_server_entity always returns the full gen-qualified id, so a round-tripped id matches exactly.
 	local function get_client_entity(server_entity: number): Entity?
 		local client_entity = client_entity_map[dense(server_entity)]
-		if client_entity ~= nil and server_entity_map[client_entity] == server_entity then
+		if client_entity ~= nil and server_entity_map[dense(client_entity)] == server_entity then
 			return client_entity
 		end
 		return nil
@@ -191,7 +211,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	end
 
 	local function remove_references(client_entity: Entity, server_entity: number)
-		server_entity_map[client_entity] = nil
+		server_entity_map[dense(client_entity)] = nil
 		local dense_id = dense(server_entity)
 		-- the dense slot may already belong to a newer mapping that replaced this one; only the mapping's own entry
 		-- (and provenance) end with it
@@ -266,8 +286,11 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 		-- covers deletions that bypass delete_client_entity (e.g. cascades). note: the client should avoid adding
 		-- (OnDeleteTarget, Delete) to imported entities; the resulting server/client mismatch is *not*
-		-- auto-corrected.
-		local server_entity = get_server_entity(client_entity)
+		-- auto-corrected. the raw read (not get_server_entity) is deliberate: this can fire inside world:delete's
+		-- teardown, and the getter's liveness guard must not decide anything mid-death (the pinned jecs keeps the
+		-- dying entity alive-indexed until its own removed hooks have run, but that ordering isn't contractual).
+		-- the read stays unambiguous because the dense slot cannot recycle before the deletion completes.
+		local server_entity = server_entity_map[dense(client_entity)]
 		if server_entity then
 			remove_references(client_entity, server_entity)
 		end
@@ -363,7 +386,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		local dense_id = dense(server_entity_gen)
 		local existing_entity = client_entity_map[dense_id]
 		if existing_entity ~= nil and world:contains(existing_entity) then
-			if server_entity_map[existing_entity] == server_entity_gen then
+			if server_entity_map[dense(existing_entity)] == server_entity_gen then
 				return
 			end
 			-- the Imported removed hook tears the stale mapping down
@@ -405,7 +428,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			return
 		end
 		local client_entity = client_entity_map[dense_id]
-		if client_entity ~= nil and server_entity_map[client_entity] == server_entity_gen then
+		if client_entity ~= nil and server_entity_map[dense(client_entity)] == server_entity_gen then
 			-- the Imported removed hook tears the mapping down; the client entity itself belongs to this world
 			-- and stays
 			world:remove(client_entity, Imported)
@@ -498,9 +521,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				for _, id in archetype.types do
 					if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
 						local relation = jecs.pair_first(world, id)
-						if server_entity_map[relation] ~= nil then
+						if server_entity_map[dense(relation)] ~= nil then
 							for _, subject in entities do
-								if server_entity_map[subject] ~= nil then
+								if server_entity_map[dense(subject)] ~= nil then
 									count += 1
 									subjects[count] = subject
 									cell_ids[count] = id
@@ -535,9 +558,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 					local id = archetype_types[i]
 					-- cast: jecs.pair_second's return is Component<unknown>, unrelated to Entity either way
 					local pair_target: Entity = jecs.pair_second(world, id) :: any
-					if pair_target == client_target or server_entity_map[pair_target] ~= nil then
+					if pair_target == client_target or server_entity_map[dense(pair_target)] ~= nil then
 						for _, subject in entities do
-							if server_entity_map[subject] ~= nil then
+							if server_entity_map[dense(subject)] ~= nil then
 								count += 1
 								subjects[count] = subject
 								cell_ids[count] = id
@@ -553,7 +576,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if idr_unpaired ~= nil then
 			for archetype_id in idr_unpaired.records do
 				for _, subject in world_archetypes[archetype_id].entities do
-					if server_entity_map[subject] ~= nil then
+					if server_entity_map[dense(subject)] ~= nil then
 						count += 1
 						subjects[count] = subject
 						cell_ids[count] = client_target

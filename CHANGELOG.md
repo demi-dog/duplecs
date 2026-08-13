@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 ### Fixed
 
 - Adding or removing `Replicated` no longer risks a hidden cost proportional to the world's replicated-entity count: an internal table keyed by full entity ids made Luau rebuild it on nearly every spawn whenever the number of replicated entities sat at (or one below) a power of two while entities churned. Spawn-and-despawn overhead at the benchmark's canonical shape (32 clients, two networked components) drops from ~14x to ~6x the cost of the same lifecycle on a world that isn't networked at all — see the updated tables in the [performance guide](docs/guides/012-performance.md). The wire format is unchanged.
+- The same table-rebuild pathology is fixed on the client: the server↔client entity mapping was keyed by full client entity ids, which are brand new for every reconciled creation, so a client whose mapped-entity count sat at (or one below) a power of two during entity churn paid a rebuild proportional to that count on nearly every creation it reconciled — at 1024 mapped entities, a benchmark frame reconciling one creation measured ~47 µs instead of ~5 µs. Stale entity references passed to `get_server_entity` still resolve to `nil`, now via a liveness check rather than key identity. The wire format is unchanged.
 
 ## [1.0.0] - 2026-08-12
 
