@@ -28,13 +28,13 @@ The headline rows, at the canonical shape: **32 clients, broadcast visibility** 
 | Component remove + set cycle | ~4x | ~1.5 µs |
 | Tag remove + add cycle | ~4x | ~1.5 µs |
 | Pair retarget (remove old target, set new) | ~5x | ~2.5 µs |
-| `Replicated` entity spawn + despawn (two networked components) | ~14x | ~15 µs |
+| `Replicated` entity spawn + despawn (two networked components) | ~6x | ~8 µs |
 
 A few readings worth pulling out:
 
 - **`NetworkedOnce` sets are genuinely free** — no changed hook is connected, exactly as [Replication basics](002-replication.md) promises. The same goes for `world:set` on a `NetworkedUnreliable` component in isolation; that row's ~3x is the cost of `generate_unreliable_chunks` re-encoding every visible value each call (a fixed-size f64 serdes hook included), which is the mode's whole deal.
 - **The structural rows (toggles, retargets) show lower ratios than value sets** not because duplecs does less there but because the baseline does more — a plain remove+add cycle already pays two archetype moves.
-- **Entity lifecycle is the priciest per op.** Spawning and despawning a replicated entity records the entity's appearance and disappearance for every connected client and reads out its current values for the clients gaining it, on top of the plain world's archetype work. ~15 µs per spawn+despawn cycle still means hundreds of replicated spawns per frame before it costs a millisecond, but mass-spawn frames are where duplecs is most visible in a profile.
+- **Entity lifecycle is the priciest per op.** Spawning and despawning a replicated entity records the entity's appearance and disappearance for every connected client and reads out its current values for the clients gaining it, on top of the plain world's archetype work. ~8 µs per spawn+despawn cycle still means over a hundred replicated spawns per frame before they cost a millisecond, but mass-spawn frames are where duplecs is most visible in a profile.
 
 ### Client count
 
@@ -43,7 +43,7 @@ Per-op cost grows with connected clients — sub-linearly, since content every c
 | Operation | 8 clients | 32 clients | 128 clients |
 | --- | --- | --- | --- |
 | `world:set`, `Networked` component | ~5x | ~6x | ~13x |
-| `Replicated` entity spawn + despawn | ~13x | ~15x | ~28x |
+| `Replicated` entity spawn + despawn | ~5x | ~6x | ~17x |
 
 The jump from 32 to 128 is mostly per-client packet assembly (and, for spawns, per-client visibility updates) scaling with the number of packets actually built.
 

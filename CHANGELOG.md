@@ -4,6 +4,12 @@ All notable changes to duplecs are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Every entry states whether the wire format changed: both sides of the wire must run the same duplecs build, so a wire change means upgrading the server and its clients together — check here before upgrading.
 
+## [Unreleased]
+
+### Fixed
+
+- Adding or removing `Replicated` no longer risks a hidden cost proportional to the world's replicated-entity count: an internal table keyed by full entity ids made Luau rebuild it on nearly every spawn whenever the number of replicated entities sat at (or one below) a power of two while entities churned. Spawn-and-despawn overhead at the benchmark's canonical shape (32 clients, two networked components) drops from ~14x to ~6x the cost of the same lifecycle on a world that isn't networked at all — see the updated tables in the [performance guide](docs/guides/012-performance.md). The wire format is unchanged.
+
 ## [1.0.0] - 2026-08-12
 
 The initial public release, published to the pesde registry as `demidog/duplecs` and the Wally registry as `demi-dog/duplecs`. Earlier development versions were never published — no public tags, no registry entries — so this changelog starts here, and later releases document their changes against this one.

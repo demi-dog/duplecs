@@ -245,14 +245,22 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- VISIBILITY STATE
 
-	-- entities with Replicated. note: cleared while the removed hook runs, so it reads false slightly earlier
-	-- than world:has would.
-	local replicated_entities = {} :: { [Entity]: true }
+	-- entities with Replicated, keyed by dense id. dense rather than gen-qualified deliberately: entity churn
+	-- inserts one fresh gen-qualified key per spawn while deaths leave tombstones, and luau rebuilds such a
+	-- table on nearly every insert whenever its live count sits at (or one below) a power of two -- the rebuilt
+	-- node array has no slack, so the next fresh key rebuilds again, costing a full O(live) rehash per spawn
+	-- (measured ~8.5us at 256 live entities, dominating spawn-heavy frames). dense ids recycle, so a death's
+	-- tombstone is revived in place by the slot's next tenant and the table never rehashes at steady state.
+	-- safe because every reader passes a live entity (the mirror leads the world mid-hook exactly like the
+	-- gen-keyed form did). note: cleared while the removed hook runs, so it reads false slightly earlier than
+	-- world:has would.
+	local replicated_entities = {} :: { [number]: true }
 
 	-- entities with a jecs.Name, mirrored by the name hooks initialize connects (seeded at construction) so
-	-- pair-target replicability stays a table lookup. note: cleared while the removed hook runs, so it reads
-	-- false slightly earlier than world:has would -- exactly when the restage must see the target as unnamed.
-	local named_entities = {} :: { [Entity]: true }
+	-- pair-target replicability stays a table lookup. keyed by dense id like replicated_entities above (named
+	-- entities churn the same way). note: cleared while the removed hook runs, so it reads false slightly
+	-- earlier than world:has would -- exactly when the restage must see the target as unnamed.
+	local named_entities = {} :: { [number]: true }
 
 	-- tracked components, mapped to whichever of Networked, NetworkedOnce, and NetworkedUnreliable owns the
 	-- tracking (the three are exclusive). networking a component also networks pairs using it as the relation.
@@ -398,7 +406,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- VISIBILITY CHECKERS
 
 	local function is_pair_target_replicable(target: Entity)
-		return replicated_entities[target] ~= nil or named_entities[target] ~= nil
+		local dense_target = dense(target)
+		return replicated_entities[dense_target] ~= nil or named_entities[dense_target] ~= nil
 	end
 
 	-- resolves whether the component is replication-eligible, the privacy key gating it per entity, and (for
@@ -456,7 +465,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- entity-level allow words gating it (nil when unrestricted). entity_vis_word fans the result out across
 	-- shards, so staging fetches these tables once rather than per shard.
 	local function entity_vis_masks(entity: Entity): (boolean, ShardMasks?)
-		if replicated_entities[entity] == nil then
+		if replicated_entities[dense(entity)] == nil then
 			return false, nil
 		end
 		return true, entity_gate_masks(entity)
@@ -481,7 +490,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local entity_masks = allow_masks[entity]
 		local cell_masks = if entity_masks then entity_masks[privacy_key] else nil
 		local target_masks: ShardMasks? = nil
-		if target ~= nil and replicated_entities[target] ~= nil then
+		if target ~= nil and replicated_entities[dense(target)] ~= nil then
 			target_masks = entity_gate_masks(target)
 		end
 		return cell_masks, target_masks
@@ -761,7 +770,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				tracked_target_gens[target] = target_gen
 				-- the target's first tracked pair: a named, unreplicated target is a shared definition clients should map
 				-- by name (replicated targets map through their creation entry instead)
-				if replicated_entities[target_gen] == nil then
+				if replicated_entities[target] == nil then
 					shared_names.announce(target_gen)
 				end
 			end
@@ -1062,7 +1071,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				if relation ~= nil and target ~= nil and is_pair_target_replicable(target) then
 					local cell_masks = if entity_masks then entity_masks[relation] else nil
 					local target_masks: ShardMasks? = nil
-					if replicated_entities[target] ~= nil then
+					if replicated_entities[dense(target)] ~= nil then
 						target_masks = entity_gate_masks(target)
 					end
 					stage_restaged_cell(component, entity, cell_masks, target_masks)
@@ -1090,7 +1099,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		for pair_id in bucket do
 			local eligible, privacy_key, target = resolve_component_eligibility(pair_id)
 			local target_masks: ShardMasks? = nil
-			if target ~= nil and replicated_entities[target] ~= nil then
+			if target ~= nil and replicated_entities[dense(target)] ~= nil then
 				target_masks = entity_gate_masks(target)
 			end
 			local idr = component_index[pair_id]
@@ -1150,14 +1159,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			fail(`{tag_name} components cannot be replicated!`)
 		end
 
-		replicated_entities[entity] = true
+		local dense_id = dense(entity)
+		replicated_entities[dense_id] = true
 
 		-- a replicated entity maps through its creation entry, never by name: withdraw the announcement. the staged
 		-- retraction is what unmaps the clients the entity is *not* visible to -- its eventual deletion never
 		-- reaches them, and a lingering name mapping would misbind the dense id's next tenant -- while a client
 		-- receiving the creation adopts the mapping out of name provenance first, so the same retraction leaves
 		-- them untouched.
-		local dense_id = dense(entity)
 		if shared_names.announced_id(dense_id) == entity then
 			shared_names.retract(dense_id)
 		end
@@ -1174,10 +1183,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- replicated_entities is cleared first so the restage below recomputes each mask as 0, staging the entity
 		-- delete and every cell removal
-		replicated_entities[entity] = nil
+		local dense_id = dense(entity)
+		replicated_entities[dense_id] = nil
 
 		-- an unreplicated entity still targeted by tracked pairs is back to mapping by name (if it has one)
-		if tracked_pairs_by_target[dense(entity)] ~= nil then
+		if tracked_pairs_by_target[dense_id] ~= nil then
 			shared_names.announce(entity)
 		end
 
@@ -1195,14 +1205,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if id ~= jecs.Name then
 			return
 		end
-		named_entities[entity] = true
+		local dense_id = dense(entity)
+		named_entities[dense_id] = true
 		-- pairs targeting the entity may just have gained a replicable target
 		restage_pairs_targeting(entity)
 		-- announce the relevant: a tracked definition, or an unreplicated target of tracked pairs (replicated
 		-- targets map through their creation entry instead)
 		if
 			tracked_by[entity] ~= nil
-			or (tracked_pairs_by_target[dense(entity)] ~= nil and replicated_entities[entity] == nil)
+			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
 		then
 			shared_names.announce(entity)
 		end
@@ -1215,9 +1226,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- a rename doesn't change replicability; announce-relevance is re-derived (the same condition as
 		-- on_name_added) rather than gated on an existing announcement -- a name refused at announce time (empty or
 		-- too long) leaves the id unannounced, and its fix arrives through this hook
+		local dense_id = dense(entity)
 		if
 			tracked_by[entity] ~= nil
-			or (tracked_pairs_by_target[dense(entity)] ~= nil and replicated_entities[entity] == nil)
+			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
 		then
 			shared_names.announce(entity)
 		end
@@ -1227,10 +1239,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if id ~= jecs.Name then
 			return
 		end
-		named_entities[entity] = nil
+		local dense_id = dense(entity)
+		named_entities[dense_id] = nil
 		-- pairs targeting the entity may just have lost their replicable target
 		restage_pairs_targeting(entity)
-		local dense_id = dense(entity)
 		if shared_names.announced_id(dense_id) == entity then
 			shared_names.retract(dense_id)
 		end
@@ -2236,7 +2248,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					if target_gen == nil or is_pair_target_replicable(target_gen) ~= true then
 						continue
 					end
-					if replicated_entities[target_gen] ~= nil then
+					if replicated_entities[ECS_PAIR_SECOND(component)] ~= nil then
 						local gate = entity_gate_masks(target_gen)
 						if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
 							continue
@@ -3944,7 +3956,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- their structural moves (the first world:added/changed/removed on a component sets EcsOnAdd/etc on it,
 		-- moving it) run strictly before or strictly after this walk, never during it.
 		for entity in world:each(jecs.Name) do
-			named_entities[entity] = true
+			named_entities[dense(entity)] = true
 		end
 
 		catch_up()
