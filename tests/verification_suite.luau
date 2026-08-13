@@ -13706,7 +13706,7 @@ end)
 -- two of the docs sitting above the sources are pinned to them mechanically rather than by convention, because
 -- both drifted in practice: a diagnostic shipped with no matching spec change, another kept its old wording in
 -- one appendix section after being reworded elsewhere, and is_entity_replicated was simply missing from
--- docs/api.md. so the suite reads them: docs/api.md must carry a `###` heading for every key the server and
+-- docs/api.md. so the suite reads them: docs/api.md must carry a `####` heading for every key the server and
 -- client instances return (underscore-prefixed debug exports excepted, being deliberately undocumented), and
 -- docs/spec.md's warnings-and-errors appendix must quote every message the module's warn( and fail( calls
 -- raise. each doc is checked in both directions -- forwards, so nothing the sources have goes undocumented,
@@ -13722,11 +13722,11 @@ end)
 -- composed string, one entry filed under a fourth label, one heading demoted a level -- fails outright
 -- instead of quietly dropping out of the comparison; raise a floor when the surface it counts really grows.
 
--- every `###` heading's leading identifier, signature and type parameters stripped
+-- every `####` heading's leading identifier, signature and type parameters stripped
 local function collect_api_headings()
 	local headings = {}
 	for line in string.gmatch(fs.readFile("docs/api.md"), "[^\n]+") do
-		if string.sub(line, 1, 4) ~= "### " then
+		if string.sub(line, 1, 5) ~= "#### " then
 			continue
 		end
 		local span = string.match(line, "`([^`]+)`")
