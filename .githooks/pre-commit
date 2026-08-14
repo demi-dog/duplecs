@@ -1,0 +1,18 @@
+#!/bin/sh
+# Runs CI's formatting check before a commit lands, so a stylua failure surfaces here rather than
+# several commits later in Actions. Enable it with `git config core.hooksPath .githooks` (the
+# Setup section of CONTRIBUTING.md); bypass a single commit with `git commit --no-verify`.
+#
+# This checks the whole tree, exactly as CI does, not just the staged files — a partial commit that
+# leaves an unformatted file behind would still fail CI on the next push.
+
+if ! command -v stylua >/dev/null 2>&1; then
+	echo "pre-commit: stylua not found, skipping the formatting check (run 'rokit install')" >&2
+	exit 0
+fi
+
+if ! stylua --check .; then
+	echo "" >&2
+	echo "pre-commit: formatting check failed — run 'stylua .' and stage the result" >&2
+	exit 1
+fi

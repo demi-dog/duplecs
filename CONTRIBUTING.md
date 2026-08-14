@@ -9,7 +9,10 @@ Tools are pinned in `rokit.toml`; [rokit](https://github.com/rojo-rbx/rokit) fet
 ```sh
 rokit install
 lune run tests/setup.luau   # once: fetch the pinned jecs release directly into roblox_packages/
+git config core.hooksPath .githooks   # once: enable the pre-commit formatting check
 ```
+
+`.githooks/pre-commit` runs `stylua --check .` — the same check CI runs — so a formatting slip fails the commit rather than the push. It skips itself when StyLua isn't installed, and `git commit --no-verify` bypasses it.
 
 `lune run tests/setup.luau` fetches the jecs source directly, whereas a `pesde install` run inside this repo would link a Roblox-only stub in its place (Wally-sourced packages are linked with instance-based requires); re-run `tests/setup.luau` if that happens.
 
