@@ -11,7 +11,12 @@
 -- does on a world that isn't networked at all", amortized per op at the row's
 -- stated ops/frame — generate_packets has a per-frame floor besides its
 -- marginal per-change cost, so the ratios only hold near these batch sizes
--- (the floor section measures the fixed part alone).
+-- (the floor section measures the fixed part alone). Every server row also
+-- prints a mutate/generate split of the same timed frames: `mutate` is the
+-- workload's mutations with duplecs's hooks live (mutate minus plain ~ the
+-- per-op staging cost) and `generate` is the packet pass, so a row says not
+-- just how much overhead replication adds but which phase it lives in. The
+-- joiner row splits the same way into add_client and generate_packets.
 --
 -- Sections:
 --   canonical      — the headline rows at P=32 (one full shard), broadcast
@@ -157,8 +162,12 @@ local function make_world(P)
 end
 
 -- ---- timing shell: WARM then REPS frames of mutate plus the generate call
--- when one is given, returning nanoseconds per op. The drain runs outside the
--- timed region.
+-- when one is given. The drain runs outside the timed region. The two phases
+-- of each frame are clocked separately so every row can report where its
+-- overhead lives: `mutate` is the workload's mutations with duplecs's hooks
+-- live (so mutate minus the plain column is the per-op staging cost) and
+-- `generate` is the packet pass. Returns total, mutate, and generate
+-- nanoseconds per op.
 
 local function measure(mutate, generate, ops)
 	for _ = 1, WARM do
@@ -168,31 +177,35 @@ local function measure(mutate, generate, ops)
 		end
 	end
 
-	local elapsed = 0
+	local mutate_elapsed = 0
+	local generate_elapsed = 0
 	for _ = 1, REPS do
 		local t = os.clock()
 		mutate()
+		local mid = os.clock()
+		mutate_elapsed += mid - t
 		if generate ~= nil then
 			local packets = generate()
-			elapsed += os.clock() - t
+			generate_elapsed += os.clock() - mid
 			guard += drain(packets)
-		else
-			elapsed += os.clock() - t
 		end
 	end
 
-	return 1e9 * elapsed / (REPS * ops)
+	local scale = 1e9 / (REPS * ops)
+	return (mutate_elapsed + generate_elapsed) * scale, mutate_elapsed * scale, generate_elapsed * scale
 end
 
-local function row(label, P, plain_ns, duplecs_ns)
+local function row(label, P, plain_ns, duplecs_ns, mutate_ns, generate_ns)
 	print(
 		string.format(
-			"%-44s P=%3d | plain %8.1f ns/op | duplecs %8.1f ns/op | x%5.2f",
+			"%-44s P=%3d | plain %8.1f ns/op | duplecs %8.1f ns/op | x%5.2f | mutate %8.1f + generate %8.1f",
 			label,
 			P,
 			plain_ns,
 			duplecs_ns,
-			duplecs_ns / plain_ns
+			duplecs_ns / plain_ns,
+			mutate_ns,
+			generate_ns
 		)
 	)
 end
@@ -501,14 +514,17 @@ local function run_joiner_row()
 	end
 	net.generate_packets()
 
-	local elapsed = 0
+	local add_elapsed = 0
+	local generate_elapsed = 0
 	local bytes = 0
 	for _ = 1, FULL_REPS do
 		local viewer = {}
 		local t = os.clock()
 		net.add_client(viewer)
+		local mid = os.clock()
 		local packets = net.generate_packets()
-		elapsed += os.clock() - t
+		generate_elapsed += os.clock() - mid
+		add_elapsed += mid - t
 		bytes = buffer.len(packets[viewer].data)
 		net.remove_client(viewer)
 		net.generate_packets()
@@ -517,11 +533,13 @@ local function run_joiner_row()
 	local cells = FULL_BASE + FULL_BASE // 4 + FULL_PAIRS
 	print(
 		string.format(
-			"full packet: %4d entities, %4d cells        | %8.4f ms/join | %6d B",
+			"full packet: %4d entities, %4d cells        | %8.4f ms/join | %6d B | add_client %.4f + generate %.4f",
 			FULL_BASE,
 			cells,
-			1000 * elapsed / FULL_REPS,
-			bytes
+			1000 * (add_elapsed + generate_elapsed) / FULL_REPS,
+			bytes,
+			1000 * add_elapsed / FULL_REPS,
+			1000 * generate_elapsed / FULL_REPS
 		)
 	)
 end
@@ -976,7 +994,8 @@ end
 print(
 	string.format(
 		"duplecs end-to-end overhead  cells=%d toggles=%d pairs=%d spawns=%d reps=%d"
-			.. "  (plain = same mutations, no duplecs; duplecs = mutations + generate, timed together)",
+			.. "  (plain = same mutations, no duplecs; duplecs = mutations + generate, timed together;"
+			.. " mutate/generate = the same frames' two phases clocked separately)",
 		CELLS,
 		TOGGLES,
 		PAIR_CELLS,
