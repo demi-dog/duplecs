@@ -25,8 +25,11 @@ type Serdes<T = any> = types.Serdes<T>
 -- half needs a construction catch-up for it. hooks are assigned by setting Serdes on the component (or
 -- relation) definition entity, which keys the store by that entity; pair(Serdes, target) set on a relation
 -- keys the concrete pair(relation, target) instead, taking precedence over the relation's own hooks when a
--- pair section resolves (resolve_serdes). removal (the holder's or a pair target's deletion included) clears
--- the entry, so the store never carries stale ids.
+-- pair section resolves (resolve_serdes). a tag relation's pairs additionally derive hooks from the target
+-- definition's own registration -- jecs types such a pair's data by the target, so the definition typing the
+-- value is the one encoding it -- with a concrete pair(Serdes, target) registration still winning. removal
+-- (the holder's or a pair target's deletion included) clears the entry, so the store never carries stale
+-- ids.
 return function(world: types.World)
 	local Serdes = world:component() :: Component<Serdes?>
 
@@ -93,11 +96,23 @@ return function(world: types.World)
 	hooks.removed(world, Serdes, on_serdes_removed)
 
 	-- the serdes hooks a section's values encode or decode with: the concrete component's (a pair-specific
-	-- registration for pair sections), falling back to the relation's for pairs without their own.
+	-- registration for pair sections), falling back to the relation's for pairs without their own -- and, for
+	-- pairs of a tag relation, to the target definition's own registration: jecs types a tag relation's pair
+	-- data by the target (the same rule is_tag_key mirrors above), so the definition that types the value is
+	-- the one that encodes it. the two fallbacks never compete -- a tag relation can never hold an unpaired
+	-- registration (the added-hook guard refuses it) -- and the live pair_second read is safe here: staged
+	-- values never outlive their target, so every value-bearing resolve sees it alive, and paths that resolve
+	-- a dead half carry no values.
 	local function resolve_serdes(component: Id, relation: Id?): Serdes?
 		local serdes = serdes_hooks[component]
 		if serdes == nil and relation ~= nil then
 			serdes = serdes_hooks[relation]
+			if serdes == nil and jecs.is_tag(world, relation) then
+				local target = jecs.pair_second(world, component)
+				if (target :: any) ~= 0 then
+					serdes = serdes_hooks[target]
+				end
+			end
 		end
 		return serdes
 	end

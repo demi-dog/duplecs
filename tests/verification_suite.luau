@@ -43,6 +43,9 @@ local pair = jecs.pair
 
 local duplecs = require("../src")
 local wire = require("../src/wire")
+-- the per-world record getter behind duplecs.shared: the harness decodes inline serdes values through the
+-- record's resolve_serdes -- the module's own resolution chain -- rather than a mirror of its own
+local shared = require("../src/shared")
 
 -- wire-format flag bits, widths, and id encoding used by tests that
 -- hand-craft or inspect wire buffers directly; the layouts are documented
@@ -270,18 +273,15 @@ local function make_env()
 	-- .components) for assertions while keeping .data/.values reconcilable.
 	-- replaces the old delta()/full() snapshot object.
 	-- decodes inline serdes values through the server's hooks; tests assign
-	-- hooks symmetrically, so this matches what the receiving client would use
-	local function resolve_serdes(component, relation)
-		if relation == nil then
-			return world:get(component, net.Serdes)
-		end
-		local target = jecs.ECS_PAIR_SECOND(component)
-		local serdes = world:get(relation, pair(net.Serdes, target))
-		if serdes == nil then
-			serdes = world:get(relation, net.Serdes)
-		end
-		return serdes
-	end
+	-- hooks symmetrically, so this matches what the receiving client would use.
+	-- this is the module's own resolver, not a copy of it: the serdes store the
+	-- encoder just resolved through lives in the server world's shared record, so
+	-- the harness can never drift from the chain under test (the target-derived
+	-- link for a tag relation's pairs included). the decoders hand it raw wire ids
+	-- -- dense component/relation ids and pairs packed from dense halves -- which
+	-- is exactly how the store keys pairs, and test definition entities are
+	-- generation 0, so a dense definition id is its own store key too.
+	local resolve_serdes = shared(world).resolve_serdes
 
 	local function frame()
 		local packets = net.generate_packets()
@@ -1893,6 +1893,68 @@ test("wildcard pair overrides apply per-relation", function(env)
 	expect_equal(removed_calls[1], le1, "removed override entity")
 	expect_equal(c.world:has(le1, pair(c.defs.Likes, le2)), true, "default pair remove suppressed")
 	expect_equal(#calls, 1, "and the removal never dispatched to the changed override")
+end)
+
+test("a concrete pair's overrides take precedence over its relation's", function(env)
+	local s, c = env.server, env.client
+	local relation_changed = {}
+	local concrete_changed = {}
+	local relation_removed = {}
+	local concrete_removed = {}
+
+	local e = s.world:entity()
+	local t1 = s.world:entity()
+	local t2 = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:add(t1, s.net.Replicated)
+	s.world:add(t2, s.net.Replicated)
+	-- a concrete registration keys off the *client's* target id, so map the targets before registering
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	local lt1 = c.net.get_client_entity(t1)
+	local lt2 = c.net.get_client_entity(t2)
+
+	c.net.set_changed_override(pair(c.defs.Likes, jecs.Wildcard), function(entity, value)
+		table.insert(relation_changed, { entity = entity, value = value })
+	end)
+	c.net.set_changed_override(pair(c.defs.Likes, lt1), function(entity, value)
+		table.insert(concrete_changed, { entity = entity, value = value })
+	end)
+
+	s.world:set(e, pair(s.defs.Likes, t1), "one")
+	s.world:set(e, pair(s.defs.Likes, t2), "two")
+	env.sync(env.player_a)
+
+	expect_equal(#concrete_changed, 1, "the concrete pair's changed override ran for its own target")
+	expect_equal(concrete_changed[1].entity, le, "on the subject")
+	expect_equal(concrete_changed[1].value, "one", "with that target's value")
+	expect_equal(#relation_changed, 1, "the relation's override still served the other target")
+	expect_equal(relation_changed[1].value, "two", "and only that one -- the registered target never reached it")
+	expect_equal(c.world:has(le, pair(c.defs.Likes, lt1)), false, "the overridden set never applied")
+	expect_equal(c.world:has(le, pair(c.defs.Likes, lt2)), false, "nor the fallback's")
+
+	-- removed overrides resolve through the same two links; the changed overrides above suppressed every real
+	-- set, so seed the client cells directly to make a suppressed default remove observable
+	c.net.set_removed_override(pair(c.defs.Likes, jecs.Wildcard), function(entity)
+		table.insert(relation_removed, entity)
+	end)
+	c.net.set_removed_override(pair(c.defs.Likes, lt1), function(entity)
+		table.insert(concrete_removed, entity)
+	end)
+	c.world:set(le, pair(c.defs.Likes, lt1), "one")
+	c.world:set(le, pair(c.defs.Likes, lt2), "two")
+	s.world:remove(e, pair(s.defs.Likes, t1))
+	s.world:remove(e, pair(s.defs.Likes, t2))
+	env.sync(env.player_a)
+
+	expect_equal(#concrete_removed, 1, "the concrete pair's removed override ran for its own target")
+	expect_equal(concrete_removed[1], le, "on the subject")
+	expect_equal(#relation_removed, 1, "the relation's removed override still served the other target")
+	expect_equal(relation_removed[1], le, "on the same subject, through the fallback")
+	expect_equal(c.world:has(le, pair(c.defs.Likes, lt1)), true, "the overridden remove never applied")
+	expect_equal(c.world:has(le, pair(c.defs.Likes, lt2)), true, "nor the fallback's")
+	expect_equal(#concrete_changed, 1, "and neither removal dispatched to a changed override")
+	expect_equal(#relation_changed, 1, "on either link")
 end)
 
 test("override getters return registrations and nil clears them", function(env)
@@ -6595,6 +6657,265 @@ test(
 	end
 )
 
+-- serdes target derivation: jecs types pair(tag relation, data component) by the *target*, and a tag relation
+-- can never hold an unpaired registration of its own (the tag guard above refuses one), so the resolution
+-- chain's last link reads the target definition's own registration. the tests below pin that link on every
+-- path resolve_serdes serves, plus the two negatives that bound it.
+
+test("a tag relation's pair derives its serdes hooks from its data-component target", function(env)
+	local s, c = env.server, env.client
+	-- Health's own registration, which also types pair(Targeting, Health)'s value
+	s.world:set(s.defs.Health, s.net.Serdes, f64_serdes)
+	c.world:set(c.defs.Health, c.net.Serdes, f64_serdes)
+	-- a named definition is a replicable pair target; make_client already maps it, so the announcement the
+	-- name makes is inert here
+	s.world:set(s.defs.Health, jecs.Name, "DerivedPairTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Health), 42.5)
+	local packet = env.sync(env.player_a)
+
+	-- a lone target keeps the plain single-target layout (section 21 pins that choice), so this is
+	-- measure_plain_section's resolve; no side array is what separates derived hooks from the hookless path
+	expect_equal(packet.values, nil, "the pair's value packed into the buffer")
+	local data = packet.components[pair(s.defs.Targeting, s.defs.Health)]
+	expect(data ~= nil and data.values ~= nil and data.values[1] == 42.5, "decoded value in the merged view")
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(
+		c.world:get(le, pair(c.defs.Targeting, c.defs.Health)),
+		42.5,
+		"pair value decoded via the target's hooks"
+	)
+
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Health), 8.25)
+	env.sync(env.player_a)
+	expect_equal(
+		c.world:get(le, pair(c.defs.Targeting, c.defs.Health)),
+		8.25,
+		"...and again after a change, still through the derived hooks"
+	)
+end)
+
+test("a joiner's full packet packs a pair whose serdes hooks derive from its target", function(env)
+	local s = env.server
+	s.world:set(s.defs.Health, s.net.Serdes, f64_serdes)
+	s.world:set(s.defs.Health, jecs.Name, "DerivedJoinTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Health), 19.5)
+	env.frame()
+
+	local c2 = env.make_client()
+	c2.world:set(c2.defs.Health, c2.net.Serdes, f64_serdes)
+	local player_c = fake_player("PlayerC")
+	local packet = env.join(player_c, c2)
+
+	-- anchor the packet as a real full packet first: a player with nothing to receive indexes the blank-packet
+	-- fallback, whose values field is nil too, so the absence below would hold vacuously
+	expect_equal(#packet.replicated, 1, "the full packet announces the entity")
+	expect_equal(packet.values, nil, "full-packet pair values packed into the buffer")
+	local data = packet.components[pair(s.defs.Targeting, s.defs.Health)]
+	expect(data ~= nil and data.values ~= nil and data.values[1] == 19.5, "the full packet's pair value decoded inline")
+
+	local le = c2.net.get_client_entity(e)
+	expect(le ~= nil, "the joiner mapped the entity")
+	expect_equal(
+		c2.world:get(le, pair(c2.defs.Targeting, c2.defs.Health)),
+		19.5,
+		"full-packet pair value decoded via the target's hooks"
+	)
+end)
+
+test("a concrete pair(Serdes, target) registration beats the target-derived hooks", function(env)
+	local s, c = env.server, env.client
+
+	-- the two registrations encode incompatibly (a bare u8 versus a length-prefixed f64), so a resolve that
+	-- fell through to the target's hooks could not round-trip the value at all -- and the spies name which
+	-- side actually ran either way
+	local target_calls = 0
+	local target_serdes = {
+		encode = function(value)
+			target_calls += 1
+			local buf = buffer.create(8)
+			buffer.writef64(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			target_calls += 1
+			return buffer.readf64(buf, 0)
+		end,
+	}
+	local pair_calls = 0
+	local pair_serdes = {
+		size = 1,
+		encode = function(value)
+			pair_calls += 1
+			local buf = buffer.create(1)
+			buffer.writeu8(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			pair_calls += 1
+			return buffer.readu8(buf, 0)
+		end,
+	}
+
+	s.world:set(s.defs.Health, s.net.Serdes, target_serdes)
+	c.world:set(c.defs.Health, c.net.Serdes, target_serdes)
+	s.world:set(s.defs.Targeting, pair(s.net.Serdes, s.defs.Health), pair_serdes)
+	c.world:set(c.defs.Targeting, pair(c.net.Serdes, c.defs.Health), pair_serdes)
+	s.world:set(s.defs.Health, jecs.Name, "PrecedencePairTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Health), 200)
+	local packet = env.sync(env.player_a)
+
+	expect_equal(packet.values, nil, "the pair's value packed into the buffer")
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(c.defs.Targeting, c.defs.Health)), 200, "the value round-tripped")
+	expect(pair_calls > 0, "the concrete pair's hooks ran")
+	expect_equal(target_calls, 0, "and the target's own hooks never did")
+end)
+
+test("a data relation's pair never derives its target's serdes hooks", function(env)
+	local s, c = env.server, env.client
+	-- Likes is a value relation, so jecs types pair(Likes, Health) by *Likes*, not by Health: Health's
+	-- registration describes a different value entirely and must not be reached for
+	s.world:set(s.defs.Health, s.net.Serdes, f64_serdes)
+	c.world:set(c.defs.Health, c.net.Serdes, f64_serdes)
+	s.world:set(s.defs.Health, jecs.Name, "UnderivedPairTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Likes, s.defs.Health), 5)
+	local packet = env.sync(env.player_a)
+
+	-- with neither a pair-specific nor a relation registration to resolve, the cell stays hookless
+	expect(packet.values ~= nil, "the pair's value travels in the plain side array")
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(c.defs.Likes, c.defs.Health)), 5, "and reconciles by the hookless path")
+end)
+
+test("a tag relation's pair whose target holds no registration stays on the side array", function(env)
+	local s, c = env.server, env.client
+	-- the negative control for derivation itself: the chain reaches the target and finds nothing there
+	s.world:set(s.defs.Inventory, jecs.Name, "HooklessPairTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Inventory), { "axe" })
+	local packet = env.sync(env.player_a)
+
+	expect(packet.values ~= nil, "the pair's value travels in the plain side array")
+	local le = c.net.get_client_entity(e)
+	local received = c.world:get(le, pair(c.defs.Targeting, c.defs.Inventory))
+	expect(received ~= nil and received[1] == "axe", "and reconciles by the hookless path")
+end)
+
+test("a static size carried through target derivation omits the wire length prefix", function(env)
+	local s, c = env.server, env.client
+	-- derivation hands the wire the target registration's whole record, its size included, so the framing must
+	-- come out identical to a registration held on the encoding component itself
+	s.world:set(s.defs.Health, s.net.Serdes, f64_static_serdes)
+	c.world:set(c.defs.Health, c.net.Serdes, f64_static_serdes)
+	s.world:set(s.defs.Health, jecs.Name, "StaticDerivedTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(s.defs.Targeting, s.defs.Health), 100)
+	local packet = env.sync(env.player_a)
+
+	expect_equal(packet.values, nil, "the pair's value packed into the buffer")
+
+	-- the omission is invisible to a round-trip, so count the section's bytes instead: with one 8-byte value
+	-- in the packet's only section, a plain pair section's layout (see src/wire.luau) allows exactly flags +
+	-- section length + relation + target + ids count + one id + the bare value
+	local buf = packet.data
+	local _, offset, unreplicated_count, replicated_count, names_count = read_packet_header(buf)
+	offset += unreplicated_count * id_width + replicated_count * gen_id_width
+	for _ = 1, names_count do
+		local _, _, next_offset = read_name(buf, offset)
+		offset = next_offset
+	end
+	local _, section_end = read_section_header(buf, offset)
+	expect_equal(section_end, buffer.len(buf), "the pair section is the packet's only section")
+	expect_equal(section_end - offset, 1 + 2 + id_width * 2 + 2 + id_width + 8, "the value rides with no prefix")
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(
+		c.world:get(le, pair(c.defs.Targeting, c.defs.Health)),
+		100,
+		"the pair value decoded via the derived static-size hooks"
+	)
+end)
+
+test("a concrete pair's serdes registration serves its target while the relation's serves the rest", function(env)
+	local s, c = env.server, env.client
+	-- the coexistence half of pair-over-relation precedence: one frame, one relation, two targets, each
+	-- resolving a different link of the chain. the encodings are incompatible (a bare u8 versus a
+	-- length-prefixed f64), so a misresolved run would also misframe the section
+	local relation_calls = 0
+	local relation_serdes = {
+		encode = function(value)
+			relation_calls += 1
+			local buf = buffer.create(8)
+			buffer.writef64(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			relation_calls += 1
+			return buffer.readf64(buf, 0)
+		end,
+	}
+	local pair_calls = 0
+	local pair_serdes = {
+		size = 1,
+		encode = function(value)
+			pair_calls += 1
+			local buf = buffer.create(1)
+			buffer.writeu8(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			pair_calls += 1
+			return buffer.readu8(buf, 0)
+		end,
+	}
+
+	s.world:set(s.defs.Likes, s.net.Serdes, relation_serdes)
+	c.world:set(c.defs.Likes, c.net.Serdes, relation_serdes)
+
+	local e = s.world:entity()
+	local t1 = s.world:entity()
+	local t2 = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:add(t1, s.net.Replicated)
+	s.world:add(t2, s.net.Replicated)
+	-- the client half of the pair-specific registration keys off the client's target id, so map the targets
+	-- before registering
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	local lt1 = c.net.get_client_entity(t1)
+	local lt2 = c.net.get_client_entity(t2)
+
+	s.world:set(s.defs.Likes, pair(s.net.Serdes, t1), pair_serdes)
+	c.world:set(c.defs.Likes, pair(c.net.Serdes, lt1), pair_serdes)
+
+	s.world:set(e, pair(s.defs.Likes, t1), 200)
+	s.world:set(e, pair(s.defs.Likes, t2), 2.5)
+	local packet = env.sync(env.player_a)
+
+	expect_equal(packet.values, nil, "both targets packed their values inline, neither fell to the side array")
+	expect_equal(c.world:get(le, pair(c.defs.Likes, lt1)), 200, "the registered target rode its own hooks")
+	expect_equal(c.world:get(le, pair(c.defs.Likes, lt2)), 2.5, "the other target rode the relation's")
+	expect(pair_calls > 0, "the pair-specific hooks ran")
+	expect(relation_calls > 0, "and the relation's hooks still served the target without its own")
+end)
+
 -- 18) client shard compaction
 
 test("a straggler moved by shard compaction is invisible to the move and keeps receiving correct deltas", function(env)
@@ -9148,6 +9469,65 @@ test("inline serdes values across multiple targets of one relation round-trip th
 	expect_equal(c.world:get(le1, pair(c.defs.Likes, lt1)), 1.5, "first inline run reconciled")
 	expect_equal(c.world:get(le1, pair(c.defs.Likes, lt2)), 2.5, "second inline run reconciled")
 	expect_equal(c.world:get(le2, pair(c.defs.Likes, lt3)), 3.5, "third inline run, on a different subject, reconciled")
+end)
+
+test("serdes hooks derived from the targets themselves round-trip through grouped runs", function(env)
+	local s, c = env.server, env.client
+	-- Targeting is a tag relation, so jecs types each pair by its target and the store derives each run's
+	-- hooks from that target's own registration (see section 17). the two targets register *different* hooks,
+	-- so a run that resolved the wrong target's would misdecode and misframe rather than merely round-trip
+	s.world:set(s.defs.Health, s.net.Serdes, f64_serdes)
+	c.world:set(c.defs.Health, c.net.Serdes, f64_serdes)
+	s.world:set(s.defs.Inventory, s.net.Serdes, buffer_string_serdes)
+	c.world:set(c.defs.Inventory, c.net.Serdes, buffer_string_serdes)
+	-- named definitions are replicable pair targets; make_client already maps both
+	s.world:set(s.defs.Health, jecs.Name, "DerivedRunHealth")
+	s.world:set(s.defs.Inventory, jecs.Name, "DerivedRunInventory")
+
+	local e1 = s.world:entity()
+	local e2 = s.world:entity()
+	s.world:add(e1, s.net.Replicated)
+	s.world:add(e2, s.net.Replicated)
+	s.world:set(e1, pair(s.defs.Targeting, s.defs.Health), 1.5)
+	s.world:set(e1, pair(s.defs.Targeting, s.defs.Inventory), "packed")
+	s.world:set(e2, pair(s.defs.Targeting, s.defs.Health), 2.5)
+	local packet = env.sync(env.player_a)
+
+	local grouped_count = 0
+	local legacy_count = 0
+	for _, flags in raw_section_flags(packet) do
+		if bit32.band(flags, flag_pair) ~= 0 then
+			if bit32.band(flags, flag_runs) ~= 0 then
+				grouped_count += 1
+				expect(
+					bit32.band(flags, flag_side_values) == 0,
+					"every run packed its values inline through the derived hooks, none hookless"
+				)
+			else
+				legacy_count += 1
+			end
+		end
+	end
+	expect_equal(grouped_count, 1, "the tag relation's two targets share one grouped section")
+	expect_equal(legacy_count, 0, "no target split off into a single-target section of its own")
+
+	local le1 = c.net.get_client_entity(e1)
+	local le2 = c.net.get_client_entity(e2)
+	expect_equal(
+		c.world:get(le1, pair(c.defs.Targeting, c.defs.Health)),
+		1.5,
+		"the first run decoded via its target's hooks"
+	)
+	expect_equal(
+		c.world:get(le1, pair(c.defs.Targeting, c.defs.Inventory)),
+		"packed",
+		"the second run via its own target's hooks, not the first's"
+	)
+	expect_equal(
+		c.world:get(le2, pair(c.defs.Targeting, c.defs.Health)),
+		2.5,
+		"and the first run's second subject alongside it"
+	)
 end)
 
 test("a single-target pair section still uses the legacy layout", function(env)

@@ -197,10 +197,13 @@ local narrow_limit = 0xffff
 --
 -- BUMP THIS on any change to the byte layout of a packet, section, run, id, count, or unreliable chunk in
 -- this module -- a client on an older build must reject a newer packet loudly rather than silently misparse
--- it. retrofitting a version field after 1.0.0 would itself have been a breaking wire change, which is why it
--- ships now. (the byte's high bit is claimed by chunk_version_flag below, so 127 format revisions of headroom
--- remain -- still ample.)
-local wire_version = 2
+-- it -- and on any change to how the two sides agree on a packet's framing even when no layout moves: version
+-- 3 changed no byte layout, it marks serdes target-derivation (see resolve_serdes in serdes.luau), which
+-- moves affected schemas' pair values between the inline and side-array framings, so mixed builds would tear
+-- mid-reconcile instead of refusing up front. retrofitting a version field after 1.0.0 would itself have been
+-- a breaking wire change, which is why it ships now. (the byte's high bit is claimed by chunk_version_flag
+-- below, so 127 format revisions of headroom remain -- still ample.)
+local wire_version = 3
 
 -- the leading version byte of an unreliable chunk is wire_version with this high bit set, keeping the two
 -- buffer kinds mutually unparseable: check_version / check_chunk_version each refuse the other kind with a

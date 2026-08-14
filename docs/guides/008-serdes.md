@@ -94,9 +94,22 @@ A registration on a relation covers every pair using it as the relation. When on
 
 ```lua
 -- in shared/components.luau
-world:set(DamageOver, net.Serdes, number_serdes)                    -- every pair(DamageOver, *)
-world:set(DamageOver, jecs.pair(net.Serdes, fire), fire_serdes)     -- pair(DamageOver, fire) only
+world:set(DamageOver, net.Serdes, number_serdes)				-- every pair(DamageOver, *)
+world:set(DamageOver, jecs.pair(net.Serdes, fire), fire_serdes)	-- pair(DamageOver, fire) only
 ```
+
+When the relation is a **tag**, it has no values of its own to register for — a tag relation's pairs carry data typed by their *target* (jecs's rule for `pair(tag, component)`). Those pairs derive their hooks from the target component's own registration automatically, so registering the target once covers both roles:
+
+```lua
+-- in shared/components.luau
+local Stockpiles = world:entity()			-- a tag relation
+world:add(Stockpiles, net.Networked)
+
+world:set(Wood, net.Serdes, number_serdes)	-- covers Wood itself
+                                        	-- ...and pair(Stockpiles, Wood)'s values
+```
+
+A concrete `pair(net.Serdes, target)` registration on the relation still wins over the derived hooks, for the rare pair whose values shouldn't encode like the target's.
 
 Tags cannot carry serdes hooks (they have no values); registering one errors. Registrations follow their ids' lifetimes — deleting the definition (or a concrete pair's target) clears them — and registration tables are frozen once set, like visibility filters.
 

@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ### Added
 
+- Pairs of a **tag** relation now derive serdes hooks from the target definition's own registration automatically: such a pair's data is typed by its target (jecs's rule for `pair(tag, component)`), and a tag relation cannot carry a registration of its own, so registering the target once now covers both its standalone values and every tag-relation pair carrying it as data. A concrete `pair(Serdes, target)` registration on the relation still takes precedence — see the [serdes guide](docs/guides/008-serdes.md). **The wire format version is bumped** (no byte layout changed, but affected schemas' pair values move from the side array into the packet buffer, so mixed builds must be refused rather than misparse): upgrade the server and its clients together.
 - A [bandwidth guide](docs/guides/013-bandwidth.md), the byte-side sibling of the performance guide: the exact per-entry cost of everything duplecs puts on the wire, measured packet sizes for representative frames, and budgeting for the join snapshot and the unreliable channel. Its numbers come from a new benchmark, `tests/benchmarks/bench_bandwidth.luau`, and are byte-exact and machine-independent. Documentation only — the wire format is unchanged.
 
 ### Fixed
