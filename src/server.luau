@@ -2516,39 +2516,44 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local group_frame = 0
 	local last_group_sweep = 0
 
-	-- per-frame accumulators of the packet passes, shared by the pass functions below as upvalues rather than
-	-- parameters. the maps themselves persist: release_frame_state hands their inner tables back to the scratch
-	-- pool once the frame's packets are assembled, and reset_frame_state clears whatever an errored frame
-	-- stranded (the salvage guard contains user encode throws, but an internal error can still unwind
-	-- mid-frame) so every call still starts fresh. both stay directly below the declarations so an accumulator
-	-- can't be added without its reset and release in view.
+	-- per-frame accumulators of the packet passes, grouped into one record shared by the pass functions below
+	-- as an upvalue rather than parameters: the nine accumulators cost one of create_server's locals between
+	-- them (the function sits near luau's 200-local ceiling), and each pass aliases the fields it touches into
+	-- locals at its head -- nested functions have their own 200-local budget, and the aliases are the upvalue
+	-- reads the passes already paid. the maps themselves persist: release_frame_state hands their inner tables
+	-- back to the scratch pool once the frame's packets are assembled, and reset_frame_state clears whatever an
+	-- errored frame stranded (the salvage guard contains user encode throws, but an internal error can still
+	-- unwind mid-frame) so every call still starts fresh. both stay directly below the declaration so an
+	-- accumulator can't be added without its reset and release in view -- the record literal is the declaration
+	-- list.
+	local frame_state = {
+		-- entity create/delete lists keyed by global client index
+		replicated_by = {} :: { [number]: { number } },
+		unreplicated_by = {} :: { [number]: { number } },
 
-	-- entity create/delete lists keyed by global client index
-	local replicated_by = {} :: { [number]: { number } }
-	local unreplicated_by = {} :: { [number]: { number } }
+		-- sections attach per accumulated-visibility node via node_section_drafts, keyed [node][group] -- the
+		-- group object itself, so an unpaired component and a relation can never collide however their ids
+		-- overlap; unpaired groups draft an unpaired section, pair groups a relation section whose per-target
+		-- runs the bucket pass fills. with a single occupied shard every cell has exactly one run, so the trie
+		-- is skipped entirely and the drafts key by the raw mask word instead. masks are intersected with each
+		-- shard's allocated word at resolve time so a departed client's stale bit lingering in last_visibilities
+		-- never creates or widens a section.
+		node_section_drafts = {} :: { [VisibilityNode]: { [PacketGroup]: SectionDraft } },
 
-	-- sections attach per accumulated-visibility node via node_section_drafts, keyed [node][group] -- the group
-	-- object itself, so an unpaired component and a relation can never collide however their ids overlap;
-	-- unpaired groups draft an unpaired section, pair groups a relation section whose per-target runs the
-	-- bucket pass fills. with a single occupied shard every cell has exactly one run, so the trie is skipped
-	-- entirely and the drafts key by the raw mask word instead. masks are intersected with each shard's
-	-- allocated word at resolve time so a departed client's stale bit lingering in last_visibilities never
-	-- creates or widens a section.
-	local node_section_drafts = {} :: { [VisibilityNode]: { [PacketGroup]: SectionDraft } }
+		-- finalize_node_sections' outputs, per node: the node's sections encoded back-to-back into one shared
+		-- buffer, its byte size, and (only when the node has any) the hookless sections' value arrays in write
+		-- order -- one array per hookless section, so the outer length counts sections and never values.
+		node_buffers = {} :: { [VisibilityNode]: buffer },
+		node_sizes = {} :: { [VisibilityNode]: number },
+		node_section_values = {} :: { [VisibilityNode]: { { any } } },
 
-	-- finalize_node_sections' outputs, per node: the node's sections encoded back-to-back into one shared
-	-- buffer, its byte size, and (only when the node has any) the hookless sections' value arrays in write
-	-- order -- one array per hookless section, so the outer length counts sections and never values.
-	local node_buffers = {} :: { [VisibilityNode]: buffer }
-	local node_sizes = {} :: { [VisibilityNode]: number }
-	local node_section_values = {} :: { [VisibilityNode]: { { any } } }
-
-	-- per-client accumulators for the expansion pass: the section buffers to stamp, their running byte size, and
-	-- the hookless sections' value arrays in section order (the packet's side array, same one-array-per-section
-	-- shape as node_section_values), all keyed by global client index.
-	local client_buffers = {} :: { [number]: { buffer } }
-	local client_sizes = {} :: { [number]: number }
-	local client_section_values = {} :: { [number]: { { any } } }
+		-- per-client accumulators for the expansion pass: the section buffers to stamp, their running byte size,
+		-- and the hookless sections' value arrays in section order (the packet's side array, same
+		-- one-array-per-section shape as node_section_values), all keyed by global client index.
+		client_buffers = {} :: { [number]: { buffer } },
+		client_sizes = {} :: { [number]: number },
+		client_section_values = {} :: { [number]: { { any } } },
+	}
 
 	-- the frame's freshly-announced shared names (gen-qualified id -> name), drained from the shared-name store
 	-- and stamped into every allocated client's packet; nil on frames announcing nothing.
@@ -2559,15 +2564,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local multi_shard = false
 
 	local function reset_frame_state()
-		table.clear(replicated_by)
-		table.clear(unreplicated_by)
-		table.clear(node_section_drafts)
-		table.clear(node_buffers)
-		table.clear(node_sizes)
-		table.clear(node_section_values)
-		table.clear(client_buffers)
-		table.clear(client_sizes)
-		table.clear(client_section_values)
+		table.clear(frame_state.replicated_by)
+		table.clear(frame_state.unreplicated_by)
+		table.clear(frame_state.node_section_drafts)
+		table.clear(frame_state.node_buffers)
+		table.clear(frame_state.node_sizes)
+		table.clear(frame_state.node_section_values)
+		table.clear(frame_state.client_buffers)
+		table.clear(frame_state.client_sizes)
+		table.clear(frame_state.client_section_values)
 		-- an errored frame's stranded table is abandoned to the GC rather than pooled; release_frame_state is what
 		-- recycles it on clean frames
 		frame_names = nil
@@ -2583,22 +2588,26 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local function release_frame_state()
 		-- node_buffers holds plain buffers whose bytes were already stamped into the clients' packets, so they just
 		-- drop to the GC
-		table.clear(node_buffers)
-		table.clear(node_sizes)
+		table.clear(frame_state.node_buffers)
+		table.clear(frame_state.node_sizes)
+		local node_section_values = frame_state.node_section_values
 		for _, section_values in node_section_values do
 			release_scratch(section_values)
 		end
 		table.clear(node_section_values)
+		local client_buffers = frame_state.client_buffers
 		for _, buffers in client_buffers do
 			release_scratch(buffers)
 		end
 		table.clear(client_buffers)
-		table.clear(client_sizes)
-		table.clear(client_section_values)
+		table.clear(frame_state.client_sizes)
+		table.clear(frame_state.client_section_values)
+		local replicated_by = frame_state.replicated_by
 		for _, list in replicated_by do
 			release_scratch(list)
 		end
 		table.clear(replicated_by)
+		local unreplicated_by = frame_state.unreplicated_by
 		for _, list in unreplicated_by do
 			release_scratch(list)
 		end
@@ -2695,6 +2704,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	local function get_section(node: VisibilityNode, group: PacketGroup): SectionDraft
+		local node_section_drafts = frame_state.node_section_drafts
 		local section_drafts = node_section_drafts[node]
 		if section_drafts == nil then
 			section_drafts = fetch_scratch()
@@ -2721,6 +2731,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		allocated: VisibilityMask,
 		base_index: number
 	): { [Entity]: VisibilityMask }
+		local replicated_by = frame_state.replicated_by
+		local unreplicated_by = frame_state.unreplicated_by
+
 		-- pooled; the caller releases it once the component cells resolve
 		local entity_unreplicate_masks: { [Entity]: VisibilityMask } = fetch_scratch()
 
@@ -3171,6 +3184,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- and assembly stamps it with one copy, no matter how many sections the node carries -- filling the per-node
 	-- outputs declared above.
 	local function finalize_node_sections()
+		local node_section_drafts = frame_state.node_section_drafts
+		local node_section_values = frame_state.node_section_values
+		local node_buffers = frame_state.node_buffers
+		local node_sizes = frame_state.node_sizes
 		for node, section_drafts in node_section_drafts do
 			-- drop the entry before releasing anything: the fetches below may hand a released table right back, and a
 			-- lingering node_section_drafts reference to it would alias
@@ -3222,6 +3239,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- and the swap measured 9.5% slower at high fan-out against 14-20% faster on the broadcast one-node shape,
 	-- with the realistic mixed benches at parity either way.
 	local function scatter(client_index: number, node_buffer: buffer, node_size: number, section_values: { { any } }?)
+		local client_buffers = frame_state.client_buffers
+		local client_sizes = frame_state.client_sizes
 		local target_buffers = client_buffers[client_index]
 		if target_buffers == nil then
 			target_buffers = fetch_scratch()
@@ -3231,6 +3250,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		client_sizes[client_index] += node_size
 		table.insert(target_buffers, node_buffer)
 		if section_values then
+			local client_section_values = frame_state.client_section_values
 			local target_section_values = client_section_values[client_index]
 			if target_section_values == nil then
 				-- escapes as the packet's side array, so never pooled
@@ -3249,10 +3269,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local path_words = {} :: { number }
 
 	local function expand_node(node: MaskTrieNode, depth: number)
-		local node_buffer = node_buffers[node]
+		local node_buffer = frame_state.node_buffers[node]
 		if node_buffer then
-			local node_size = node_sizes[node]
-			local section_values = node_section_values[node]
+			local node_size = frame_state.node_sizes[node]
+			local section_values = frame_state.node_section_values[node]
 			for i = 1, depth do
 				local base_index = path_bases[i]
 				local m = path_words[i]
@@ -3283,7 +3303,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			expand_node(mask_trie, 0)
 			table.clear(mask_trie)
 		else
-			for mask, node_buffer in node_buffers do
+			local node_sizes = frame_state.node_sizes
+			local node_section_values = frame_state.node_section_values
+			for mask, node_buffer in frame_state.node_buffers do
 				local m = mask :: number
 				local node_size = node_sizes[mask]
 				local section_values = node_section_values[mask]
@@ -3304,24 +3326,24 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if packets[client] == nil then
 			packets[client] = assemble_packet(
 				this_packet_frame,
-				unreplicated_by[index],
-				replicated_by[index],
+				frame_state.unreplicated_by[index],
+				frame_state.replicated_by[index],
 				frame_names,
-				client_buffers[index],
-				client_sizes[index] or 0,
-				client_section_values[index]
+				frame_state.client_buffers[index],
+				frame_state.client_sizes[index] or 0,
+				frame_state.client_section_values[index]
 			)
 		end
 	end
 
 	local function assemble_client_packets(packets: { [Client]: Packet }, this_packet_frame: number)
-		for index in client_buffers do
+		for index in frame_state.client_buffers do
 			assemble_for(packets, this_packet_frame, index)
 		end
-		for index in replicated_by do
+		for index in frame_state.replicated_by do
 			assemble_for(packets, this_packet_frame, index)
 		end
-		for index in unreplicated_by do
+		for index in frame_state.unreplicated_by do
 			assemble_for(packets, this_packet_frame, index)
 		end
 		-- shared names go to every allocated client, otherwise-empty packets included (pending joiners get them
