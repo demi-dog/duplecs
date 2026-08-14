@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- A [bandwidth guide](docs/guides/013-bandwidth.md), the byte-side sibling of the performance guide: the exact per-entry cost of everything duplecs puts on the wire, measured packet sizes for representative frames, and budgeting for the join snapshot and the unreliable channel. Its numbers come from a new benchmark, `tests/benchmarks/bench_bandwidth.luau`, and are byte-exact and machine-independent. Documentation only — the wire format is unchanged.
+
 ### Fixed
 
 - Adding or removing `Replicated` no longer risks a hidden cost proportional to the world's replicated-entity count: an internal table keyed by full entity ids made Luau rebuild it on nearly every spawn whenever the number of replicated entities sat at (or one below) a power of two while entities churned. Spawn-and-despawn overhead at the benchmark's canonical shape (32 clients, two networked components) drops from ~14x to ~6x the cost of the same lifecycle on a world that isn't networked at all — see the updated tables in the [performance guide](docs/guides/012-performance.md). The wire format is unchanged.

@@ -38,3 +38,4 @@ Start with [Getting started](001-getting-started.md) if you're new; the rest are
 ## Performance
 
 - **[Performance](012-performance.md)** — ballpark overhead ratios for every operation duplecs touches, end-to-end and re-measurable in seconds: the server and client cost tables, the client-count and visibility-fragmentation scaling axes, and budgeting for the join spike.
+- **[Bandwidth](013-bandwidth.md)** — the byte cost of everything duplecs puts on the wire, exact and machine-independent: per-value and per-entity prices under each encoding, measured packet sizes for representative frames, the join snapshot, and budgeting the unreliable channel.
