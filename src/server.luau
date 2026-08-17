@@ -192,7 +192,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local InheritsPrivacy = components.InheritsPrivacy
 
 	-- the tracking tags' names for diagnostics, keyed by tag: the guards below name whichever tag was added
-	-- (or owns the tracking) in their messages, and the tags are foreign entities with no jecs.Name to render.
+	-- (or owns the tracking) in their messages, spelled short like call sites type them -- the tags' own
+	-- jecs.Name carries the "duplecs." prefix (see shared.luau).
 	local tracking_tag_names = {
 		[Networked] = "Networked",
 		[NetworkedOnce] = "NetworkedOnce",

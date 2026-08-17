@@ -114,6 +114,23 @@ return function(world: World): Record
 	-- ever predate them -- serdes needs no construction catch-up on either half
 	local serdes_store = create_serdes_store(world)
 
+	-- every exported component carries a jecs.Name in jecs's own dotted style ("jecs.ChildOf"), so debuggers
+	-- and state viewers that label ids by name (e.g. jabby) render duplecs's components legibly instead of as
+	-- bare ids. the prefix keeps the names out of the plain namespace schema modules map by -- the client half
+	-- binds announced shared names to the same-named client entity, so an unprefixed "Networked" would collide
+	-- with a user component named that. set at minting, before either half can be constructed, so the server's
+	-- construction walk seeds them into its named-entity mirror like any pre-existing name: a named entity is
+	-- a replicable pair target, and both sides mint identical names, so a networked pair aimed at a duplecs
+	-- component maps like any named target.
+	world:set(Networked, jecs.Name, "duplecs.Networked")
+	world:set(NetworkedOnce, jecs.Name, "duplecs.NetworkedOnce")
+	world:set(NetworkedUnreliable, jecs.Name, "duplecs.NetworkedUnreliable")
+	world:set(Replicated, jecs.Name, "duplecs.Replicated")
+	world:set(Private, jecs.Name, "duplecs.Private")
+	world:set(InheritsPrivacy, jecs.Name, "duplecs.InheritsPrivacy")
+	world:set(serdes_store.Serdes, jecs.Name, "duplecs.Serdes")
+	world:set(Imported, jecs.Name, "duplecs.Imported")
+
 	-- frozen so consumers can't mutate the shared set; the cast bridges table.freeze's read-only result back to
 	-- the exported type (the old solver rejects `read` property syntax, so the type can't declare it directly)
 	local components = table.freeze({

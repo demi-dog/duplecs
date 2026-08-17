@@ -13,7 +13,7 @@ The server half for a world: change tracking, per-client visibility, and packet 
 The client half for a world: server/client entity mapping, reconciliation overrides, and packet reconciliation. The first call constructs it — connecting the entity-mapping and name-index hooks — and returns the client methods alongside the client-side components (`Imported`, `Serdes`).
 
 #### `duplecs.shared(world: World) -> Components`
-The world's full component set — `Networked`, `NetworkedOnce`, `NetworkedUnreliable`, `Replicated`, `Private`, `InheritsPrivacy`, `Serdes`, `Imported` — as one frozen table, created at the world's first duplecs contact. The same ids the instances return, for code that runs on both sides: a shared definitions module can tag definitions `Networked` and register `Serdes` hooks without knowing which half the world will construct; a tag is inert until the half that owns it is constructed, and each half's construction catches up on whatever was tagged before it.
+The world's full component set — `Networked`, `NetworkedOnce`, `NetworkedUnreliable`, `Replicated`, `Private`, `InheritsPrivacy`, `Serdes`, `Imported` — as one frozen table, created at the world's first duplecs contact. The same ids the instances return, for code that runs on both sides: a shared definitions module can tag definitions `Networked` and register `Serdes` hooks without knowing which half the world will construct; a tag is inert until the half that owns it is constructed, and each half's construction catches up on whatever was tagged before it. Each component carries a `jecs.Name` like `duplecs.Networked`, so debuggers and state viewers label them legibly.
 
 ## Server
 
