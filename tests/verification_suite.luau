@@ -13543,10 +13543,11 @@ end)
 -- therefore can predate construction, so a side-agnostic schema module may tag definitions, filter privacy,
 -- and register serdes hooks before either half exists; construction then replays that pre-existing state
 -- through the same handlers the live hooks use (see the CONSTRUCTION CATCH-UP section in server.luau). the
--- tests below cover the accessors' identity, the replay's equivalence with a post-construction schema, and
--- the two seams the replay has: a pre-existing misuse errors from the construction call rather than from the
--- offending add, and a *valued* privacy filter sanitizes against a tracked-client set that is necessarily
--- empty before construction, so every client it names is pruned.
+-- tests below cover the accessors' identity, the jecs.Name every exported component carries, the replay's
+-- equivalence with a post-construction schema, and the two seams the replay has: a pre-existing misuse errors
+-- from the construction call rather than from the offending add, and a *valued* privacy filter sanitizes
+-- against a tracked-client set that is necessarily empty before construction, so every client it names is
+-- pruned.
 
 test("the per-world accessors memoize their instance and share one component set", function()
 	-- one world per side, as production has: an instance is memoized per world and per half, while the
@@ -13589,6 +13590,35 @@ test("the per-world accessors memoize their instance and share one component set
 
 	-- each world mints its own set, so nothing here is module-level state two worlds could share
 	expect(client_components ~= components, "the second world minted a set of its own")
+end)
+
+test("every component in the shared set carries its key as a dotted jecs.Name", function()
+	-- debuggers and state viewers (jabby among them) label ids by their jecs.Name, so every exported component
+	-- is named at minting, in jecs's own dotted style: the set's key under a "duplecs." prefix, which also keeps
+	-- the names out of the plain namespace a schema module maps by. the set is walked rather than listed here,
+	-- so a component added to it later is covered without touching this test.
+	local function expect_named(world, components, label)
+		local walked = 0
+		for name, component in components do
+			expect_equal(world:get(component, jecs.Name), `duplecs.{name}`, `{label}: {name}'s jecs.Name`)
+			walked += 1
+		end
+		-- walking an empty set would assert nothing at all, so pin that there was something to walk
+		expect(walked > 0, `{label}: the shared set is empty`)
+	end
+
+	-- the names are set at minting, so the shared accessor on its own -- neither half constructed -- is enough
+	local shared_world = jecs.world()
+	expect_named(shared_world, duplecs.shared(shared_world), "shared alone")
+
+	-- and they are in place on a constructed world whichever half mints the set
+	local server_world = jecs.world()
+	duplecs.server(server_world)
+	expect_named(server_world, duplecs.shared(server_world), "server-constructed")
+
+	local client_world = jecs.world()
+	duplecs.client(client_world)
+	expect_named(client_world, duplecs.shared(client_world), "client-constructed")
 end)
 
 test("a schema tagged through duplecs.shared before construction replicates like one tagged after", function()
