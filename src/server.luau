@@ -1005,16 +1005,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- velocities): its reliable tracking is exactly NetworkedOnce's -- membership adds with their initial value,
 	-- removals, visibility shifts, and full packets all ride the reliable path, with no changed hook connected,
 	-- so per-set cost is zero -- while current values are re-read and re-sent every generate_unreliable_chunks
-	-- call, intended for an unreliable transport where a dropped chunk costs one frame of staleness. tags are
-	-- refused: an always-streamed tag carries nothing (and chunk values require serdes hooks, which tags cannot
-	-- have). exclusive with the other Networked tags, like they are with each other.
+	-- call, intended for an unreliable transport where a dropped chunk costs one frame of staleness. on a tag
+	-- definition only its pairs with data-component targets stream -- the one cell shape of a tag that carries
+	-- values (target-typed, with serdes hooks deriving from the target's registration) -- while its valueless
+	-- tag cells ride the reliable path alone (see generate_unreliable_chunks). exclusive with the other
+	-- Networked tags, like they are with each other.
 	local function on_networked_unreliable_added(component: Component, id: Id)
 		guard_networked_added(component, id, NetworkedUnreliable, "NetworkedUnreliable")
-
-		if jecs.is_tag(world, component) then
-			world:remove(component, NetworkedUnreliable)
-			fail(`NetworkedUnreliable cannot be added to tags! ({id_to_string(component, world)})`)
-		end
 
 		start_tracking_component(component, NetworkedUnreliable)
 	end
@@ -3708,9 +3705,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- legitimately holds a cell until the reliable removal reaches it, so the two channels always agree, and the
 	-- two calls may run at independent cadences. cells walk per component through jecs' per-component archetype
 	-- records (the world_each scheme -- undocumented internals, like get_components' sparse_array read), so
-	-- archetypes without unreliable cells cost nothing; per entity the work is one mask probe per occupied
-	-- shard, a column read, and the serdes encode, with cells of equal cross-shard visibility sharing one
-	-- serialization no matter how many clients receive it. chunk buffers are shared by reference across every
+	-- archetypes without unreliable cells cost nothing -- a tag definition contributing only its pairs with
+	-- data-component targets, the one cell shape of a tag that carries values; per entity the work is one mask
+	-- probe per occupied shard, a column read, and the serdes encode, with cells of equal cross-shard
+	-- visibility sharing one serialization no matter how many clients receive it. chunk buffers are shared by reference across every
 	-- client of a node -- never mutate them -- and clients with nothing visible are omitted from the returned
 	-- map.
 	local function generate_unreliable_chunks(chunk_bytes: number?): { [Client]: { buffer } }
@@ -3739,21 +3737,31 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local archetypes = world.archetypes
 
 		for component in networked_unreliable do
+			-- a tag definition streams only its data pairs: its bare cells -- and its pairs with tag targets,
+			-- filtered in the pair walk below -- are valueless tag cells whose membership already rides the
+			-- reliable path, and streaming them would re-send every one as a data null each call, which the
+			-- client applies via world:set and world:set errors on tags. the tag-ness read is the cached one the
+			-- reliable resolve uses (tracked_relation_tags; every unreliable member is tracked, so the entry
+			-- always exists).
+			local relation_is_tag = tracked_relation_tags[dense(component)]
+
 			-- unpaired cells: the component's own archetype records
-			local idr = component_index[component]
-			if idr ~= nil and prefetch_unreliable_visibility(component) then
-				for archetype_id in idr.records do
-					local archetype = archetypes[archetype_id]
-					local entities = archetype.entities
-					if #entities > 0 then
-						accumulate_unreliable_archetype(
-							entities,
-							archetype.columns_map[component],
-							component,
-							component :: any,
-							nil,
-							nil
-						)
+			if relation_is_tag ~= true then
+				local idr = component_index[component]
+				if idr ~= nil and prefetch_unreliable_visibility(component) then
+					for archetype_id in idr.records do
+						local archetype = archetypes[archetype_id]
+						local entities = archetype.entities
+						if #entities > 0 then
+							accumulate_unreliable_archetype(
+								entities,
+								archetype.columns_map[component],
+								component,
+								component :: any,
+								nil,
+								nil
+							)
+						end
 					end
 				end
 			end
@@ -3761,7 +3769,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- pair cells: the relation's wildcard record covers exactly the archetypes holding at least one pair of
 			-- this relation, and same-relation pairs sit contiguously in archetype.types (see each_target), so the
 			-- record's records/counts hand each archetype its exact pair slice with no types scan. the target gen
-			-- resolves through the pair index, which covers every live pair of a tracked relation.
+			-- resolves through the pair index, which covers every live pair of a tracked relation. a tag relation's
+			-- pairs follow their target's tag-ness (the reliable resolve's rule), so its tag-target pairs -- tag
+			-- pairs, carrying no value -- skip like its bare cells above.
 			local idr_pair = component_index[pair(component, jecs.Wildcard)]
 			if idr_pair ~= nil then
 				local pair_counts = idr_pair.counts
@@ -3775,7 +3785,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					for i = slice_start, slice_start + pair_counts[archetype_id] - 1 do
 						local cell = archetype_types[i]
 						local target = tracked_target_gens[ECS_PAIR_SECOND(cell)]
-						if target ~= nil and prefetch_unreliable_visibility(cell) then
+						if target == nil then
+							continue
+						end
+						if relation_is_tag and jecs.is_tag(world, target) then
+							continue
+						end
+						if prefetch_unreliable_visibility(cell) then
 							accumulate_unreliable_archetype(
 								entities,
 								archetype.columns_map[cell],

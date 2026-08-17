@@ -1019,8 +1019,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		if nulled_count > 0 then
-			-- unreliable components are never tags (the server refuses them), so nulled entries always apply as data
-			-- nulls
+			-- unreliable cells on the wire are never tags (the server streams only value-carrying cells, so a tag
+			-- definition's tag cells stay off this channel), so nulled entries always apply as data nulls
 			if changed_override then
 				for _ = 1, nulled_count do
 					local entity = get_client_entity_from_dense(read_id(data, offset))

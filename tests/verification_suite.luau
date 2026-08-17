@@ -10869,6 +10869,35 @@ local function make_unreliable_relation(env, serdes)
 	return rel_s, rel_c
 end
 
+-- the tag-relation counterpart of make_unreliable_relation, which takes no hooks of its own: a tag definition
+-- can hold no serdes registration (the store's added hook refuses one), because jecs types a tag relation's
+-- pair data by the *target* -- so the target definition's own registration is what encodes such a pair, and
+-- make_unreliable_pair_target below is what supplies it.
+local function make_unreliable_tag_relation(env)
+	local s, c = env.server, env.client
+	local rel_s = s.world:entity()
+	local rel_c = c.world:entity()
+	c.net.set_client_entity(rel_s, rel_c)
+	s.world:add(rel_s, s.net.NetworkedUnreliable)
+	return rel_s, rel_c
+end
+
+-- a data-component pair target for the tag-relation tests: a serdes registration on both sides -- the hooks
+-- such a pair derives (section 17 covers the derivation itself) -- and a shared name, which is what makes an
+-- unreplicated definition a replicable pair target. the client maps it explicitly too, so the announcement
+-- the name makes is inert here.
+local function make_unreliable_pair_target(env, name, serdes)
+	local s, c = env.server, env.client
+	local serdes_hooks = serdes or f64_serdes
+	local target_s = s.world:component()
+	local target_c = c.world:component()
+	c.net.set_client_entity(target_s, target_c)
+	s.world:set(target_s, s.net.Serdes, serdes_hooks)
+	c.world:set(target_c, c.net.Serdes, serdes_hooks)
+	s.world:set(target_s, jecs.Name, name)
+	return target_s, target_c
+end
+
 -- decodes every chunk in `list` (nil-safe, for a client with nothing visible)
 -- and reports whether `dense_id` appears in any section's ids or nulled list;
 -- shared by the privacy tests below to inspect a client's raw chunks. every
@@ -11010,28 +11039,126 @@ for _, incumbent in tracking_tags do
 	end
 end
 
-test("guard: NetworkedUnreliable cannot be added to tags", function(env)
-	local s = env.server
+test("a NetworkedUnreliable tag definition tracks reliably and streams nothing", function(env)
+	local s, c = env.server, env.client
 	local Tag = s.world:entity()
-	expect_error(function()
-		s.world:add(Tag, s.net.NetworkedUnreliable)
-	end, "adding NetworkedUnreliable to a tag", "cannot be added to tags")
-	expect_equal(
-		s.world:has(Tag, s.net.NetworkedUnreliable),
-		false,
-		"NetworkedUnreliable removed by the guard before erroring"
-	)
+	local CTag = c.world:entity()
+	c.net.set_client_entity(Tag, CTag)
+	s.world:add(Tag, s.net.NetworkedUnreliable)
 
-	-- the refusal has to leave the definition wholly untracked, not merely untagged: the tag check sits ahead
-	-- of start_tracking_component, so a refused definition must stream on neither channel. the entity's own
-	-- replication is what makes the packet below a real one rather than the harness's blank fallback.
+	-- a bare tag cell carries no value, so it has nothing to stream: its whole lifecycle rides the reliable
+	-- path, exactly as NetworkedOnce's does. the entity's own replication is what makes the packet below a real
+	-- one rather than the harness's blank fallback, and generate_unreliable_chunks is read raw for the same
+	-- reason -- indexing it per player would read the fallback instead of an absence.
 	local e = s.world:entity()
 	s.world:add(e, s.net.Replicated)
 	s.world:add(e, Tag)
 	local packet = env.sync(env.player_a)
 	expect_equal(#packet.replicated, 1, "the entity itself replicates, so this is a real packet")
-	expect_equal(next(packet.components), nil, "the refused tag ships no reliable section")
+	expect(packet.components[Tag] ~= nil, "the tag cell ships a reliable section")
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:has(le, CTag), true, "the client applied the membership add")
 	expect_equal(next(s.net.generate_unreliable_chunks()), nil, "and no client has unreliable chunks to receive")
+
+	s.world:remove(e, Tag)
+	env.sync(env.player_a)
+	expect_equal(c.world:has(le, CTag), false, "the removal replicates reliably too")
+	expect_equal(next(s.net.generate_unreliable_chunks()), nil, "the tag streams nothing after the removal either")
+end)
+
+test("a tag relation's pair with a data-component target streams through the unreliable channel", function(env)
+	local s, c = env.server, env.client
+	local TagRel, CTagRel = make_unreliable_tag_relation(env)
+	local Target, CTarget = make_unreliable_pair_target(env, "UnreliableTagPairTarget", f64_static_serdes)
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(TagRel, Target), 1.5)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 1.5, "the membership add carried the initial value reliably")
+
+	s.world:set(e, pair(TagRel, Target), 7.25)
+	local packet = env.sync(env.player_a)
+	expect_equal(next(packet.components), nil, "no changed hook runs, so the reliable path stays silent")
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 1.5, "client value unchanged on the reliable path")
+
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 7.25, "the unreliable channel streamed the new value")
+
+	-- always-replicate cadence: the value is re-read and re-sent every call, with no change to prompt it, so
+	-- clobbering the client's copy locally is undone by the very next call
+	c.world:set(le, pair(CTagRel, CTarget), 0)
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 7.25, "the second call re-sent the same value")
+end)
+
+test("a tag relation streams its data-target pairs and skips its tag-target ones", function(env)
+	local s, c = env.server, env.client
+	local TagRel, CTagRel = make_unreliable_tag_relation(env)
+	local Target, CTarget = make_unreliable_pair_target(env, "MixedUnreliableTagPairTarget")
+
+	-- the second target is a plain entity, which jecs counts as a tag: pair(TagRel, other) is a tag pair
+	-- carrying no value at all. Replicated is what makes it a replicable target, and one subject holding both
+	-- pairs is what puts the two shapes in the same walk of the same call.
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(TagRel, Target), 3.5)
+	s.world:add(e, pair(TagRel, other))
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	local lother = c.net.get_client_entity(other)
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 3.5, "the data pair's membership carried its value")
+	expect_equal(c.world:has(le, pair(CTagRel, lother)), true, "the tag pair's membership rode the reliable path too")
+
+	s.world:set(e, pair(TagRel, Target), 9.75)
+	local chunks = s.net.generate_unreliable_chunks()[env.player_a]
+
+	local sections = 0
+	for _, chunk in chunks do
+		local view = wire.decode_chunk(chunk, function()
+			return f64_serdes
+		end)
+		for _, section in view.sections do
+			sections += 1
+			expect_equal(section.relation, jecs.ECS_ID(TagRel), "the streamed section belongs to the relation")
+			expect_equal(section.target, jecs.ECS_ID(Target), "...paired with the data-component target alone")
+		end
+	end
+	expect_equal(sections, 1, "the tag-target pair contributed no section of its own")
+
+	for _, chunk in chunks do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 9.75, "the data pair's new value applied")
+	expect_equal(c.world:has(le, pair(CTagRel, lother)), true, "and the tag pair is left standing")
+end)
+
+test("a nil-valued data pair of a tag relation streams as a nulled entry", function(env)
+	local s, c = env.server, env.client
+	local TagRel, CTagRel = make_unreliable_tag_relation(env)
+	local Target, CTarget = make_unreliable_pair_target(env, "NulledUnreliableTagPairTarget")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(TagRel, Target), 2.5)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), 2.5, "precondition: initial value replicated")
+
+	s.world:set(e, pair(TagRel, Target), nil)
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:has(le, pair(CTagRel, CTarget)), true, "the cell is not removed, only nulled")
+	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), nil, "the value is nil after the nulled transition")
 end)
 
 test("guard: NetworkedUnreliable cannot be used as a pair", function(env)
@@ -13561,6 +13688,64 @@ test("a schema tagged through duplecs.shared before construction replicates like
 	expect_equal(client_world:get(le_visible, client_position), 9, "the unreliable chunk applied the new value")
 end)
 
+test("a NetworkedUnreliable tag relation set up before construction is tracked from the construction call", function()
+	-- the equivalence test above covers a data component; a tag relation is the shape whose tracking splits
+	-- across the two channels by cell rather than by event -- its pairs' membership rides the reliable path
+	-- while only the data-target ones stream -- and the whole shape goes in before the server half exists.
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+
+	local TagRel = world:entity()
+	world:add(TagRel, components.NetworkedUnreliable)
+	-- the target definition's own registration is what types and encodes the pair's value; the shared name is
+	-- what makes an unreplicated definition a replicable pair target
+	local Target = world:component()
+	world:set(Target, components.Serdes, f64_serdes)
+	world:set(Target, jecs.Name, "PreSchemaUnreliableTagTarget")
+
+	local e = world:entity()
+	world:add(e, components.Replicated)
+	world:set(e, pair(TagRel, Target), 4.5)
+
+	local net = duplecs.server(world)
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	local client_rel = client_world:entity()
+	local client_target = client_world:component()
+	client_world:set(client_target, client_net.Serdes, f64_serdes)
+	client_net.set_client_entity(TagRel, client_rel)
+	client_net.set_client_entity(Target, client_target)
+
+	local player = fake_player("PreSchemaUnreliableTagViewer")
+	net.add_client(player)
+	client_net.reconcile_packet(deep_copy(net.generate_packets()[player]))
+
+	local le = client_net.get_client_entity(e)
+	expect(le ~= nil, "the joiner's full packet created the replicated entity")
+	expect_equal(
+		client_world:get(le, pair(client_rel, client_target)),
+		4.5,
+		"the pre-construction pair's membership carried its value reliably"
+	)
+
+	-- the replay connects no changed hook for an unreliable definition, exactly as a live add would not, so
+	-- this edit stages nothing at all and the player drops out of the frame's packet map entirely
+	world:set(e, pair(TagRel, Target), 8.5)
+	expect_equal(net.generate_packets()[player], nil, "the edit staged no reliable delta")
+
+	local chunks = net.generate_unreliable_chunks()
+	expect(chunks[player] ~= nil, "the pre-construction tag relation streams its data-target pair")
+	for _, chunk in chunks[player] do
+		client_net.reconcile_chunk(chunk)
+	end
+	expect_equal(
+		client_world:get(le, pair(client_rel, client_target)),
+		8.5,
+		"the unreliable chunk applied the new value"
+	)
+end)
+
 test("a multi-parent delegation DAG built before construction gates and fans out like a live one", function()
 	-- the equivalence test above covers a single delegation edge; this builds the whole shape before
 	-- duplecs.server exists -- a two-level chain (group_b -> root), a standalone group_a, a leaf inheriting one
@@ -13720,22 +13905,6 @@ test("guard: two tracking tags on one definition before construction error from 
 	-- the catch-up walks Networked first, so that is the tag whose replayed add the guard undoes
 	expect_equal(world:has(Health, components.Networked), false, "the replayed tag was removed by the guard")
 	expect_equal(world:has(Health, components.NetworkedOnce), true, "the tag it collided with is left in place")
-end)
-
-test("guard: NetworkedUnreliable on a tag before construction errors from the construction call", function()
-	local world = jecs.world()
-	local components = duplecs.shared(world)
-	local Tag = world:entity()
-	world:add(Tag, components.NetworkedUnreliable)
-
-	expect_error(function()
-		duplecs.server(world)
-	end, "constructing over an unreliable tag definition", "cannot be added to tags")
-	expect_equal(
-		world:has(Tag, components.NetworkedUnreliable),
-		false,
-		"NetworkedUnreliable removed by the guard before erroring"
-	)
 end)
 
 test("guard: an unpaired InheritsPrivacy added before construction errors from the construction call", function()

@@ -58,7 +58,7 @@ That's the whole loop. `world:set(entity, Position, ...)` on the server now cost
 
 On the reliable path an unreliable component tracks like `NetworkedOnce`: the **add** replicates with its initial value, **removals** and **visibility changes** replicate, and full packets carry current values — so a joiner (or a client newly admitted by a visibility filter) is never blank while waiting for the stream. Everything in between — the actual motion — rides the chunks.
 
-Pairs using the component as the relation stream too, and tags are refused (an always-streamed tag carries nothing).
+Pairs using the component as the relation stream too. A **tag** relation can be `NetworkedUnreliable` as well: its pairs with data-component targets carry target-typed values, with [serdes hooks derived from the target's registration](008-serdes.md) — so per-target amounts like `pair(Stockpiles, Gold)` can stream every frame with no serdes ceremony beyond the target's own. The tag's valueless cells — the bare tag, and pairs targeting tags or plain entities — carry nothing to stream, so they simply stay on the reliable path, exactly as they would under `Networked`.
 
 ## Why drops don't matter
 
