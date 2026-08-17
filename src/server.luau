@@ -1496,8 +1496,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- any of the three tracking tags refuses Replicated (see guard_networked_added and on_designation_added
 		-- for the mirror direction), so the message names whichever one owns the tracking -- the plain tag, or
 		-- any designation's tag for a definition tracked only through designations. spelled out here rather than
-		-- read from a shared table: create_server sits at luau's 200-local ceiling, and these locals are the
-		-- hook's own.
+		-- read from a shared table: a shared table would cost create_server a local for a rare diagnostic path
+		-- (its 200-local budget is finite -- see create_packet_generation), and these locals are the hook's own.
 		local tracking_tag = tracked_by[entity]
 		if tracking_tag == nil then
 			local designated = designations[entity]
@@ -2214,25 +2214,6 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- the per-world serdes store (see shared.luau / serdes.luau): its Serdes component and validation hooks
 	-- predate every possible registration, so there is nothing to catch up on here
 	local Serdes = components.Serdes
-	local resolve_serdes = shared_record.resolve_serdes
-
-	-- the packet passes' measure, behind the salvage guard (see wire.measure_section_salvaging): a user encode
-	-- hook that throws mid-measure no longer unwinds out of generate_packets after the resolve passes marked the
-	-- frame's deltas sent -- the offending values are pruned from the draft, and everything else (the surviving
-	-- values, and the nulled/removed lists, which never encode) ships as measured. warn-and-continue: the frame
-	-- is salvaged, so erroring would throw away the salvage. the pruned values simply never reach clients --
-	-- their cells replicate again on their next staged change (which encodes fresh, and may fail again until the
-	-- hook or the value is fixed).
-	local function measure_section_guarded(draft: SectionDraft): number
-		local size, pruned, salvage_error = measure_section_salvaging(draft, resolve_serdes)
-		if salvage_error ~= nil then
-			local section_id = draft.relation or draft.component
-			warn(
-				`a serdes encode hook threw while encoding {id_to_string(section_id, world)}! {pruned} value(s) were dropped from this frame's packets and will not replicate until their cells next change: {salvage_error}`
-			)
-		end
-		return size
-	end
 
 	-- CLIENT SLOTS
 
@@ -2355,942 +2336,1086 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- ALLOCATION & PACKET GENERATION
 
-	-- the packet frame counter, cycling 0..2^32-1: every packet of one generate_packets call carries it, so a
-	-- caller splitting a call's packets across channels can group, dedupe, or order them (wrap-aware) on the
-	-- client. independent of the chunk frame counter below.
-	local packet_frame = -1
+	-- both packet passes -- the reliable delta/full pipeline and the unreliable always-replicate one -- live in
+	-- this nested scope for create_server's local budget: luau caps a function at 200 locals, create_server sat
+	-- near the cap, and nested functions have their own budget, so the ~60 helpers and stores below no longer
+	-- count against the outer one. runs exactly once, at construction, so every closure and persistent store
+	-- here is minted once like before, and upvalue access costs what it did as create_server locals (closures
+	-- capture each upvalue directly however many scopes up it lives). only the two entry points escape,
+	-- returned at the tail.
+	local function create_packet_generation()
+		-- the per-world serdes resolver (see shared.luau / serdes.luau), rebound here so the salvage guards
+		-- below reach it without leaving the scope
+		local resolve_serdes = shared_record.resolve_serdes
 
-	local function next_packet_frame(): number
-		packet_frame = (packet_frame + 1) % 2 ^ 32
-		return packet_frame
-	end
-
-	-- the recycling pools (see pools.luau). the scratch tables back the packet passes' per-frame lists: the
-	-- section drafts' lists, the per-node and per-client accumulators' inner tables, the entity create/delete
-	-- lists, and full_packet's collectors -- the flat packet buffer copies or encodes all of their contents, so
-	-- none escape a generate_packets call.
-	local pools = create_pools()
-	local fetch_scratch = pools.fetch_scratch
-	local release_scratch = pools.release_scratch
-	local fetch_draft = pools.fetch_draft
-	local release_draft = pools.release_draft
-	local get_run = pools.get_run
-
-	-- clears one masks table's swept bits for the shard, dropping the word when it zeroes (zero words are always
-	-- omitted, so equal restrictions compare equal).
-	local function sweep_masks_word(masks: ShardMasks, shard: number, clear: VisibilityMask)
-		local word = masks[shard]
-		if word == nil then
-			return
-		end
-		local cleared = bit32.band(word, clear)
-		if cleared == 0 then
-			masks[shard] = nil
-		else
-			masks[shard] = cleared
-		end
-	end
-
-	-- clears freed slots' stale marks from one shard's persistent stores: its last tree, the allow words, and
-	-- the derived effective words (bit clears distribute over intersection, so the same per-word sweep keeps
-	-- them consistent with their inputs). bits may carry several set bits (compaction batches reused target
-	-- slots per shard; allocate_client sweeps one). entries that zero are pruned, like everywhere else, so a
-	-- present last word is always nonzero.
-	local function sweep_freed_slots(shard: number, bits: VisibilityMask)
-		local clear = bit32.bnot(bits)
-		local shard_last_visibilities = last_visibilities[shard]
-		if shard_last_visibilities then
-			for _, last_component in shard_last_visibilities do
-				for entity, last in last_component do
-					local cleared = bit32.band(last, clear)
-					if cleared == 0 then
-						last_component[entity] = nil
-					else
-						last_component[entity] = cleared
-					end
-				end
+		-- the packet passes' measure, behind the salvage guard (see wire.measure_section_salvaging): a user encode
+		-- hook that throws mid-measure no longer unwinds out of generate_packets after the resolve passes marked the
+		-- frame's deltas sent -- the offending values are pruned from the draft, and everything else (the surviving
+		-- values, and the nulled/removed lists, which never encode) ships as measured. warn-and-continue: the frame
+		-- is salvaged, so erroring would throw away the salvage. the pruned values simply never reach clients --
+		-- their cells replicate again on their next staged change (which encodes fresh, and may fail again until the
+		-- hook or the value is fixed).
+		local function measure_section_guarded(draft: SectionDraft): number
+			local size, pruned, salvage_error = measure_section_salvaging(draft, resolve_serdes)
+			if salvage_error ~= nil then
+				local section_id = draft.relation or draft.component
+				warn(
+					`a serdes encode hook threw while encoding {id_to_string(section_id, world)}! {pruned} value(s) were dropped from this frame's packets and will not replicate until their cells next change: {salvage_error}`
+				)
 			end
-		end
-		for _, entity_masks in allow_masks do
-			for _, masks in entity_masks do
-				sweep_masks_word(masks, shard, clear)
-			end
-		end
-		for _, masks in effective_masks do
-			sweep_masks_word(masks, shard, clear)
-		end
-	end
-
-	-- allocates the lowest free (shard, bit) for a pending client -- opening a new shard when every existing one
-	-- is full, so allocation never fails -- sweeps a reused slot's stale bits from the persistent masks (so the
-	-- joiner starts blank and full_packet rebuilds from scratch), and grants the client's bit to cached filters
-	-- that admit them.
-	local function allocate_client(client: Client)
-		local shard = 1
-		while shard <= shard_count and allocated_masks[shard] == 0xffffffff do
-			shard += 1
-		end
-		if shard > shard_count then
-			-- reopened shards keep their freed word: their allow words may still carry stale bits the per-slot sweep
-			-- must clear
-			shard_count = shard
-			allocated_masks[shard] = 0
-			if freed_masks[shard] == nil then
-				freed_masks[shard] = 0
-			end
+			return size
 		end
 
-		local index = bit32.countrz(bit32.bnot(allocated_masks[shard]))
-		local bit = bit32.lshift(1, index)
-		local client_index = (shard - 1) * 32 + index
-		tracked_clients[client] = client_index
-		clients_by_index[client_index] = client
-		client_count += 1
-		allocated_masks[shard] = bit32.bor(allocated_masks[shard], bit)
+		-- the packet frame counter, cycling 0..2^32-1: every packet of one generate_packets call carries it, so a
+		-- caller splitting a call's packets across channels can group, dedupe, or order them (wrap-aware) on the
+		-- client. independent of the chunk frame counter below.
+		local packet_frame = -1
 
-		-- fresh slots never carry stale bits, so only freed slots are swept
-		if bit32.band(freed_masks[shard], bit) ~= 0 then
-			freed_masks[shard] = bit32.band(freed_masks[shard], bit32.bnot(bit))
-			sweep_freed_slots(shard, bit)
+		local function next_packet_frame(): number
+			packet_frame = (packet_frame + 1) % 2 ^ 32
+			return packet_frame
 		end
 
-		-- grant the bit to filters that admit this client: whitelists that named them while pending (their bit
-		-- didn't exist yet), and blacklists that don't name them -- this is what keeps blacklists' snapshot-derived
-		-- allow words fresh as the population grows. allow_masks mirrors privacy_filters' keys, so the masks table
-		-- always exists.
-		for entity, component_filters in privacy_filters do
-			local entity_masks = allow_masks[entity]
-			for privacy_key, filter in component_filters do
-				local admitted = filter[client]
-				if admitted == nil then
-					-- unnamed clients are admitted by blacklists only
-					admitted = privacy_is_blacklist(filter)
-				end
-				if admitted then
-					local masks = entity_masks[privacy_key]
-					masks[shard] = bit32.bor(masks[shard] or 0, bit)
-				end
-			end
-		end
+		-- the recycling pools (see pools.luau). the scratch tables back the packet passes' per-frame lists: the
+		-- section drafts' lists, the per-node and per-client accumulators' inner tables, the entity create/delete
+		-- lists, and full_packet's collectors -- the flat packet buffer copies or encodes all of their contents, so
+		-- none escape a generate_packets call.
+		local pools = create_pools()
+		local fetch_scratch = pools.fetch_scratch
+		local release_scratch = pools.release_scratch
+		local fetch_draft = pools.fetch_draft
+		local release_draft = pools.release_draft
+		local get_run = pools.get_run
 
-		-- delegation-aware pass: effective words derive from the own words the grant loop just refreshed, so
-		-- re-derive every delegator's, parents first. joins are rare and this is pure word math over the delegator
-		-- set; no restage -- the joiner's visibility ships via their full packet, and no other client's bits moved.
-		if next(delegation_parents) ~= nil then
-			local refreshed = {} :: { [Entity]: true }
-			for entity, parents in delegation_parents do
-				refresh_delegator(entity, parents, refreshed)
-			end
-		end
-	end
-
-	-- builds a full packet for a freshly-allocated client and marks their bit in their shard's last_* masks so
-	-- subsequent deltas diff correctly. allocate_client must have run first. walks the replicated set archetype
-	-- by archetype rather than per tracked component: cells only replicate on replicated subjects, so the
-	-- archetypes of Replicated's component record cover every cell (walked directly -- an uncached
-	-- world:query(Replicated):archetypes() rebuilds exactly that record's archetype list per call), and
-	-- everything shape-derived -- eligibility, privacy keys, pair halves (read off archetype.types like
-	-- restage_own_cells, never world:target), and value columns -- resolves once per archetype, leaving
-	-- per-entity work of only the entity's own gate, one filter word per cell, and a column read per value. only
-	-- this client's bit matters, so every mask check collapses to one band against the bit (allocated needs no
-	-- re-check: the client's own bit is allocated by definition).
-	local function full_packet(client: Client, this_packet_frame: number): Packet
-		local client_index = tracked_clients[client] :: number
-		local shard = shard_of(client_index)
-		local bit = slot_bit_of(client_index)
-		local sections: { SectionDraft } = fetch_scratch()
-		local section_of: { [Id]: SectionDraft } = fetch_scratch()
-		-- pair drafts collect per relation (their cells landing in per-target runs), in their own map: both maps
-		-- key gen-qualified ids here, so one definition serving as an unpaired component and as a relation shares
-		-- a key between the two roles at any generation, and the two must draft separate sections
-		local pair_section_of: { [Entity]: SectionDraft } = fetch_scratch()
-
-		local shard_last_visibilities = last_visibilities[shard]
-		if shard_last_visibilities == nil then
-			shard_last_visibilities = {}
-			last_visibilities[shard] = shard_last_visibilities
-		end
-		local last_existence = shard_last_visibilities[Existence]
-
-		local replicated: { number } = fetch_scratch()
-		local replicated_count = 0
-
-		-- appends one visible cell to its section draft. relation and target ride in from the archetype resolve
-		-- below, already gen-qualified, so pair cells never pay a pair_first/pair_second here; value is the cell's
-		-- column read (nil for tags and nulled values).
-		local function emit(component: Id, entity: Entity, relation: Entity?, target: Entity?, value: any)
-			local last_component = shard_last_visibilities[component]
-			if last_component == nil then
-				last_component = {}
-				shard_last_visibilities[component] = last_component
-			end
-			last_component[entity] = bit32.bor(last_component[entity] or 0, bit)
-
-			local lists: any
-			if relation ~= nil then
-				local data = pair_section_of[relation]
-				if data == nil then
-					data = fetch_draft(nil, relation :: any)
-					pair_section_of[relation] = data
-					table.insert(sections, data)
-				end
-				lists = get_run(data, target :: any)
-			else
-				local data = section_of[component]
-				if data == nil then
-					data = fetch_draft(component :: any)
-					section_of[component] = data
-					table.insert(sections, data)
-				end
-				lists = data
-			end
-
-			if value == nil then
-				local nulled = lists.nulled
-				if nulled == nil then
-					nulled = fetch_scratch()
-					lists.nulled = nulled
-				end
-				table.insert(nulled, entity)
-			else
-				local ids = lists.ids
-				local values = lists.values
-				if ids == nil then
-					ids = fetch_scratch()
-					values = fetch_scratch()
-					lists.ids = ids
-					lists.values = values
-				end
-				table.insert(ids, entity)
-				table.insert(values, value)
-			end
-		end
-
-		-- the walked archetype's networked cells, parallel over 1..cell_count: the cell id as staged and keyed in
-		-- the last tree (the component, or the packed pair id straight from archetype.types), the privacy key
-		-- gating it per entity (the component itself, or the gen-qualified relation -- doubling as emit's relation
-		-- argument), the value column (jecs backs tags with a shared empty column, so tag reads are plain nils),
-		-- and -- pair cells only -- the gen-qualified target.
-		local cell_ids: { number } = fetch_scratch()
-		local cell_keys: { number } = fetch_scratch()
-		local cell_columns: { { any } } = fetch_scratch()
-		local cell_targets: { [number]: Entity } = fetch_scratch()
-
-		local idr_replicated = component_index[Replicated]
-		local replicated_records = (if idr_replicated ~= nil then idr_replicated.records else empty_records) :: {
-			[number]: number,
-		}
-		local world_archetypes = world.archetypes
-		for archetype_id in replicated_records do
-			local archetype = world_archetypes[archetype_id]
-			local entities = archetype.entities
-			if #entities == 0 then
-				continue
-			end
-			local columns_map = archetype.columns_map
-
-			-- resolve the archetype's networked cells once: the tracking and pair-half checks are per component, not
-			-- per entity, and a pair target's gate blocking this client blocks the cell for every subject in the
-			-- archetype, so it drops here. the pair resolve mirrors restage_own_cells (an unindexed half is
-			-- ineligible).
-			local cell_count = 0
-			for _, component in archetype.types do
-				local privacy_key: number
-				local target: Entity? = nil
-				if IS_PAIR(component) then
-					local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
-					if relation == nil then
-						continue
-					end
-					local dense_target = ECS_PAIR_SECOND(component)
-					local target_gen = tracked_target_gens[dense_target]
-					if target_gen == nil or is_pair_target_replicable(target_gen) ~= true then
-						continue
-					end
-					if is_pair_mode_tracked(relation, dense_target) ~= true then
-						continue
-					end
-					if replicated_entities[dense_target] ~= nil then
-						local gate = entity_gate_masks(target_gen)
-						if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
-							continue
-						end
-					end
-					privacy_key = relation :: any
-					target = target_gen
-				elseif tracked_by[component] ~= nil then
-					privacy_key = component :: any
-				else
-					continue
-				end
-				cell_count += 1
-				cell_ids[cell_count] = component :: any
-				cell_keys[cell_count] = privacy_key
-				cell_columns[cell_count] = columns_map[component]
-				-- assigned even when nil, clearing whatever the previous archetype left at this row
-				cell_targets[cell_count] = target :: any
-			end
-
-			for row, entity in entities do
-				-- the entity's own gate: entity_gate_masks inlined so the allow-mask fetch is shared with the cell loop
-				-- below
-				local entity_masks = allow_masks[entity]
-				local gate = effective_masks[entity]
-				if gate == nil and entity_masks ~= nil then
-					gate = entity_masks[Existence]
-				end
-				if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
-					continue
-				end
-
-				replicated_count += 1
-				replicated[replicated_count] = entity :: any
-				if last_existence == nil then
-					last_existence = {}
-					shard_last_visibilities[Existence] = last_existence
-				end
-				last_existence[entity] = bit32.bor(last_existence[entity] or 0, bit)
-
-				for i = 1, cell_count do
-					local privacy_key = cell_keys[i]
-					if entity_masks ~= nil then
-						local filter = entity_masks[privacy_key :: any]
-						if filter ~= nil and bit32.band(filter[shard] or 0, bit) == 0 then
-							continue
-						end
-					end
-					local target = cell_targets[i]
-					emit(
-						cell_ids[i] :: any,
-						entity,
-						if target ~= nil then privacy_key :: any else nil,
-						target,
-						cell_columns[i][row]
-					)
-				end
-			end
-		end
-
-		release_scratch(cell_ids)
-		release_scratch(cell_keys)
-		release_scratch(cell_columns)
-		release_scratch(cell_targets)
-
-		-- measure first, then write back-to-back into one exactly-sized buffer, like finalize_node_sections: the
-		-- whole snapshot encodes into a single section buffer assemble_packet stamps with one copy
-		local sections_size = 0
-		for _, draft in sections do
-			sections_size += measure_section_guarded(draft)
-		end
-		local section_data = buffer.create(sections_size)
-		local section_offset = 0
-		local values: { { any } }? = nil
-		for _, draft in sections do
-			local hookless
-			section_offset, hookless = write_section(section_data, section_offset, draft)
-			if hookless then
-				if values == nil then
-					-- escapes as the packet's side array, so never pooled
-					values = {}
-				end
-				table.insert(values :: { { any } }, hookless)
-			end
-			release_draft(draft, hookless)
-		end
-		local section_buffers: { buffer } = fetch_scratch()
-		section_buffers[1] = section_data
-		release_scratch(sections)
-		release_scratch(section_of)
-		release_scratch(pair_section_of)
-
-		-- a joiner receives the whole live shared-name set, so every announced definition maps before the sections
-		-- above resolve
-		local names: { [number]: string }? = nil
-		if shared_names.has_live() then
-			local collected: { [number]: string } = fetch_scratch()
-			shared_names.collect_live(collected)
-			names = collected
-		end
-
-		local packet =
-			assemble_packet(this_packet_frame, nil, replicated, names, section_buffers, sections_size, values)
-		if names ~= nil then
-			release_scratch(names)
-		end
-		release_scratch(section_buffers)
-		release_scratch(replicated)
-		return packet
-	end
-
-	-- reclaims the highest occupied shard once the live client count falls more than 8 below the slot capacity
-	-- beneath it, so per-frame cost tracks the current population rather than the historical peak (staging,
-	-- resolve, and finalize all run per occupied shard). lowest-first allocation packs joiners low, so only the
-	-- stragglers of a population shrink pin a high shard; the deadzone guarantees at least stragglers + 9 free
-	-- bits below, so placement never fails, and re-opening the reclaimed shard takes ~9 net joins, so a
-	-- population hovering at a shard boundary never churns. at most one shard is reclaimed per call; a large
-	-- drop reclaims over successive calls. a move is a pure server-side bit transfer, invisible to clients:
-	-- packets are keyed by client object and deltas diff against whatever last words carry the bit. must run at
-	-- the tail of generate_packets -- next_visibilities and changed_values are empty there, leaving the last
-	-- trees, the allow words, and the slot bookkeeping as the only stores carrying slot bits.
-	local function compact_shards()
-		local reclaimed = shard_count
-		if client_count >= (reclaimed - 1) * 32 - 8 then
-			return
-		end
-
-		-- assign each straggler the lowest free bit below the reclaimed shard, collecting reused slots' stale bits
-		-- to sweep, batched per target shard
-		local straggler_mask = allocated_masks[reclaimed]
-		local moved_shards = {} :: { [number]: number }
-		local moved_bits = {} :: { [number]: VisibilityMask }
-		local swept_masks = {} :: { [number]: VisibilityMask }
-		local target_shard = 1
-		local stragglers = straggler_mask
-		while stragglers ~= 0 do
-			local old_index = bit32.countrz(stragglers)
-			stragglers = bit32.band(stragglers, stragglers - 1)
-
-			while allocated_masks[target_shard] == 0xffffffff do
-				target_shard += 1
-			end
-			local index = bit32.countrz(bit32.bnot(allocated_masks[target_shard]))
-			local bit = bit32.lshift(1, index)
-			allocated_masks[target_shard] = bit32.bor(allocated_masks[target_shard], bit)
-			if bit32.band(freed_masks[target_shard], bit) ~= 0 then
-				freed_masks[target_shard] = bit32.band(freed_masks[target_shard], bit32.bnot(bit))
-				swept_masks[target_shard] = bit32.bor(swept_masks[target_shard] or 0, bit)
-			end
-			moved_shards[old_index] = target_shard
-			moved_bits[old_index] = bit
-
-			local old_client_index = (reclaimed - 1) * 32 + old_index
-			local client = clients_by_index[old_client_index]
-			local client_index = (target_shard - 1) * 32 + index
-			tracked_clients[client] = client_index
-			clients_by_index[client_index] = client
-			clients_by_index[old_client_index] = nil
-		end
-
-		for shard, bits in swept_masks do
-			sweep_freed_slots(shard, bits)
-		end
-
-		-- transfer the last words: one walk of the reclaimed shard's tree (Existence included) moves every
-		-- straggler bit to its new slot; stale bits of the shard's previously-freed slots drop with the tree.
-		local reclaimed_last = last_visibilities[reclaimed]
-		if reclaimed_last then
-			for component, last_component in reclaimed_last do
-				for entity, last in last_component do
-					local moved = bit32.band(last, straggler_mask)
-					while moved ~= 0 do
-						local old_index = bit32.countrz(moved)
-						moved = bit32.band(moved, moved - 1)
-						local shard_last_visibilities = last_visibilities[moved_shards[old_index]]
-						if shard_last_visibilities == nil then
-							shard_last_visibilities = {}
-							last_visibilities[moved_shards[old_index]] = shard_last_visibilities
-						end
-						local target_component = shard_last_visibilities[component]
-						if target_component == nil then
-							target_component = {}
-							shard_last_visibilities[component] = target_component
-						end
-						target_component[entity] = bit32.bor(target_component[entity] or 0, moved_bits[old_index])
-					end
-				end
-			end
-			last_visibilities[reclaimed] = nil
-		end
-
-		-- moves one masks table's straggler bits to their new slots, dropping the reclaimed-shard word outright
-		local function transfer_masks_word(masks: ShardMasks)
-			local word = masks[reclaimed]
+		-- clears one masks table's swept bits for the shard, dropping the word when it zeroes (zero words are always
+		-- omitted, so equal restrictions compare equal).
+		local function sweep_masks_word(masks: ShardMasks, shard: number, clear: VisibilityMask)
+			local word = masks[shard]
 			if word == nil then
 				return
 			end
-			local moved = bit32.band(word, straggler_mask)
-			while moved ~= 0 do
-				local old_index = bit32.countrz(moved)
-				moved = bit32.band(moved, moved - 1)
-				local shard = moved_shards[old_index]
-				masks[shard] = bit32.bor(masks[shard] or 0, moved_bits[old_index])
-			end
-			masks[reclaimed] = nil
-		end
-
-		-- transfer the allow words with one walk; with the last tree gone that scrubs the shard's every slot bit,
-		-- so its freed word resets too and a future reopen starts pristine.
-		for _, entity_masks in allow_masks do
-			for _, masks in entity_masks do
-				transfer_masks_word(masks)
-			end
-		end
-
-		-- the derived effective words transfer the same way (bit moves distribute over intersection), their store
-		-- being one level flat
-		for _, masks in effective_masks do
-			transfer_masks_word(masks)
-		end
-
-		allocated_masks[reclaimed] = 0
-		freed_masks[reclaimed] = 0
-		while shard_count > 0 and allocated_masks[shard_count] == 0 do
-			shard_count -= 1
-		end
-	end
-
-	-- the mask trie: a cell's accumulated visibility is the node its run path reaches, so equal cross-shard
-	-- visibility converges on one node. its contents are per-frame and trie nodes never escape the pass, so the
-	-- expansion pass clears each node it leaves into a free list that append_mask_run drains before allocating,
-	-- and the root persists empty between calls.
-	local mask_trie = {} :: MaskTrieNode
-	local trie_node_pool = {} :: { MaskTrieNode }
-	local trie_node_pool_count = 0
-
-	-- advances a cell's node by one run, starting from the root at 0
-	local function append_mask_run(node: VisibilityNode, run: number): MaskTrieNode
-		local parent: MaskTrieNode = if node == 0 then mask_trie else node :: MaskTrieNode
-		local child = parent[run]
-		if child == nil then
-			if trie_node_pool_count > 0 then
-				child = trie_node_pool[trie_node_pool_count]
-				trie_node_pool[trie_node_pool_count] = nil
-				trie_node_pool_count -= 1
+			local cleared = bit32.band(word, clear)
+			if cleared == 0 then
+				masks[shard] = nil
 			else
-				child = {}
-			end
-			parent[run] = child
-		end
-		return child
-	end
-
-	-- cross-shard packet groups, persistent across calls (see the PacketGroup type): every dirty cell lands in
-	-- its group once, its nodes accumulating per-shard runs as the shard loop advances. unpaired components
-	-- key groups by their id; pair cells share one group per relation, keyed by the relation's dense half (all a
-	-- packed pair id carries) in its own store -- a generation-0 component id can collide with a relation's
-	-- dense id, and the two must stay distinct groups. dirty_groups lists the groups touched this frame so the
-	-- bucket pass never walks the historical set; group_frame stamps first touches, and last_group_sweep
-	-- schedules the eviction sweep that keeps both stores bounded by the recently-live id set.
-	local groups = {} :: { [Id]: PacketGroup }
-	local pair_groups = {} :: { [number]: PacketGroup }
-	local dirty_groups = {} :: { PacketGroup }
-	local dirty_group_count = 0
-	local group_frame = 0
-	local last_group_sweep = 0
-
-	-- per-frame accumulators of the packet passes, grouped into one record shared by the pass functions below
-	-- as an upvalue rather than parameters: the nine accumulators cost one of create_server's locals between
-	-- them (the function sits near luau's 200-local ceiling), and each pass aliases the fields it touches into
-	-- locals at its head -- nested functions have their own 200-local budget, and the aliases are the upvalue
-	-- reads the passes already paid. the maps themselves persist: release_frame_state hands their inner tables
-	-- back to the scratch pool once the frame's packets are assembled, and reset_frame_state clears whatever an
-	-- errored frame stranded (the salvage guard contains user encode throws, but an internal error can still
-	-- unwind mid-frame) so every call still starts fresh. both stay directly below the declaration so an
-	-- accumulator can't be added without its reset and release in view -- the record literal is the declaration
-	-- list.
-	local frame_state = {
-		-- entity create/delete lists keyed by global client index
-		replicated_by = {} :: { [number]: { number } },
-		unreplicated_by = {} :: { [number]: { number } },
-
-		-- sections attach per accumulated-visibility node via node_section_drafts, keyed [node][group] -- the
-		-- group object itself, so an unpaired component and a relation can never collide however their ids
-		-- overlap; unpaired groups draft an unpaired section, pair groups a relation section whose per-target
-		-- runs the bucket pass fills. with a single occupied shard every cell has exactly one run, so the trie
-		-- is skipped entirely and the drafts key by the raw mask word instead. masks are intersected with each
-		-- shard's allocated word at resolve time so a departed client's stale bit lingering in last_visibilities
-		-- never creates or widens a section.
-		node_section_drafts = {} :: { [VisibilityNode]: { [PacketGroup]: SectionDraft } },
-
-		-- finalize_node_sections' outputs, per node: the node's sections encoded back-to-back into one shared
-		-- buffer, its byte size, and (only when the node has any) the hookless sections' value arrays in write
-		-- order -- one array per hookless section, so the outer length counts sections and never values.
-		node_buffers = {} :: { [VisibilityNode]: buffer },
-		node_sizes = {} :: { [VisibilityNode]: number },
-		node_section_values = {} :: { [VisibilityNode]: { { any } } },
-
-		-- per-client accumulators for the expansion pass: the section buffers to stamp, their running byte size,
-		-- and the hookless sections' value arrays in section order (the packet's side array, same
-		-- one-array-per-section shape as node_section_values), all keyed by global client index.
-		client_buffers = {} :: { [number]: { buffer } },
-		client_sizes = {} :: { [number]: number },
-		client_section_values = {} :: { [number]: { { any } } },
-	}
-
-	-- the frame's freshly-announced shared names (gen-qualified id -> name), drained from the shared-name store
-	-- and stamped into every allocated client's packet; nil on frames announcing nothing.
-	local frame_names: { [number]: string }? = nil
-
-	-- whether several shards are occupied this frame: with one occupied shard the trie is skipped and raw mask
-	-- words key node_section_drafts directly.
-	local multi_shard = false
-
-	local function reset_frame_state()
-		table.clear(frame_state.replicated_by)
-		table.clear(frame_state.unreplicated_by)
-		table.clear(frame_state.node_section_drafts)
-		table.clear(frame_state.node_buffers)
-		table.clear(frame_state.node_sizes)
-		table.clear(frame_state.node_section_values)
-		table.clear(frame_state.client_buffers)
-		table.clear(frame_state.client_sizes)
-		table.clear(frame_state.client_section_values)
-		-- an errored frame's stranded table is abandoned to the GC rather than pooled; release_frame_state is what
-		-- recycles it on clean frames
-		frame_names = nil
-		multi_shard = shard_count > 1
-	end
-
-	-- runs after assemble_client_packets: every section buffer has been stamped into the clients' flat packets
-	-- and the create/delete lists written inline, so only the hookless value arrays inside client_section_values
-	-- (escaped into the packets' side arrays) outlive the frame. releasing a map's values before clearing the
-	-- map is safe here -- nothing fetches until the maps are cleared -- and running before the joiner full
-	-- packets lets those draw on the freed tables. node_section_drafts is already empty: finalize_node_sections
-	-- consumed it.
-	local function release_frame_state()
-		-- node_buffers holds plain buffers whose bytes were already stamped into the clients' packets, so they just
-		-- drop to the GC
-		table.clear(frame_state.node_buffers)
-		table.clear(frame_state.node_sizes)
-		local node_section_values = frame_state.node_section_values
-		for _, section_values in node_section_values do
-			release_scratch(section_values)
-		end
-		table.clear(node_section_values)
-		local client_buffers = frame_state.client_buffers
-		for _, buffers in client_buffers do
-			release_scratch(buffers)
-		end
-		table.clear(client_buffers)
-		table.clear(frame_state.client_sizes)
-		table.clear(frame_state.client_section_values)
-		local replicated_by = frame_state.replicated_by
-		for _, list in replicated_by do
-			release_scratch(list)
-		end
-		table.clear(replicated_by)
-		local unreplicated_by = frame_state.unreplicated_by
-		for _, list in unreplicated_by do
-			release_scratch(list)
-		end
-		table.clear(unreplicated_by)
-		if frame_names ~= nil then
-			release_scratch(frame_names)
-			frame_names = nil
-		end
-	end
-
-	local function get_group(component: Id): PacketGroup
-		local group = groups[component]
-		if group == nil then
-			group = {
-				key = component :: any,
-				frame = group_frame,
-				count = 0,
-				entities = {},
-				values = {},
-				send_nodes = {},
-				removed_nodes = {},
-				row_of = if multi_shard then {} else nil,
-				is_tag = jecs.is_tag(world, component),
-			} :: PacketGroup
-			groups[component] = group
-			dirty_group_count += 1
-			dirty_groups[dirty_group_count] = group
-		elseif group.frame ~= group_frame then
-			group.frame = group_frame
-			dirty_group_count += 1
-			dirty_groups[dirty_group_count] = group
-			if multi_shard and group.row_of == nil then
-				group.row_of = {}
+				masks[shard] = cleared
 			end
 		end
-		return group
-	end
 
-	-- the shared group of every pair cell using component's relation. packed pair ids reuse dense halves across
-	-- generations, so the gen-qualified relation (and the relation tag-ness gating the resolve passes' value
-	-- reads) re-resolves on the group's first touch each frame -- through the relation gen cache, with an
-	-- untracked relation (a stop_tracking_component or a relation death resolving its staged removals) recovered
-	-- from the retired store, and the live resolve as a last resort for cells no retirement covers; the targets
-	-- resolve per pair id in the resolve passes, since one group now spans every target of the relation.
-	local function get_pair_group(component: Id): PacketGroup
-		local relation_dense = ECS_PAIR_FIRST(component)
-		local group = pair_groups[relation_dense]
-		if group == nil then
-			local relation = (
-				tracked_relation_gens[relation_dense]
-				or retired_relation_gens[relation_dense]
-				or jecs.pair_first(world, component)
-			) :: any
-			local is_tag = tracked_relation_tags[relation_dense]
-			if is_tag == nil then
-				is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
+		-- clears freed slots' stale marks from one shard's persistent stores: its last tree, the allow words, and
+		-- the derived effective words (bit clears distribute over intersection, so the same per-word sweep keeps
+		-- them consistent with their inputs). bits may carry several set bits (compaction batches reused target
+		-- slots per shard; allocate_client sweeps one). entries that zero are pruned, like everywhere else, so a
+		-- present last word is always nonzero.
+		local function sweep_freed_slots(shard: number, bits: VisibilityMask)
+			local clear = bit32.bnot(bits)
+			local shard_last_visibilities = last_visibilities[shard]
+			if shard_last_visibilities then
+				for _, last_component in shard_last_visibilities do
+					for entity, last in last_component do
+						local cleared = bit32.band(last, clear)
+						if cleared == 0 then
+							last_component[entity] = nil
+						else
+							last_component[entity] = cleared
+						end
+					end
+				end
 			end
-			group = {
-				key = relation_dense,
-				frame = group_frame,
-				count = 0,
-				entities = {},
-				values = {},
-				send_nodes = {},
-				removed_nodes = {},
-				is_tag = is_tag,
-				relation = relation,
-				targets = {},
-				pair_rows = if multi_shard then {} else nil,
-			} :: PacketGroup
-			pair_groups[relation_dense] = group
-			dirty_group_count += 1
-			dirty_groups[dirty_group_count] = group
-		elseif group.frame ~= group_frame then
-			group.frame = group_frame
-			dirty_group_count += 1
-			dirty_groups[dirty_group_count] = group
-			local relation = (
-				tracked_relation_gens[relation_dense]
-				or retired_relation_gens[relation_dense]
-				or jecs.pair_first(world, component)
-			) :: any
-			group.relation = relation
-			local is_tag = tracked_relation_tags[relation_dense]
-			if is_tag == nil then
-				is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
+			for _, entity_masks in allow_masks do
+				for _, masks in entity_masks do
+					sweep_masks_word(masks, shard, clear)
+				end
 			end
-			group.is_tag = is_tag
-			if multi_shard and group.pair_rows == nil then
-				group.pair_rows = {}
+			for _, masks in effective_masks do
+				sweep_masks_word(masks, shard, clear)
 			end
 		end
-		return group
-	end
 
-	local function get_section(node: VisibilityNode, group: PacketGroup): SectionDraft
-		local node_section_drafts = frame_state.node_section_drafts
-		local section_drafts = node_section_drafts[node]
-		if section_drafts == nil then
-			section_drafts = fetch_scratch()
-			node_section_drafts[node] = section_drafts
+		-- allocates the lowest free (shard, bit) for a pending client -- opening a new shard when every existing one
+		-- is full, so allocation never fails -- sweeps a reused slot's stale bits from the persistent masks (so the
+		-- joiner starts blank and full_packet rebuilds from scratch), and grants the client's bit to cached filters
+		-- that admit them.
+		local function allocate_client(client: Client)
+			local shard = 1
+			while shard <= shard_count and allocated_masks[shard] == 0xffffffff do
+				shard += 1
+			end
+			if shard > shard_count then
+				-- reopened shards keep their freed word: their allow words may still carry stale bits the per-slot sweep
+				-- must clear
+				shard_count = shard
+				allocated_masks[shard] = 0
+				if freed_masks[shard] == nil then
+					freed_masks[shard] = 0
+				end
+			end
+
+			local index = bit32.countrz(bit32.bnot(allocated_masks[shard]))
+			local bit = bit32.lshift(1, index)
+			local client_index = (shard - 1) * 32 + index
+			tracked_clients[client] = client_index
+			clients_by_index[client_index] = client
+			client_count += 1
+			allocated_masks[shard] = bit32.bor(allocated_masks[shard], bit)
+
+			-- fresh slots never carry stale bits, so only freed slots are swept
+			if bit32.band(freed_masks[shard], bit) ~= 0 then
+				freed_masks[shard] = bit32.band(freed_masks[shard], bit32.bnot(bit))
+				sweep_freed_slots(shard, bit)
+			end
+
+			-- grant the bit to filters that admit this client: whitelists that named them while pending (their bit
+			-- didn't exist yet), and blacklists that don't name them -- this is what keeps blacklists' snapshot-derived
+			-- allow words fresh as the population grows. allow_masks mirrors privacy_filters' keys, so the masks table
+			-- always exists.
+			for entity, component_filters in privacy_filters do
+				local entity_masks = allow_masks[entity]
+				for privacy_key, filter in component_filters do
+					local admitted = filter[client]
+					if admitted == nil then
+						-- unnamed clients are admitted by blacklists only
+						admitted = privacy_is_blacklist(filter)
+					end
+					if admitted then
+						local masks = entity_masks[privacy_key]
+						masks[shard] = bit32.bor(masks[shard] or 0, bit)
+					end
+				end
+			end
+
+			-- delegation-aware pass: effective words derive from the own words the grant loop just refreshed, so
+			-- re-derive every delegator's, parents first. joins are rare and this is pure word math over the delegator
+			-- set; no restage -- the joiner's visibility ships via their full packet, and no other client's bits moved.
+			if next(delegation_parents) ~= nil then
+				local refreshed = {} :: { [Entity]: true }
+				for entity, parents in delegation_parents do
+					refresh_delegator(entity, parents, refreshed)
+				end
+			end
 		end
-		local data = section_drafts[group]
-		if data == nil then
-			-- a pair group's key is its dense relation half, which must never reach a wire header; the draft names
-			-- only the relation
-			data = fetch_draft(if group.targets then nil else group.key, group.relation)
-			section_drafts[group] = data
-		end
-		return data
-	end
 
-	-- the one special-cased cell: the existence diff resolves into per-client replicated / unreplicated lists
-	-- rather than a component group (a bit gained is a create, a bit cleared a delete), and resolves *before*
-	-- the component cells because the returned record holds the bits deleted this frame so they can drop
-	-- per-component removals the client applies wholesale when deleting the entity (or pair target) locally.
-	-- masks are shard-relative, so the diff and the record are both per-shard.
-	local function resolve_existence_diff(
-		shard_next_visibilities: ShardVisibilities,
-		shard_last_visibilities: ShardVisibilities,
-		allocated: VisibilityMask,
-		base_index: number
-	): { [Entity]: VisibilityMask }
-		local replicated_by = frame_state.replicated_by
-		local unreplicated_by = frame_state.unreplicated_by
+		-- builds a full packet for a freshly-allocated client and marks their bit in their shard's last_* masks so
+		-- subsequent deltas diff correctly. allocate_client must have run first. walks the replicated set archetype
+		-- by archetype rather than per tracked component: cells only replicate on replicated subjects, so the
+		-- archetypes of Replicated's component record cover every cell (walked directly -- an uncached
+		-- world:query(Replicated):archetypes() rebuilds exactly that record's archetype list per call), and
+		-- everything shape-derived -- eligibility, privacy keys, pair halves (read off archetype.types like
+		-- restage_own_cells, never world:target), and value columns -- resolves once per archetype, leaving
+		-- per-entity work of only the entity's own gate, one filter word per cell, and a column read per value. only
+		-- this client's bit matters, so every mask check collapses to one band against the bit (allocated needs no
+		-- re-check: the client's own bit is allocated by definition).
+		local function full_packet(client: Client, this_packet_frame: number): Packet
+			local client_index = tracked_clients[client] :: number
+			local shard = shard_of(client_index)
+			local bit = slot_bit_of(client_index)
+			local sections: { SectionDraft } = fetch_scratch()
+			local section_of: { [Id]: SectionDraft } = fetch_scratch()
+			-- pair drafts collect per relation (their cells landing in per-target runs), in their own map: both maps
+			-- key gen-qualified ids here, so one definition serving as an unpaired component and as a relation shares
+			-- a key between the two roles at any generation, and the two must draft separate sections
+			local pair_section_of: { [Entity]: SectionDraft } = fetch_scratch()
 
-		-- pooled; the caller releases it once the component cells resolve
-		local entity_unreplicate_masks: { [Entity]: VisibilityMask } = fetch_scratch()
-
-		local existence_visibility = shard_next_visibilities[Existence]
-		if existence_visibility then
-			shard_next_visibilities[Existence] = nil
+			local shard_last_visibilities = last_visibilities[shard]
+			if shard_last_visibilities == nil then
+				shard_last_visibilities = {}
+				last_visibilities[shard] = shard_last_visibilities
+			end
 			local last_existence = shard_last_visibilities[Existence]
 
-			for entity, new in existence_visibility do
-				local old = if last_existence then last_existence[entity] or 0 else 0
-				local send = bit32.band(bit32.band(new, bit32.bnot(old)), allocated)
-				local removed = bit32.band(bit32.band(old, bit32.bnot(new)), allocated)
+			local replicated: { number } = fetch_scratch()
+			local replicated_count = 0
 
-				local m = send
-				while m ~= 0 do
-					local index = bit32.countrz(m)
-					m = bit32.band(m, m - 1)
-					local list = replicated_by[base_index + index]
-					if list == nil then
-						list = fetch_scratch()
-						replicated_by[base_index + index] = list
-					end
-					table.insert(list, entity :: any)
+			-- appends one visible cell to its section draft. relation and target ride in from the archetype resolve
+			-- below, already gen-qualified, so pair cells never pay a pair_first/pair_second here; value is the cell's
+			-- column read (nil for tags and nulled values).
+			local function emit(component: Id, entity: Entity, relation: Entity?, target: Entity?, value: any)
+				local last_component = shard_last_visibilities[component]
+				if last_component == nil then
+					last_component = {}
+					shard_last_visibilities[component] = last_component
 				end
+				last_component[entity] = bit32.bor(last_component[entity] or 0, bit)
 
-				if removed ~= 0 then
-					entity_unreplicate_masks[entity] = removed
-					local r = removed
-					while r ~= 0 do
-						local index = bit32.countrz(r)
-						r = bit32.band(r, r - 1)
-						local list = unreplicated_by[base_index + index]
-						if list == nil then
-							list = fetch_scratch()
-							unreplicated_by[base_index + index] = list
-						end
-						table.insert(list, entity :: any)
+				local lists: any
+				if relation ~= nil then
+					local data = pair_section_of[relation]
+					if data == nil then
+						data = fetch_draft(nil, relation :: any)
+						pair_section_of[relation] = data
+						table.insert(sections, data)
 					end
-				end
-
-				-- merge existence next -> last in place, pruning hides
-				if new == 0 then
-					if last_existence then
-						last_existence[entity] = nil
-					end
+					lists = get_run(data, target :: any)
 				else
+					local data = section_of[component]
+					if data == nil then
+						data = fetch_draft(component :: any)
+						section_of[component] = data
+						table.insert(sections, data)
+					end
+					lists = data
+				end
+
+				if value == nil then
+					local nulled = lists.nulled
+					if nulled == nil then
+						nulled = fetch_scratch()
+						lists.nulled = nulled
+					end
+					table.insert(nulled, entity)
+				else
+					local ids = lists.ids
+					local values = lists.values
+					if ids == nil then
+						ids = fetch_scratch()
+						values = fetch_scratch()
+						lists.ids = ids
+						lists.values = values
+					end
+					table.insert(ids, entity)
+					table.insert(values, value)
+				end
+			end
+
+			-- the walked archetype's networked cells, parallel over 1..cell_count: the cell id as staged and keyed in
+			-- the last tree (the component, or the packed pair id straight from archetype.types), the privacy key
+			-- gating it per entity (the component itself, or the gen-qualified relation -- doubling as emit's relation
+			-- argument), the value column (jecs backs tags with a shared empty column, so tag reads are plain nils),
+			-- and -- pair cells only -- the gen-qualified target.
+			local cell_ids: { number } = fetch_scratch()
+			local cell_keys: { number } = fetch_scratch()
+			local cell_columns: { { any } } = fetch_scratch()
+			local cell_targets: { [number]: Entity } = fetch_scratch()
+
+			local idr_replicated = component_index[Replicated]
+			local replicated_records = (if idr_replicated ~= nil then idr_replicated.records else empty_records) :: {
+				[number]: number,
+			}
+			local world_archetypes = world.archetypes
+			for archetype_id in replicated_records do
+				local archetype = world_archetypes[archetype_id]
+				local entities = archetype.entities
+				if #entities == 0 then
+					continue
+				end
+				local columns_map = archetype.columns_map
+
+				-- resolve the archetype's networked cells once: the tracking and pair-half checks are per component, not
+				-- per entity, and a pair target's gate blocking this client blocks the cell for every subject in the
+				-- archetype, so it drops here. the pair resolve mirrors restage_own_cells (an unindexed half is
+				-- ineligible).
+				local cell_count = 0
+				for _, component in archetype.types do
+					local privacy_key: number
+					local target: Entity? = nil
+					if IS_PAIR(component) then
+						local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
+						if relation == nil then
+							continue
+						end
+						local dense_target = ECS_PAIR_SECOND(component)
+						local target_gen = tracked_target_gens[dense_target]
+						if target_gen == nil or is_pair_target_replicable(target_gen) ~= true then
+							continue
+						end
+						if is_pair_mode_tracked(relation, dense_target) ~= true then
+							continue
+						end
+						if replicated_entities[dense_target] ~= nil then
+							local gate = entity_gate_masks(target_gen)
+							if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
+								continue
+							end
+						end
+						privacy_key = relation :: any
+						target = target_gen
+					elseif tracked_by[component] ~= nil then
+						privacy_key = component :: any
+					else
+						continue
+					end
+					cell_count += 1
+					cell_ids[cell_count] = component :: any
+					cell_keys[cell_count] = privacy_key
+					cell_columns[cell_count] = columns_map[component]
+					-- assigned even when nil, clearing whatever the previous archetype left at this row
+					cell_targets[cell_count] = target :: any
+				end
+
+				for row, entity in entities do
+					-- the entity's own gate: entity_gate_masks inlined so the allow-mask fetch is shared with the cell loop
+					-- below
+					local entity_masks = allow_masks[entity]
+					local gate = effective_masks[entity]
+					if gate == nil and entity_masks ~= nil then
+						gate = entity_masks[Existence]
+					end
+					if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
+						continue
+					end
+
+					replicated_count += 1
+					replicated[replicated_count] = entity :: any
 					if last_existence == nil then
 						last_existence = {}
 						shard_last_visibilities[Existence] = last_existence
 					end
-					last_existence[entity] = new
+					last_existence[entity] = bit32.bor(last_existence[entity] or 0, bit)
+
+					for i = 1, cell_count do
+						local privacy_key = cell_keys[i]
+						if entity_masks ~= nil then
+							local filter = entity_masks[privacy_key :: any]
+							if filter ~= nil and bit32.band(filter[shard] or 0, bit) == 0 then
+								continue
+							end
+						end
+						local target = cell_targets[i]
+						emit(
+							cell_ids[i] :: any,
+							entity,
+							if target ~= nil then privacy_key :: any else nil,
+							target,
+							cell_columns[i][row]
+						)
+					end
 				end
 			end
 
-			if last_existence and next(last_existence) == nil then
-				shard_last_visibilities[Existence] = nil
+			release_scratch(cell_ids)
+			release_scratch(cell_keys)
+			release_scratch(cell_columns)
+			release_scratch(cell_targets)
+
+			-- measure first, then write back-to-back into one exactly-sized buffer, like finalize_node_sections: the
+			-- whole snapshot encodes into a single section buffer assemble_packet stamps with one copy
+			local sections_size = 0
+			for _, draft in sections do
+				sections_size += measure_section_guarded(draft)
+			end
+			local section_data = buffer.create(sections_size)
+			local section_offset = 0
+			local values: { { any } }? = nil
+			for _, draft in sections do
+				local hookless
+				section_offset, hookless = write_section(section_data, section_offset, draft)
+				if hookless then
+					if values == nil then
+						-- escapes as the packet's side array, so never pooled
+						values = {}
+					end
+					table.insert(values :: { { any } }, hookless)
+				end
+				release_draft(draft, hookless)
+			end
+			local section_buffers: { buffer } = fetch_scratch()
+			section_buffers[1] = section_data
+			release_scratch(sections)
+			release_scratch(section_of)
+			release_scratch(pair_section_of)
+
+			-- a joiner receives the whole live shared-name set, so every announced definition maps before the sections
+			-- above resolve
+			local names: { [number]: string }? = nil
+			if shared_names.has_live() then
+				local collected: { [number]: string } = fetch_scratch()
+				shared_names.collect_live(collected)
+				names = collected
+			end
+
+			local packet =
+				assemble_packet(this_packet_frame, nil, replicated, names, section_buffers, sections_size, values)
+			if names ~= nil then
+				release_scratch(names)
+			end
+			release_scratch(section_buffers)
+			release_scratch(replicated)
+			return packet
+		end
+
+		-- reclaims the highest occupied shard once the live client count falls more than 8 below the slot capacity
+		-- beneath it, so per-frame cost tracks the current population rather than the historical peak (staging,
+		-- resolve, and finalize all run per occupied shard). lowest-first allocation packs joiners low, so only the
+		-- stragglers of a population shrink pin a high shard; the deadzone guarantees at least stragglers + 9 free
+		-- bits below, so placement never fails, and re-opening the reclaimed shard takes ~9 net joins, so a
+		-- population hovering at a shard boundary never churns. at most one shard is reclaimed per call; a large
+		-- drop reclaims over successive calls. a move is a pure server-side bit transfer, invisible to clients:
+		-- packets are keyed by client object and deltas diff against whatever last words carry the bit. must run at
+		-- the tail of generate_packets -- next_visibilities and changed_values are empty there, leaving the last
+		-- trees, the allow words, and the slot bookkeeping as the only stores carrying slot bits.
+		local function compact_shards()
+			local reclaimed = shard_count
+			if client_count >= (reclaimed - 1) * 32 - 8 then
+				return
+			end
+
+			-- assign each straggler the lowest free bit below the reclaimed shard, collecting reused slots' stale bits
+			-- to sweep, batched per target shard
+			local straggler_mask = allocated_masks[reclaimed]
+			local moved_shards = {} :: { [number]: number }
+			local moved_bits = {} :: { [number]: VisibilityMask }
+			local swept_masks = {} :: { [number]: VisibilityMask }
+			local target_shard = 1
+			local stragglers = straggler_mask
+			while stragglers ~= 0 do
+				local old_index = bit32.countrz(stragglers)
+				stragglers = bit32.band(stragglers, stragglers - 1)
+
+				while allocated_masks[target_shard] == 0xffffffff do
+					target_shard += 1
+				end
+				local index = bit32.countrz(bit32.bnot(allocated_masks[target_shard]))
+				local bit = bit32.lshift(1, index)
+				allocated_masks[target_shard] = bit32.bor(allocated_masks[target_shard], bit)
+				if bit32.band(freed_masks[target_shard], bit) ~= 0 then
+					freed_masks[target_shard] = bit32.band(freed_masks[target_shard], bit32.bnot(bit))
+					swept_masks[target_shard] = bit32.bor(swept_masks[target_shard] or 0, bit)
+				end
+				moved_shards[old_index] = target_shard
+				moved_bits[old_index] = bit
+
+				local old_client_index = (reclaimed - 1) * 32 + old_index
+				local client = clients_by_index[old_client_index]
+				local client_index = (target_shard - 1) * 32 + index
+				tracked_clients[client] = client_index
+				clients_by_index[client_index] = client
+				clients_by_index[old_client_index] = nil
+			end
+
+			for shard, bits in swept_masks do
+				sweep_freed_slots(shard, bits)
+			end
+
+			-- transfer the last words: one walk of the reclaimed shard's tree (Existence included) moves every
+			-- straggler bit to its new slot; stale bits of the shard's previously-freed slots drop with the tree.
+			local reclaimed_last = last_visibilities[reclaimed]
+			if reclaimed_last then
+				for component, last_component in reclaimed_last do
+					for entity, last in last_component do
+						local moved = bit32.band(last, straggler_mask)
+						while moved ~= 0 do
+							local old_index = bit32.countrz(moved)
+							moved = bit32.band(moved, moved - 1)
+							local shard_last_visibilities = last_visibilities[moved_shards[old_index]]
+							if shard_last_visibilities == nil then
+								shard_last_visibilities = {}
+								last_visibilities[moved_shards[old_index]] = shard_last_visibilities
+							end
+							local target_component = shard_last_visibilities[component]
+							if target_component == nil then
+								target_component = {}
+								shard_last_visibilities[component] = target_component
+							end
+							target_component[entity] = bit32.bor(target_component[entity] or 0, moved_bits[old_index])
+						end
+					end
+				end
+				last_visibilities[reclaimed] = nil
+			end
+
+			-- moves one masks table's straggler bits to their new slots, dropping the reclaimed-shard word outright
+			local function transfer_masks_word(masks: ShardMasks)
+				local word = masks[reclaimed]
+				if word == nil then
+					return
+				end
+				local moved = bit32.band(word, straggler_mask)
+				while moved ~= 0 do
+					local old_index = bit32.countrz(moved)
+					moved = bit32.band(moved, moved - 1)
+					local shard = moved_shards[old_index]
+					masks[shard] = bit32.bor(masks[shard] or 0, moved_bits[old_index])
+				end
+				masks[reclaimed] = nil
+			end
+
+			-- transfer the allow words with one walk; with the last tree gone that scrubs the shard's every slot bit,
+			-- so its freed word resets too and a future reopen starts pristine.
+			for _, entity_masks in allow_masks do
+				for _, masks in entity_masks do
+					transfer_masks_word(masks)
+				end
+			end
+
+			-- the derived effective words transfer the same way (bit moves distribute over intersection), their store
+			-- being one level flat
+			for _, masks in effective_masks do
+				transfer_masks_word(masks)
+			end
+
+			allocated_masks[reclaimed] = 0
+			freed_masks[reclaimed] = 0
+			while shard_count > 0 and allocated_masks[shard_count] == 0 do
+				shard_count -= 1
 			end
 		end
 
-		return entity_unreplicate_masks
-	end
+		-- the mask trie: a cell's accumulated visibility is the node its run path reaches, so equal cross-shard
+		-- visibility converges on one node. its contents are per-frame and trie nodes never escape the pass, so the
+		-- expansion pass clears each node it leaves into a free list that append_mask_run drains before allocating,
+		-- and the root persists empty between calls.
+		local mask_trie = {} :: MaskTrieNode
+		local trie_node_pool = {} :: { MaskTrieNode }
+		local trie_node_pool_count = 0
 
-	-- visibility cells of one shard: fold every dirty cell into its component's cross-shard group, its send /
-	-- removed words accumulated into section keys. send and removed are disjoint, so a client falls into at most
-	-- one of them per cell. a cell whose value also changed emits only its removals here; its sends defer to
-	-- resolve_value_cells, run against the post-merge mask so every viewer gets the new value exactly once.
-	local function resolve_visibility_cells(
-		shard_next_visibilities: ShardVisibilities,
-		shard_last_visibilities: ShardVisibilities,
-		allocated: VisibilityMask,
-		shard_key_base: number,
-		entity_unreplicate_masks: { [Entity]: VisibilityMask }
-	)
-		for component, new_visibility in shard_next_visibilities do
-			local changed = changed_values[component]
-			local old_visibility = shard_last_visibilities[component]
-
-			local is_pair = IS_PAIR(component)
-			local group = if is_pair then get_pair_group(component) else get_group(component)
-			local is_tag = group.is_tag
-			local count = group.count
-			local entities = group.entities
-			local values = group.values
-			local send_nodes = group.send_nodes
-			local removed_nodes = group.removed_nodes
-			local targets = group.targets
-			local rows = group.row_of
-
-			-- a pair whose target the client drops this frame needs no explicit removals: dropping the target locally
-			-- auto-removes the pair. a live cache entry is the dense id's current tenant (== the target the client
-			-- resolves with), so the sends of a dense id recycled within the frame are never taken for the old tenant;
-			-- a miss means the pair id carries only removals, which belong to the retired tenant -- naming that gen
-			-- keeps the skip generation-precise across a same-frame recycle. the target-side drops are loop-invariant,
-			-- so they narrow removed_allowed -- the word removals compute against in place of the raw allocated word --
-			-- once, outside the entity loop; the subject's own drop stays per entity.
-			local target: Entity? = nil
-			local removed_allowed = allocated
-			if is_pair then
-				-- the relation-level recycle signature: the relation's dense id retired one definition and re-tracked
-				-- another since the last call, so the staged removals belong to the retired definition -- section
-				-- relation ids are dense on the wire and the new definition's announcement rebinds the client's mapping
-				-- before sections apply, so a shipped removal would misresolve to the new definition. drop them; the
-				-- client's mapping-teardown sweep owns the cleanup (see sweep_imported_cells in client.luau). the
-				-- target-level signature below is the same check one level down.
-				local relation_dense = ECS_PAIR_FIRST(component)
-				local retired_relation = retired_relation_gens[relation_dense]
-				if retired_relation ~= nil then
-					local live_relation = tracked_relation_gens[relation_dense]
-					if live_relation ~= nil and live_relation ~= retired_relation then
-						removed_allowed = 0
-					end
-				end
-
-				local dense_target = ECS_PAIR_SECOND(component)
-				local retired = retired_target_gens[dense_target]
-				target = tracked_target_gens[dense_target]
-				if target == nil then
-					-- the target died (or shed its last pair) since staging: recover the gen-qualified id retired at deindex
-					-- time so removals can still name it on the wire. viewers who imported a dead target drop the pair with
-					-- it (their bits clear against the unreplicate record below), but a name-mapped target is never deleted
-					-- client-side, so its viewers need the explicit removals.
-					target = retired
+		-- advances a cell's node by one run, starting from the root at 0
+		local function append_mask_run(node: VisibilityNode, run: number): MaskTrieNode
+			local parent: MaskTrieNode = if node == 0 then mask_trie else node :: MaskTrieNode
+			local child = parent[run]
+			if child == nil then
+				if trie_node_pool_count > 0 then
+					child = trie_node_pool[trie_node_pool_count]
+					trie_node_pool[trie_node_pool_count] = nil
+					trie_node_pool_count -= 1
 				else
-					if is_tag then
-						-- a tag relation's pairs follow their target's tag-ness, and the relation half is already known to be
-						-- a tag here, so only the target needs the check (jecs.is_tag on the packed pair id would re-resolve
-						-- and re-check both halves); gone targets never send, so the check is moot for them
-						is_tag = jecs.is_tag(world, target)
+					child = {}
+				end
+				parent[run] = child
+			end
+			return child
+		end
+
+		-- cross-shard packet groups, persistent across calls (see the PacketGroup type): every dirty cell lands in
+		-- its group once, its nodes accumulating per-shard runs as the shard loop advances. unpaired components
+		-- key groups by their id; pair cells share one group per relation, keyed by the relation's dense half (all a
+		-- packed pair id carries) in its own store -- a generation-0 component id can collide with a relation's
+		-- dense id, and the two must stay distinct groups. dirty_groups lists the groups touched this frame so the
+		-- bucket pass never walks the historical set; group_frame stamps first touches, and last_group_sweep
+		-- schedules the eviction sweep that keeps both stores bounded by the recently-live id set.
+		local groups = {} :: { [Id]: PacketGroup }
+		local pair_groups = {} :: { [number]: PacketGroup }
+		local dirty_groups = {} :: { PacketGroup }
+		local dirty_group_count = 0
+		local group_frame = 0
+		local last_group_sweep = 0
+
+		-- per-frame accumulators of the packet passes, grouped into one record shared by the pass functions below
+		-- as an upvalue rather than parameters: the nine accumulators cost one local between them (grouped back
+		-- when they counted against create_server's 200-local ceiling, before this scope split out), and each pass
+		-- aliases the fields it touches into locals at its head -- nested functions have their own 200-local
+		-- budget, and the aliases are the upvalue reads the passes already paid. the maps themselves persist:
+		-- release_frame_state hands their inner tables back to the scratch pool once the frame's packets are
+		-- assembled, and reset_frame_state clears whatever an errored frame stranded (the salvage guard contains
+		-- user encode throws, but an internal error can still unwind mid-frame) so every call still starts fresh.
+		-- both stay directly below the declaration so an accumulator can't be added without its reset and release
+		-- in view -- the record literal is the declaration list.
+		local frame_state = {
+			-- entity create/delete lists keyed by global client index
+			replicated_by = {} :: { [number]: { number } },
+			unreplicated_by = {} :: { [number]: { number } },
+
+			-- sections attach per accumulated-visibility node via node_section_drafts, keyed [node][group] -- the
+			-- group object itself, so an unpaired component and a relation can never collide however their ids
+			-- overlap; unpaired groups draft an unpaired section, pair groups a relation section whose per-target
+			-- runs the bucket pass fills. with a single occupied shard every cell has exactly one run, so the trie
+			-- is skipped entirely and the drafts key by the raw mask word instead. masks are intersected with each
+			-- shard's allocated word at resolve time so a departed client's stale bit lingering in last_visibilities
+			-- never creates or widens a section.
+			node_section_drafts = {} :: { [VisibilityNode]: { [PacketGroup]: SectionDraft } },
+
+			-- finalize_node_sections' outputs, per node: the node's sections encoded back-to-back into one shared
+			-- buffer, its byte size, and (only when the node has any) the hookless sections' value arrays in write
+			-- order -- one array per hookless section, so the outer length counts sections and never values.
+			node_buffers = {} :: { [VisibilityNode]: buffer },
+			node_sizes = {} :: { [VisibilityNode]: number },
+			node_section_values = {} :: { [VisibilityNode]: { { any } } },
+
+			-- per-client accumulators for the expansion pass: the section buffers to stamp, their running byte size,
+			-- and the hookless sections' value arrays in section order (the packet's side array, same
+			-- one-array-per-section shape as node_section_values), all keyed by global client index.
+			client_buffers = {} :: { [number]: { buffer } },
+			client_sizes = {} :: { [number]: number },
+			client_section_values = {} :: { [number]: { { any } } },
+		}
+
+		-- the frame's freshly-announced shared names (gen-qualified id -> name), drained from the shared-name store
+		-- and stamped into every allocated client's packet; nil on frames announcing nothing.
+		local frame_names: { [number]: string }? = nil
+
+		-- whether several shards are occupied this frame: with one occupied shard the trie is skipped and raw mask
+		-- words key node_section_drafts directly.
+		local multi_shard = false
+
+		local function reset_frame_state()
+			table.clear(frame_state.replicated_by)
+			table.clear(frame_state.unreplicated_by)
+			table.clear(frame_state.node_section_drafts)
+			table.clear(frame_state.node_buffers)
+			table.clear(frame_state.node_sizes)
+			table.clear(frame_state.node_section_values)
+			table.clear(frame_state.client_buffers)
+			table.clear(frame_state.client_sizes)
+			table.clear(frame_state.client_section_values)
+			-- an errored frame's stranded table is abandoned to the GC rather than pooled; release_frame_state is what
+			-- recycles it on clean frames
+			frame_names = nil
+			multi_shard = shard_count > 1
+		end
+
+		-- runs after assemble_client_packets: every section buffer has been stamped into the clients' flat packets
+		-- and the create/delete lists written inline, so only the hookless value arrays inside client_section_values
+		-- (escaped into the packets' side arrays) outlive the frame. releasing a map's values before clearing the
+		-- map is safe here -- nothing fetches until the maps are cleared -- and running before the joiner full
+		-- packets lets those draw on the freed tables. node_section_drafts is already empty: finalize_node_sections
+		-- consumed it.
+		local function release_frame_state()
+			-- node_buffers holds plain buffers whose bytes were already stamped into the clients' packets, so they just
+			-- drop to the GC
+			table.clear(frame_state.node_buffers)
+			table.clear(frame_state.node_sizes)
+			local node_section_values = frame_state.node_section_values
+			for _, section_values in node_section_values do
+				release_scratch(section_values)
+			end
+			table.clear(node_section_values)
+			local client_buffers = frame_state.client_buffers
+			for _, buffers in client_buffers do
+				release_scratch(buffers)
+			end
+			table.clear(client_buffers)
+			table.clear(frame_state.client_sizes)
+			table.clear(frame_state.client_section_values)
+			local replicated_by = frame_state.replicated_by
+			for _, list in replicated_by do
+				release_scratch(list)
+			end
+			table.clear(replicated_by)
+			local unreplicated_by = frame_state.unreplicated_by
+			for _, list in unreplicated_by do
+				release_scratch(list)
+			end
+			table.clear(unreplicated_by)
+			if frame_names ~= nil then
+				release_scratch(frame_names)
+				frame_names = nil
+			end
+		end
+
+		local function get_group(component: Id): PacketGroup
+			local group = groups[component]
+			if group == nil then
+				group = {
+					key = component :: any,
+					frame = group_frame,
+					count = 0,
+					entities = {},
+					values = {},
+					send_nodes = {},
+					removed_nodes = {},
+					row_of = if multi_shard then {} else nil,
+					is_tag = jecs.is_tag(world, component),
+				} :: PacketGroup
+				groups[component] = group
+				dirty_group_count += 1
+				dirty_groups[dirty_group_count] = group
+			elseif group.frame ~= group_frame then
+				group.frame = group_frame
+				dirty_group_count += 1
+				dirty_groups[dirty_group_count] = group
+				if multi_shard and group.row_of == nil then
+					group.row_of = {}
+				end
+			end
+			return group
+		end
+
+		-- the shared group of every pair cell using component's relation. packed pair ids reuse dense halves across
+		-- generations, so the gen-qualified relation (and the relation tag-ness gating the resolve passes' value
+		-- reads) re-resolves on the group's first touch each frame -- through the relation gen cache, with an
+		-- untracked relation (a stop_tracking_component or a relation death resolving its staged removals) recovered
+		-- from the retired store, and the live resolve as a last resort for cells no retirement covers; the targets
+		-- resolve per pair id in the resolve passes, since one group now spans every target of the relation.
+		local function get_pair_group(component: Id): PacketGroup
+			local relation_dense = ECS_PAIR_FIRST(component)
+			local group = pair_groups[relation_dense]
+			if group == nil then
+				local relation = (
+					tracked_relation_gens[relation_dense]
+					or retired_relation_gens[relation_dense]
+					or jecs.pair_first(world, component)
+				) :: any
+				local is_tag = tracked_relation_tags[relation_dense]
+				if is_tag == nil then
+					is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
+				end
+				group = {
+					key = relation_dense,
+					frame = group_frame,
+					count = 0,
+					entities = {},
+					values = {},
+					send_nodes = {},
+					removed_nodes = {},
+					is_tag = is_tag,
+					relation = relation,
+					targets = {},
+					pair_rows = if multi_shard then {} else nil,
+				} :: PacketGroup
+				pair_groups[relation_dense] = group
+				dirty_group_count += 1
+				dirty_groups[dirty_group_count] = group
+			elseif group.frame ~= group_frame then
+				group.frame = group_frame
+				dirty_group_count += 1
+				dirty_groups[dirty_group_count] = group
+				local relation = (
+					tracked_relation_gens[relation_dense]
+					or retired_relation_gens[relation_dense]
+					or jecs.pair_first(world, component)
+				) :: any
+				group.relation = relation
+				local is_tag = tracked_relation_tags[relation_dense]
+				if is_tag == nil then
+					is_tag = if relation == 0 then false else jecs.is_tag(world, relation)
+				end
+				group.is_tag = is_tag
+				if multi_shard and group.pair_rows == nil then
+					group.pair_rows = {}
+				end
+			end
+			return group
+		end
+
+		local function get_section(node: VisibilityNode, group: PacketGroup): SectionDraft
+			local node_section_drafts = frame_state.node_section_drafts
+			local section_drafts = node_section_drafts[node]
+			if section_drafts == nil then
+				section_drafts = fetch_scratch()
+				node_section_drafts[node] = section_drafts
+			end
+			local data = section_drafts[group]
+			if data == nil then
+				-- a pair group's key is its dense relation half, which must never reach a wire header; the draft names
+				-- only the relation
+				data = fetch_draft(if group.targets then nil else group.key, group.relation)
+				section_drafts[group] = data
+			end
+			return data
+		end
+
+		-- the one special-cased cell: the existence diff resolves into per-client replicated / unreplicated lists
+		-- rather than a component group (a bit gained is a create, a bit cleared a delete), and resolves *before*
+		-- the component cells because the returned record holds the bits deleted this frame so they can drop
+		-- per-component removals the client applies wholesale when deleting the entity (or pair target) locally.
+		-- masks are shard-relative, so the diff and the record are both per-shard.
+		local function resolve_existence_diff(
+			shard_next_visibilities: ShardVisibilities,
+			shard_last_visibilities: ShardVisibilities,
+			allocated: VisibilityMask,
+			base_index: number
+		): { [Entity]: VisibilityMask }
+			local replicated_by = frame_state.replicated_by
+			local unreplicated_by = frame_state.unreplicated_by
+
+			-- pooled; the caller releases it once the component cells resolve
+			local entity_unreplicate_masks: { [Entity]: VisibilityMask } = fetch_scratch()
+
+			local existence_visibility = shard_next_visibilities[Existence]
+			if existence_visibility then
+				shard_next_visibilities[Existence] = nil
+				local last_existence = shard_last_visibilities[Existence]
+
+				for entity, new in existence_visibility do
+					local old = if last_existence then last_existence[entity] or 0 else 0
+					local send = bit32.band(bit32.band(new, bit32.bnot(old)), allocated)
+					local removed = bit32.band(bit32.band(old, bit32.bnot(new)), allocated)
+
+					local m = send
+					while m ~= 0 do
+						local index = bit32.countrz(m)
+						m = bit32.band(m, m - 1)
+						local list = replicated_by[base_index + index]
+						if list == nil then
+							list = fetch_scratch()
+							replicated_by[base_index + index] = list
+						end
+						table.insert(list, entity :: any)
 					end
-					if retired ~= nil and retired ~= target then
-						-- the target-level recycle signature: the dense id retired one tenant and re-indexed as another since
-						-- the last call. the staged removals belong to the retired tenant, but pair-run targets are dense on
-						-- the wire and the recycle frame's announcement (or creation) rebinds the dense id before sections
-						-- apply, so a shipped removal would misresolve to the new tenant -- and in the same-subject case ride
-						-- the same run as the new tenant's send and remove the just-added pair. drop them, like the
-						-- relation-level signature above; the sweep owns the cleanup.
-						removed_allowed = 0
+
+					if removed ~= 0 then
+						entity_unreplicate_masks[entity] = removed
+						local r = removed
+						while r ~= 0 do
+							local index = bit32.countrz(r)
+							r = bit32.band(r, r - 1)
+							local list = unreplicated_by[base_index + index]
+							if list == nil then
+								list = fetch_scratch()
+								unreplicated_by[base_index + index] = list
+							end
+							table.insert(list, entity :: any)
+						end
+					end
+
+					-- merge existence next -> last in place, pruning hides
+					if new == 0 then
+						if last_existence then
+							last_existence[entity] = nil
+						end
+					else
+						if last_existence == nil then
+							last_existence = {}
+							shard_last_visibilities[Existence] = last_existence
+						end
+						last_existence[entity] = new
 					end
 				end
-				if target == nil then
-					-- gone entirely: every viewer imported the (now dead) target and drops the pair with it locally, so no
-					-- removal ships
-					removed_allowed = 0
-				elseif removed_allowed ~= 0 then
-					local target_unrep = entity_unreplicate_masks[target]
-					if target_unrep ~= nil then
-						removed_allowed = bit32.band(allocated, bit32.bnot(target_unrep))
-					end
-				end
-				-- rows correlate between shards per cell, and a pair group's rows span several pair ids, so its row maps
-				-- nest per pair id
-				local pair_rows = group.pair_rows
-				if pair_rows then
-					local pair_id_rows = pair_rows[component]
-					if pair_id_rows == nil then
-						pair_id_rows = fetch_scratch()
-						pair_rows[component] = pair_id_rows
-					end
-					rows = pair_id_rows
-				end
-			else
-				-- the unpaired-cell recycle signature: this component's tracking stopped (its gen sits retired under
-				-- its dense id) and a different definition re-tracked the same dense id since the last call. unpaired
-				-- store keys are gen-qualified full ids, so nothing aliases here -- but section component ids are dense
-				-- on the wire and the new definition's announcement rebinds the client's mapping before sections
-				-- apply, so the removals would misresolve to the new definition (and the two definitions' sections,
-				-- aliased on the wire, would race on shared subjects). drop them; the sweep owns the cleanup. a live
-				-- entry equal to the component is a same-frame re-track of the same definition, whose genuine removals
-				-- must ship.
-				local component_dense = dense(component)
-				if retired_relation_gens[component_dense] == component then
-					local live_relation = tracked_relation_gens[component_dense]
-					if live_relation ~= nil and live_relation ~= component then
-						removed_allowed = 0
-					end
+
+				if last_existence and next(last_existence) == nil then
+					shard_last_visibilities[Existence] = nil
 				end
 			end
 
-			for entity, new in new_visibility do
-				local old = if old_visibility then old_visibility[entity] or 0 else 0
-				local deferred = changed ~= nil and changed[entity] ~= nil
-				local send = if deferred then 0 else bit32.band(new, bit32.bnot(old), allocated)
-				local removed = bit32.band(old, bit32.bnot(new), removed_allowed)
+			return entity_unreplicate_masks
+		end
 
-				-- drop removals the client applies wholesale this frame: the subject's own unreplication here (the
-				-- target's, being loop-invariant, already narrowed removed_allowed above). per-client, so only the
-				-- coinciding bits clear; send is already 0 for those slots.
-				if removed ~= 0 then
-					local subj_unrep = entity_unreplicate_masks[entity]
-					if subj_unrep then
-						removed = bit32.band(removed, bit32.bnot(subj_unrep))
+		-- visibility cells of one shard: fold every dirty cell into its component's cross-shard group, its send /
+		-- removed words accumulated into section keys. send and removed are disjoint, so a client falls into at most
+		-- one of them per cell. a cell whose value also changed emits only its removals here; its sends defer to
+		-- resolve_value_cells, run against the post-merge mask so every viewer gets the new value exactly once.
+		local function resolve_visibility_cells(
+			shard_next_visibilities: ShardVisibilities,
+			shard_last_visibilities: ShardVisibilities,
+			allocated: VisibilityMask,
+			shard_key_base: number,
+			entity_unreplicate_masks: { [Entity]: VisibilityMask }
+		)
+			for component, new_visibility in shard_next_visibilities do
+				local changed = changed_values[component]
+				local old_visibility = shard_last_visibilities[component]
+
+				local is_pair = IS_PAIR(component)
+				local group = if is_pair then get_pair_group(component) else get_group(component)
+				local is_tag = group.is_tag
+				local count = group.count
+				local entities = group.entities
+				local values = group.values
+				local send_nodes = group.send_nodes
+				local removed_nodes = group.removed_nodes
+				local targets = group.targets
+				local rows = group.row_of
+
+				-- a pair whose target the client drops this frame needs no explicit removals: dropping the target locally
+				-- auto-removes the pair. a live cache entry is the dense id's current tenant (== the target the client
+				-- resolves with), so the sends of a dense id recycled within the frame are never taken for the old tenant;
+				-- a miss means the pair id carries only removals, which belong to the retired tenant -- naming that gen
+				-- keeps the skip generation-precise across a same-frame recycle. the target-side drops are loop-invariant,
+				-- so they narrow removed_allowed -- the word removals compute against in place of the raw allocated word --
+				-- once, outside the entity loop; the subject's own drop stays per entity.
+				local target: Entity? = nil
+				local removed_allowed = allocated
+				if is_pair then
+					-- the relation-level recycle signature: the relation's dense id retired one definition and re-tracked
+					-- another since the last call, so the staged removals belong to the retired definition -- section
+					-- relation ids are dense on the wire and the new definition's announcement rebinds the client's mapping
+					-- before sections apply, so a shipped removal would misresolve to the new definition. drop them; the
+					-- client's mapping-teardown sweep owns the cleanup (see sweep_imported_cells in client.luau). the
+					-- target-level signature below is the same check one level down.
+					local relation_dense = ECS_PAIR_FIRST(component)
+					local retired_relation = retired_relation_gens[relation_dense]
+					if retired_relation ~= nil then
+						local live_relation = tracked_relation_gens[relation_dense]
+						if live_relation ~= nil and live_relation ~= retired_relation then
+							removed_allowed = 0
+						end
+					end
+
+					local dense_target = ECS_PAIR_SECOND(component)
+					local retired = retired_target_gens[dense_target]
+					target = tracked_target_gens[dense_target]
+					if target == nil then
+						-- the target died (or shed its last pair) since staging: recover the gen-qualified id retired at deindex
+						-- time so removals can still name it on the wire. viewers who imported a dead target drop the pair with
+						-- it (their bits clear against the unreplicate record below), but a name-mapped target is never deleted
+						-- client-side, so its viewers need the explicit removals.
+						target = retired
+					else
+						if is_tag then
+							-- a tag relation's pairs follow their target's tag-ness, and the relation half is already known to be
+							-- a tag here, so only the target needs the check (jecs.is_tag on the packed pair id would re-resolve
+							-- and re-check both halves); gone targets never send, so the check is moot for them
+							is_tag = jecs.is_tag(world, target)
+						end
+						if retired ~= nil and retired ~= target then
+							-- the target-level recycle signature: the dense id retired one tenant and re-indexed as another since
+							-- the last call. the staged removals belong to the retired tenant, but pair-run targets are dense on
+							-- the wire and the recycle frame's announcement (or creation) rebinds the dense id before sections
+							-- apply, so a shipped removal would misresolve to the new tenant -- and in the same-subject case ride
+							-- the same run as the new tenant's send and remove the just-added pair. drop them, like the
+							-- relation-level signature above; the sweep owns the cleanup.
+							removed_allowed = 0
+						end
+					end
+					if target == nil then
+						-- gone entirely: every viewer imported the (now dead) target and drops the pair with it locally, so no
+						-- removal ships
+						removed_allowed = 0
+					elseif removed_allowed ~= 0 then
+						local target_unrep = entity_unreplicate_masks[target]
+						if target_unrep ~= nil then
+							removed_allowed = bit32.band(allocated, bit32.bnot(target_unrep))
+						end
+					end
+					-- rows correlate between shards per cell, and a pair group's rows span several pair ids, so its row maps
+					-- nest per pair id
+					local pair_rows = group.pair_rows
+					if pair_rows then
+						local pair_id_rows = pair_rows[component]
+						if pair_id_rows == nil then
+							pair_id_rows = fetch_scratch()
+							pair_rows[component] = pair_id_rows
+						end
+						rows = pair_id_rows
+					end
+				else
+					-- the unpaired-cell recycle signature: this component's tracking stopped (its gen sits retired under
+					-- its dense id) and a different definition re-tracked the same dense id since the last call. unpaired
+					-- store keys are gen-qualified full ids, so nothing aliases here -- but section component ids are dense
+					-- on the wire and the new definition's announcement rebinds the client's mapping before sections
+					-- apply, so the removals would misresolve to the new definition (and the two definitions' sections,
+					-- aliased on the wire, would race on shared subjects). drop them; the sweep owns the cleanup. a live
+					-- entry equal to the component is a same-frame re-track of the same definition, whose genuine removals
+					-- must ship.
+					local component_dense = dense(component)
+					if retired_relation_gens[component_dense] == component then
+						local live_relation = tracked_relation_gens[component_dense]
+						if live_relation ~= nil and live_relation ~= component then
+							removed_allowed = 0
+						end
 					end
 				end
 
-				if send ~= 0 or removed ~= 0 then
+				for entity, new in new_visibility do
+					local old = if old_visibility then old_visibility[entity] or 0 else 0
+					local deferred = changed ~= nil and changed[entity] ~= nil
+					local send = if deferred then 0 else bit32.band(new, bit32.bnot(old), allocated)
+					local removed = bit32.band(old, bit32.bnot(new), removed_allowed)
+
+					-- drop removals the client applies wholesale this frame: the subject's own unreplication here (the
+					-- target's, being loop-invariant, already narrowed removed_allowed above). per-client, so only the
+					-- coinciding bits clear; send is already 0 for those slots.
+					if removed ~= 0 then
+						local subj_unrep = entity_unreplicate_masks[entity]
+						if subj_unrep then
+							removed = bit32.band(removed, bit32.bnot(subj_unrep))
+						end
+					end
+
+					if send ~= 0 or removed ~= 0 then
+						local row = (if rows then rows[entity] else nil) or 0
+						if row == 0 then
+							count += 1
+							row = count
+							entities[row] = entity :: any
+							send_nodes[row] = 0
+							removed_nodes[row] = 0
+							if targets then
+								targets[row] = target :: any
+							end
+							if rows then
+								rows[entity] = row
+							end
+						end
+						if send ~= 0 then
+							-- only the first shard to send resolves the value, so the live read runs once per cell
+							if send_nodes[row] == 0 then
+								local value: any = _nulled
+								if not is_tag then
+									local live = world:get(entity, component)
+									if live ~= nil then
+										value = live
+									end
+								end
+								values[row] = value
+							end
+							if multi_shard then
+								send_nodes[row] = append_mask_run(send_nodes[row], send + shard_key_base)
+							else
+								send_nodes[row] = send
+							end
+						end
+						if removed ~= 0 then
+							if multi_shard then
+								removed_nodes[row] = append_mask_run(removed_nodes[row], removed + shard_key_base)
+							else
+								removed_nodes[row] = removed
+							end
+						end
+					end
+
+					-- merge next -> last in place (the value resolve below reads the post-merge mask), pruning hides. safe
+					-- here because old was read above and cells are independent.
+					if new == 0 then
+						if old_visibility then
+							old_visibility[entity] = nil
+						end
+					else
+						if old_visibility == nil then
+							old_visibility = {}
+							shard_last_visibilities[component] = old_visibility
+						end
+						old_visibility[entity] = new
+					end
+				end
+
+				group.count = count
+
+				if old_visibility and next(old_visibility) == nil then
+					shard_last_visibilities[component] = nil
+				end
+			end
+		end
+
+		-- value cells of one shard: every slot that currently sees the cell (post-merge mask) receives the new
+		-- value. pure removals never reach here. values stay staged for the remaining shards; generate_packets
+		-- clears the shared store after the shard loop.
+		local function resolve_value_cells(
+			shard_last_visibilities: ShardVisibilities,
+			allocated: VisibilityMask,
+			shard_key_base: number
+		)
+			for component, changed in changed_values do
+				local visibility = shard_last_visibilities[component]
+				if visibility == nil then
+					continue
+				end
+
+				local is_pair = IS_PAIR(component)
+				local group = if is_pair then get_pair_group(component) else get_group(component)
+				local count = group.count
+				local entities = group.entities
+				local values = group.values
+				local send_nodes = group.send_nodes
+				local removed_nodes = group.removed_nodes
+				local targets = group.targets
+				local rows = group.row_of
+
+				-- the gen-qualified target this pair id's rows carry, read from the live-target gen cache (staged values
+				-- never outlive their target: its death stages removals that drop them, so a live entry always exists),
+				-- plus the per-pair-id row map (see resolve_visibility_cells)
+				local target: Entity? = nil
+				if is_pair then
+					target = tracked_target_gens[ECS_PAIR_SECOND(component)]
+					local pair_rows = group.pair_rows
+					if pair_rows then
+						local pair_id_rows = pair_rows[component]
+						if pair_id_rows == nil then
+							pair_id_rows = fetch_scratch()
+							pair_rows[component] = pair_id_rows
+						end
+						rows = pair_id_rows
+					end
+				end
+
+				for entity, value in changed do
+					local mask = visibility[entity]
+					if mask == nil then
+						continue
+					end
+					local send = bit32.band(mask, allocated)
+					if send == 0 then
+						continue
+					end
 					local row = (if rows then rows[entity] else nil) or 0
 					if row == 0 then
 						count += 1
@@ -3305,945 +3430,846 @@ local function create_server(world: World, shared_record: get_shared.Record)
 							rows[entity] = row
 						end
 					end
-					if send ~= 0 then
-						-- only the first shard to send resolves the value, so the live read runs once per cell
-						if send_nodes[row] == 0 then
-							local value: any = _nulled
-							if not is_tag then
-								local live = world:get(entity, component)
-								if live ~= nil then
-									value = live
-								end
-							end
-							values[row] = value
-						end
-						if multi_shard then
-							send_nodes[row] = append_mask_run(send_nodes[row], send + shard_key_base)
-						else
-							send_nodes[row] = send
-						end
+					if send_nodes[row] == 0 then
+						values[row] = value
 					end
-					if removed ~= 0 then
-						if multi_shard then
-							removed_nodes[row] = append_mask_run(removed_nodes[row], removed + shard_key_base)
-						else
-							removed_nodes[row] = removed
-						end
+					if multi_shard then
+						send_nodes[row] = append_mask_run(send_nodes[row], send + shard_key_base)
+					else
+						send_nodes[row] = send
 					end
 				end
 
-				-- merge next -> last in place (the value resolve below reads the post-merge mask), pruning hides. safe
-				-- here because old was read above and cells are independent.
-				if new == 0 then
-					if old_visibility then
-						old_visibility[entity] = nil
-					end
-				else
-					if old_visibility == nil then
-						old_visibility = {}
-						shard_last_visibilities[component] = old_visibility
-					end
-					old_visibility[entity] = new
-				end
-			end
-
-			group.count = count
-
-			if old_visibility and next(old_visibility) == nil then
-				shard_last_visibilities[component] = nil
+				group.count = count
 			end
 		end
-	end
 
-	-- value cells of one shard: every slot that currently sees the cell (post-merge mask) receives the new
-	-- value. pure removals never reach here. values stay staged for the remaining shards; generate_packets
-	-- clears the shared store after the shard loop.
-	local function resolve_value_cells(
-		shard_last_visibilities: ShardVisibilities,
-		allocated: VisibilityMask,
-		shard_key_base: number
-	)
-		for component, changed in changed_values do
-			local visibility = shard_last_visibilities[component]
-			if visibility == nil then
-				continue
-			end
+		-- bucket pass: each cell lands in the section keyed by its accumulated mask node, one insert per cell no
+		-- matter how many clients -- or shards -- see it; a pair group's cells land one level deeper, in their
+		-- target's run within the section. a cell's send and removed masks are disjoint, so no client ever receives
+		-- both for one cell. consuming a group also resets it for the next frame (see the PacketGroup type).
+		local function bucket_dirty_groups()
+			for n = 1, dirty_group_count do
+				local group = dirty_groups[n]
+				local g_count = group.count
+				if g_count == 0 then
+					continue
+				end
+				local g_entities = group.entities
+				local g_values = group.values
+				local g_send_nodes = group.send_nodes
+				local g_removed_nodes = group.removed_nodes
+				local g_targets = group.targets
 
-			local is_pair = IS_PAIR(component)
-			local group = if is_pair then get_pair_group(component) else get_group(component)
-			local count = group.count
-			local entities = group.entities
-			local values = group.values
-			local send_nodes = group.send_nodes
-			local removed_nodes = group.removed_nodes
-			local targets = group.targets
-			local rows = group.row_of
+				-- one-entry caches over the row loop, mirroring the unreliable pass's cached draft (see
+				-- accumulate_unreliable_archetype): consecutive rows usually share their visibility node -- and pair
+				-- rows their target, since one pair id's cells resolve consecutively -- so a matching row reuses the
+				-- previous row's lists instead of re-walking node_section_drafts (and, for pair groups, the run map).
+				-- a real node is never 0, so the 0 sentinel can't false-hit; declared per group because the lists
+				-- belong to the group's own drafts.
+				local cached_send_node: VisibilityNode = 0
+				local cached_send_target: number? = nil
+				local cached_send_lists: any = nil
+				local cached_removed_node: VisibilityNode = 0
+				local cached_removed_target: number? = nil
+				local cached_removed_lists: any = nil
 
-			-- the gen-qualified target this pair id's rows carry, read from the live-target gen cache (staged values
-			-- never outlive their target: its death stages removals that drop them, so a live entry always exists),
-			-- plus the per-pair-id row map (see resolve_visibility_cells)
-			local target: Entity? = nil
-			if is_pair then
-				target = tracked_target_gens[ECS_PAIR_SECOND(component)]
+				for i = 1, g_count do
+					local entity = g_entities[i]
+					local target = if g_targets then g_targets[i] else nil
+
+					local send_node = g_send_nodes[i]
+					if send_node ~= 0 then
+						local value = g_values[i]
+						local lists: any
+						if send_node == cached_send_node and target == cached_send_target then
+							lists = cached_send_lists
+						else
+							local data = get_section(send_node, group)
+							lists = if g_targets then get_run(data, target :: number) else data
+							cached_send_node = send_node
+							cached_send_target = target
+							cached_send_lists = lists
+						end
+						if value == _nulled then
+							local nulled = lists.nulled
+							if nulled == nil then
+								nulled = fetch_scratch()
+								lists.nulled = nulled
+							end
+							table.insert(nulled, entity)
+						else
+							local ids = lists.ids
+							local values
+							if ids == nil then
+								ids = fetch_scratch()
+								values = fetch_scratch()
+								lists.ids = ids
+								lists.values = values
+							else
+								values = lists.values :: { any }
+							end
+							table.insert(ids, entity)
+							table.insert(values, value)
+						end
+					end
+
+					local removed_node = g_removed_nodes[i]
+					if removed_node ~= 0 then
+						local lists: any
+						if removed_node == cached_removed_node and target == cached_removed_target then
+							lists = cached_removed_lists
+						else
+							local data = get_section(removed_node, group)
+							lists = if g_targets then get_run(data, target :: number) else data
+							cached_removed_node = removed_node
+							cached_removed_target = target
+							cached_removed_lists = lists
+						end
+						local removed_entities = lists.removed
+						if removed_entities == nil then
+							removed_entities = fetch_scratch()
+							lists.removed = removed_entities
+						end
+						table.insert(removed_entities, entity)
+					end
+				end
+
+				group.count = 0
+				table.clear(g_values)
+				local row_of = group.row_of
+				if row_of then
+					table.clear(row_of)
+				end
 				local pair_rows = group.pair_rows
 				if pair_rows then
-					local pair_id_rows = pair_rows[component]
-					if pair_id_rows == nil then
-						pair_id_rows = fetch_scratch()
-						pair_rows[component] = pair_id_rows
+					for _, pair_id_rows in pair_rows do
+						release_scratch(pair_id_rows)
 					end
-					rows = pair_id_rows
+					table.clear(pair_rows)
 				end
 			end
-
-			for entity, value in changed do
-				local mask = visibility[entity]
-				if mask == nil then
-					continue
-				end
-				local send = bit32.band(mask, allocated)
-				if send == 0 then
-					continue
-				end
-				local row = (if rows then rows[entity] else nil) or 0
-				if row == 0 then
-					count += 1
-					row = count
-					entities[row] = entity :: any
-					send_nodes[row] = 0
-					removed_nodes[row] = 0
-					if targets then
-						targets[row] = target :: any
-					end
-					if rows then
-						rows[entity] = row
-					end
-				end
-				if send_nodes[row] == 0 then
-					values[row] = value
-				end
-				if multi_shard then
-					send_nodes[row] = append_mask_run(send_nodes[row], send + shard_key_base)
-				else
-					send_nodes[row] = send
-				end
-			end
-
-			group.count = count
+			dirty_group_count = 0
 		end
-	end
 
-	-- bucket pass: each cell lands in the section keyed by its accumulated mask node, one insert per cell no
-	-- matter how many clients -- or shards -- see it; a pair group's cells land one level deeper, in their
-	-- target's run within the section. a cell's send and removed masks are disjoint, so no client ever receives
-	-- both for one cell. consuming a group also resets it for the next frame (see the PacketGroup type).
-	local function bucket_dirty_groups()
-		for n = 1, dirty_group_count do
-			local group = dirty_groups[n]
-			local g_count = group.count
-			if g_count == 0 then
-				continue
-			end
-			local g_entities = group.entities
-			local g_values = group.values
-			local g_send_nodes = group.send_nodes
-			local g_removed_nodes = group.removed_nodes
-			local g_targets = group.targets
-
-			-- one-entry caches over the row loop, mirroring the unreliable pass's cached draft (see
-			-- accumulate_unreliable_archetype): consecutive rows usually share their visibility node -- and pair
-			-- rows their target, since one pair id's cells resolve consecutively -- so a matching row reuses the
-			-- previous row's lists instead of re-walking node_section_drafts (and, for pair groups, the run map).
-			-- a real node is never 0, so the 0 sentinel can't false-hit; declared per group because the lists
-			-- belong to the group's own drafts.
-			local cached_send_node: VisibilityNode = 0
-			local cached_send_target: number? = nil
-			local cached_send_lists: any = nil
-			local cached_removed_node: VisibilityNode = 0
-			local cached_removed_target: number? = nil
-			local cached_removed_lists: any = nil
-
-			for i = 1, g_count do
-				local entity = g_entities[i]
-				local target = if g_targets then g_targets[i] else nil
-
-				local send_node = g_send_nodes[i]
-				if send_node ~= 0 then
-					local value = g_values[i]
-					local lists: any
-					if send_node == cached_send_node and target == cached_send_target then
-						lists = cached_send_lists
-					else
-						local data = get_section(send_node, group)
-						lists = if g_targets then get_run(data, target :: number) else data
-						cached_send_node = send_node
-						cached_send_target = target
-						cached_send_lists = lists
-					end
-					if value == _nulled then
-						local nulled = lists.nulled
-						if nulled == nil then
-							nulled = fetch_scratch()
-							lists.nulled = nulled
-						end
-						table.insert(nulled, entity)
-					else
-						local ids = lists.ids
-						local values
-						if ids == nil then
-							ids = fetch_scratch()
-							values = fetch_scratch()
-							lists.ids = ids
-							lists.values = values
-						else
-							values = lists.values :: { any }
-						end
-						table.insert(ids, entity)
-						table.insert(values, value)
-					end
-				end
-
-				local removed_node = g_removed_nodes[i]
-				if removed_node ~= 0 then
-					local lists: any
-					if removed_node == cached_removed_node and target == cached_removed_target then
-						lists = cached_removed_lists
-					else
-						local data = get_section(removed_node, group)
-						lists = if g_targets then get_run(data, target :: number) else data
-						cached_removed_node = removed_node
-						cached_removed_target = target
-						cached_removed_lists = lists
-					end
-					local removed_entities = lists.removed
-					if removed_entities == nil then
-						removed_entities = fetch_scratch()
-						lists.removed = removed_entities
-					end
-					table.insert(removed_entities, entity)
-				end
-			end
-
-			group.count = 0
-			table.clear(g_values)
-			local row_of = group.row_of
-			if row_of then
-				table.clear(row_of)
-			end
-			local pair_rows = group.pair_rows
-			if pair_rows then
-				for _, pair_id_rows in pair_rows do
-					release_scratch(pair_id_rows)
-				end
-				table.clear(pair_rows)
-			end
-		end
-		dirty_group_count = 0
-	end
-
-	-- finalize pass: measure every draft of a node, then encode them back-to-back into one exactly-sized buffer
-	-- the whole node shares -- the expansion pass appends one buffer reference per node to each sharing client,
-	-- and assembly stamps it with one copy, no matter how many sections the node carries -- filling the per-node
-	-- outputs declared above.
-	local function finalize_node_sections()
-		local node_section_drafts = frame_state.node_section_drafts
-		local node_section_values = frame_state.node_section_values
-		local node_buffers = frame_state.node_buffers
-		local node_sizes = frame_state.node_sizes
-		for node, section_drafts in node_section_drafts do
-			-- drop the entry before releasing anything: the fetches below may hand a released table right back, and a
-			-- lingering node_section_drafts reference to it would alias
-			node_section_drafts[node] = nil
-			-- the drafts are collected during the measure loop so the write loop lays them out in the exact order they
-			-- were measured
-			local drafts: { SectionDraft } = fetch_scratch()
-			local count = 0
-			local size = 0
-			for _, draft in section_drafts do
-				count += 1
-				drafts[count] = draft
-				size += measure_section_guarded(draft)
-			end
-			local data = buffer.create(size)
-			local offset = 0
-			for i = 1, count do
-				local draft = drafts[i]
-				local hookless
-				offset, hookless = write_section(data, offset, draft)
-				if hookless then
-					local section_values = node_section_values[node]
-					if section_values == nil then
-						section_values = fetch_scratch()
-						node_section_values[node] = section_values
-					end
-					table.insert(section_values, hookless)
-				end
-				release_draft(draft, hookless)
-			end
-			release_scratch(drafts)
-			release_scratch(section_drafts)
-			node_buffers[node] = data
-			node_sizes[node] = size
-		end
-	end
-
-	-- appends one node's shared buffer to one client's accumulators. the node's buffer, size, and value arrays
-	-- ride in as arguments: they are invariant across the node's clients, so the callers resolve them once per
-	-- node rather than paying the node-keyed lookups here, once per client. the value arrays append in the
-	-- order their sections were written into the buffer, keeping the packet's side array aligned with it. the
-	-- element-wise append below is deliberate: table.move reads as the idiom for concatenating two lists
-	-- (wire.luau uses it for exactly that), but which one wins here depends on the shape, and the shape is easy
-	-- to misread -- section_values holds one array per *hookless section*, so its length is the node's hookless
-	-- section count (rarely more than a handful), while the call itself is paid once per node the client sees.
-	-- that makes this many-appends-of-a-short-list, which table.insert wins; table.move only wins the
-	-- one-append-of-a-long-list case. benchmarked both ways (2026-08-06): a micro-benchmark puts the crossover
-	-- near eight appends of a 4-element source (table.move ~50% faster at one append, ~36% slower at sixteen),
-	-- and the swap measured 9.5% slower at high fan-out against 14-20% faster on the broadcast one-node shape,
-	-- with the realistic mixed benches at parity either way.
-	local function scatter(client_index: number, node_buffer: buffer, node_size: number, section_values: { { any } }?)
-		local client_buffers = frame_state.client_buffers
-		local client_sizes = frame_state.client_sizes
-		local target_buffers = client_buffers[client_index]
-		if target_buffers == nil then
-			target_buffers = fetch_scratch()
-			client_buffers[client_index] = target_buffers
-			client_sizes[client_index] = 0
-		end
-		client_sizes[client_index] += node_size
-		table.insert(target_buffers, node_buffer)
-		if section_values then
-			local client_section_values = frame_state.client_section_values
-			local target_section_values = client_section_values[client_index]
-			if target_section_values == nil then
-				-- escapes as the packet's side array, so never pooled
-				target_section_values = {}
-				client_section_values[client_index] = target_section_values
-			end
-			for i = 1, #section_values do
-				table.insert(target_section_values, section_values[i])
-			end
-		end
-	end
-
-	-- the current trie path's decoded runs, persistent scratch for expand_node: every read at depth i follows a
-	-- write at the same depth on the way down, so entries past the current path are never read.
-	local path_bases = {} :: { number }
-	local path_words = {} :: { number }
-
-	local function expand_node(node: MaskTrieNode, depth: number)
-		local node_buffer = frame_state.node_buffers[node]
-		if node_buffer then
-			local node_size = frame_state.node_sizes[node]
-			local section_values = frame_state.node_section_values[node]
-			for i = 1, depth do
-				local base_index = path_bases[i]
-				local m = path_words[i]
-				while m ~= 0 do
-					local index = bit32.countrz(m)
-					m = bit32.band(m, m - 1)
-					scatter(base_index + index, node_buffer, node_size, section_values)
-				end
-			end
-		end
-		for run, child in node do
-			local child_depth = depth + 1
-			path_bases[child_depth] = (run // shard_key_span - 1) * 32
-			path_words[child_depth] = run % shard_key_span
-			expand_node(child, child_depth)
-			table.clear(child)
-			trie_node_pool_count += 1
-			trie_node_pool[trie_node_pool_count] = child
-		end
-	end
-
-	-- expansion pass: walk the trie depth-first, decoding each run once no matter how many nodes descend from
-	-- it; a node's sections scatter to every client of every run on its path (countrz -> clients_by_index). each
-	-- node the walk leaves is cleared into the free list for the next frame's append_mask_run, leaving the
-	-- persistent root empty behind it. single-shard keys are the shard's raw mask words, expanded flat.
-	local function expand_to_clients()
-		if multi_shard then
-			expand_node(mask_trie, 0)
-			table.clear(mask_trie)
-		else
-			local node_sizes = frame_state.node_sizes
+		-- finalize pass: measure every draft of a node, then encode them back-to-back into one exactly-sized buffer
+		-- the whole node shares -- the expansion pass appends one buffer reference per node to each sharing client,
+		-- and assembly stamps it with one copy, no matter how many sections the node carries -- filling the per-node
+		-- outputs declared above.
+		local function finalize_node_sections()
+			local node_section_drafts = frame_state.node_section_drafts
 			local node_section_values = frame_state.node_section_values
-			for mask, node_buffer in frame_state.node_buffers do
-				local m = mask :: number
-				local node_size = node_sizes[mask]
-				local section_values = node_section_values[mask]
-				while m ~= 0 do
-					local index = bit32.countrz(m)
-					m = bit32.band(m, m - 1)
-					scatter(index, node_buffer, node_size, section_values)
+			local node_buffers = frame_state.node_buffers
+			local node_sizes = frame_state.node_sizes
+			for node, section_drafts in node_section_drafts do
+				-- drop the entry before releasing anything: the fetches below may hand a released table right back, and a
+				-- lingering node_section_drafts reference to it would alias
+				node_section_drafts[node] = nil
+				-- the drafts are collected during the measure loop so the write loop lays them out in the exact order they
+				-- were measured
+				local drafts: { SectionDraft } = fetch_scratch()
+				local count = 0
+				local size = 0
+				for _, draft in section_drafts do
+					count += 1
+					drafts[count] = draft
+					size += measure_section_guarded(draft)
+				end
+				local data = buffer.create(size)
+				local offset = 0
+				for i = 1, count do
+					local draft = drafts[i]
+					local hookless
+					offset, hookless = write_section(data, offset, draft)
+					if hookless then
+						local section_values = node_section_values[node]
+						if section_values == nil then
+							section_values = fetch_scratch()
+							node_section_values[node] = section_values
+						end
+						table.insert(section_values, hookless)
+					end
+					release_draft(draft, hookless)
+				end
+				release_scratch(drafts)
+				release_scratch(section_drafts)
+				node_buffers[node] = data
+				node_sizes[node] = size
+			end
+		end
+
+		-- appends one node's shared buffer to one client's accumulators. the node's buffer, size, and value arrays
+		-- ride in as arguments: they are invariant across the node's clients, so the callers resolve them once per
+		-- node rather than paying the node-keyed lookups here, once per client. the value arrays append in the
+		-- order their sections were written into the buffer, keeping the packet's side array aligned with it. the
+		-- element-wise append below is deliberate: table.move reads as the idiom for concatenating two lists
+		-- (wire.luau uses it for exactly that), but which one wins here depends on the shape, and the shape is easy
+		-- to misread -- section_values holds one array per *hookless section*, so its length is the node's hookless
+		-- section count (rarely more than a handful), while the call itself is paid once per node the client sees.
+		-- that makes this many-appends-of-a-short-list, which table.insert wins; table.move only wins the
+		-- one-append-of-a-long-list case. benchmarked both ways (2026-08-06): a micro-benchmark puts the crossover
+		-- near eight appends of a 4-element source (table.move ~50% faster at one append, ~36% slower at sixteen),
+		-- and the swap measured 9.5% slower at high fan-out against 14-20% faster on the broadcast one-node shape,
+		-- with the realistic mixed benches at parity either way.
+		local function scatter(
+			client_index: number,
+			node_buffer: buffer,
+			node_size: number,
+			section_values: { { any } }?
+		)
+			local client_buffers = frame_state.client_buffers
+			local client_sizes = frame_state.client_sizes
+			local target_buffers = client_buffers[client_index]
+			if target_buffers == nil then
+				target_buffers = fetch_scratch()
+				client_buffers[client_index] = target_buffers
+				client_sizes[client_index] = 0
+			end
+			client_sizes[client_index] += node_size
+			table.insert(target_buffers, node_buffer)
+			if section_values then
+				local client_section_values = frame_state.client_section_values
+				local target_section_values = client_section_values[client_index]
+				if target_section_values == nil then
+					-- escapes as the packet's side array, so never pooled
+					target_section_values = {}
+					client_section_values[client_index] = target_section_values
+				end
+				for i = 1, #section_values do
+					table.insert(target_section_values, section_values[i])
 				end
 			end
 		end
-	end
 
-	-- assembly pass: stamp each client's accumulated sections into their flat packet buffer, together with their
-	-- entity create/delete lists. clients with entity create/delete but no component changes still need a
-	-- packet; indices came from allocated bits, so clients_by_index resolves them.
-	local function assemble_for(packets: { [Client]: Packet }, this_packet_frame: number, index: number)
-		local client = clients_by_index[index]
-		if packets[client] == nil then
-			packets[client] = assemble_packet(
-				this_packet_frame,
-				frame_state.unreplicated_by[index],
-				frame_state.replicated_by[index],
-				frame_names,
-				frame_state.client_buffers[index],
-				frame_state.client_sizes[index] or 0,
-				frame_state.client_section_values[index]
-			)
-		end
-	end
+		-- the current trie path's decoded runs, persistent scratch for expand_node: every read at depth i follows a
+		-- write at the same depth on the way down, so entries past the current path are never read.
+		local path_bases = {} :: { number }
+		local path_words = {} :: { number }
 
-	local function assemble_client_packets(packets: { [Client]: Packet }, this_packet_frame: number)
-		for index in frame_state.client_buffers do
-			assemble_for(packets, this_packet_frame, index)
+		local function expand_node(node: MaskTrieNode, depth: number)
+			local node_buffer = frame_state.node_buffers[node]
+			if node_buffer then
+				local node_size = frame_state.node_sizes[node]
+				local section_values = frame_state.node_section_values[node]
+				for i = 1, depth do
+					local base_index = path_bases[i]
+					local m = path_words[i]
+					while m ~= 0 do
+						local index = bit32.countrz(m)
+						m = bit32.band(m, m - 1)
+						scatter(base_index + index, node_buffer, node_size, section_values)
+					end
+				end
+			end
+			for run, child in node do
+				local child_depth = depth + 1
+				path_bases[child_depth] = (run // shard_key_span - 1) * 32
+				path_words[child_depth] = run % shard_key_span
+				expand_node(child, child_depth)
+				table.clear(child)
+				trie_node_pool_count += 1
+				trie_node_pool[trie_node_pool_count] = child
+			end
 		end
-		for index in frame_state.replicated_by do
-			assemble_for(packets, this_packet_frame, index)
+
+		-- expansion pass: walk the trie depth-first, decoding each run once no matter how many nodes descend from
+		-- it; a node's sections scatter to every client of every run on its path (countrz -> clients_by_index). each
+		-- node the walk leaves is cleared into the free list for the next frame's append_mask_run, leaving the
+		-- persistent root empty behind it. single-shard keys are the shard's raw mask words, expanded flat.
+		local function expand_to_clients()
+			if multi_shard then
+				expand_node(mask_trie, 0)
+				table.clear(mask_trie)
+			else
+				local node_sizes = frame_state.node_sizes
+				local node_section_values = frame_state.node_section_values
+				for mask, node_buffer in frame_state.node_buffers do
+					local m = mask :: number
+					local node_size = node_sizes[mask]
+					local section_values = node_section_values[mask]
+					while m ~= 0 do
+						local index = bit32.countrz(m)
+						m = bit32.band(m, m - 1)
+						scatter(index, node_buffer, node_size, section_values)
+					end
+				end
+			end
 		end
-		for index in frame_state.unreplicated_by do
-			assemble_for(packets, this_packet_frame, index)
+
+		-- assembly pass: stamp each client's accumulated sections into their flat packet buffer, together with their
+		-- entity create/delete lists. clients with entity create/delete but no component changes still need a
+		-- packet; indices came from allocated bits, so clients_by_index resolves them.
+		local function assemble_for(packets: { [Client]: Packet }, this_packet_frame: number, index: number)
+			local client = clients_by_index[index]
+			if packets[client] == nil then
+				packets[client] = assemble_packet(
+					this_packet_frame,
+					frame_state.unreplicated_by[index],
+					frame_state.replicated_by[index],
+					frame_names,
+					frame_state.client_buffers[index],
+					frame_state.client_sizes[index] or 0,
+					frame_state.client_section_values[index]
+				)
+			end
 		end
-		-- shared names go to every allocated client, otherwise-empty packets included (pending joiners get them
-		-- through their full packet instead)
-		if frame_names ~= nil then
-			for index in clients_by_index do
+
+		local function assemble_client_packets(packets: { [Client]: Packet }, this_packet_frame: number)
+			for index in frame_state.client_buffers do
 				assemble_for(packets, this_packet_frame, index)
 			end
-		end
-	end
-
-	-- builds a packet for every client in a single pass: a delta for each allocated client and a full packet for
-	-- each pending (newly-joined) client. the shard loop runs on the outside, each occupied shard resolving its
-	-- existence diff, dirty cells, and staged values against its own mask words and folding every cell's
-	-- per-shard send / removed words into a path through the frame's mask trie (skipped with a single occupied
-	-- shard -- the common case -- where the raw mask word keys the sections directly). the passes that follow
-	-- (see each function above) are shaped so cell work is paid once per cell per occupied shard, and clients
-	-- sharing a node -- across shards included -- have the node's sections, encoded back-to-back into one shared
-	-- buffer, stamped into their packet buffers with a single buffer.copy: a cell visible to everyone encodes a
-	-- single section no matter how many shards are occupied.
-	local function generate_packets(): { [Client]: Packet }
-		local packets = {} :: { [Client]: Packet }
-		local this_packet_frame = next_packet_frame()
-		group_frame += 1
-		reset_frame_state()
-
-		-- drain the name states staged since the last call; with nobody allocated there is no delta to ride
-		-- (joiners get the full set, and nobody holds a mapping a retraction would need to end), so the drain
-		-- discards them instead of collecting
-		if shared_names.has_staged() then
-			local collected: { [number]: string }? = if client_count > 0 then fetch_scratch() else nil
-			shared_names.drain_staged(collected)
-			frame_names = collected
-		end
-
-		local has_changed_values = next(changed_values) ~= nil
-
-		-- resolve passes, per occupied shard: the existence diff first (the component cells drop removals against
-		-- its record), then the dirty visibility cells, then the staged values.
-		for shard = 1, shard_count do
-			local shard_next_visibilities = next_visibilities[shard]
-			local allocated = allocated_masks[shard]
-			local existing_last = last_visibilities[shard]
-			-- a shard resolves if it has staged visibility, or if a staged value could land in it -- which takes
-			-- allocated clients, a last tree for the value's mask to match, and staged values at all
-			if
-				shard_next_visibilities == nil and (allocated == 0 or existing_last == nil or not has_changed_values)
-			then
-				continue
+			for index in frame_state.replicated_by do
+				assemble_for(packets, this_packet_frame, index)
 			end
-
-			-- the shard's last tree is ensured up front so the resolve passes merge through it directly; it's pruned
-			-- again at the end of the iteration if nothing landed.
-			local shard_last_visibilities = existing_last
-			if shard_last_visibilities == nil then
-				shard_last_visibilities = {}
-				last_visibilities[shard] = shard_last_visibilities
+			for index in frame_state.unreplicated_by do
+				assemble_for(packets, this_packet_frame, index)
 			end
-
-			local base_index = (shard - 1) * 32
-			local shard_key_base = shard * shard_key_span
-
-			if shard_next_visibilities then
-				local entity_unreplicate_masks =
-					resolve_existence_diff(shard_next_visibilities, shard_last_visibilities, allocated, base_index)
-
-				resolve_visibility_cells(
-					shard_next_visibilities,
-					shard_last_visibilities,
-					allocated,
-					shard_key_base,
-					entity_unreplicate_masks
-				)
-
-				release_scratch(entity_unreplicate_masks)
-				next_visibilities[shard] = nil
-			end
-
-			if allocated ~= 0 then
-				resolve_value_cells(shard_last_visibilities, allocated, shard_key_base)
-			end
-
-			if next(shard_last_visibilities) == nil then
-				last_visibilities[shard] = nil
-			end
-		end
-		changed_values = {}
-		-- the resolve passes above were the last readers of the gens retired since the previous call
-		table.clear(retired_target_gens)
-		table.clear(retired_relation_gens)
-
-		bucket_dirty_groups()
-		finalize_node_sections()
-		expand_to_clients()
-		assemble_client_packets(packets, this_packet_frame)
-		release_frame_state()
-
-		-- allocate pending joiners only now, after the delta has been resolved against the existing slots
-		for client in pending_clients do
-			pending_clients[client] = nil
-			allocate_client(client)
-			packets[client] = full_packet(client, this_packet_frame)
-		end
-
-		-- fresh clients' fulls build at the same point, where the slot's last masks exactly equal current
-		-- visibility (the resolve passes merged this frame's changes in), so full_packet re-marks the same bits it
-		-- finds and the next delta diffs correctly. the full replaces whatever delta the frame assembled for the
-		-- client: built after the delta resolved, it already contains everything the delta carried.
-		for client in fresh_clients do
-			fresh_clients[client] = nil
-			packets[client] = full_packet(client, this_packet_frame)
-		end
-
-		compact_shards()
-
-		-- eviction sweep: drop groups untouched for a full interval, so dead ids don't pin their arrays forever.
-		-- safe at any frame boundary -- a group with rows was touched this frame by definition.
-		if group_frame - last_group_sweep >= group_sweep_interval then
-			last_group_sweep = group_frame
-			for component, group in groups do
-				if group_frame - group.frame >= group_sweep_interval then
-					groups[component] = nil
-				end
-			end
-			for relation_dense, group in pair_groups do
-				if group_frame - group.frame >= group_sweep_interval then
-					pair_groups[relation_dense] = nil
+			-- shared names go to every allocated client, otherwise-empty packets included (pending joiners get them
+			-- through their full packet instead)
+			if frame_names ~= nil then
+				for index in clients_by_index do
+					assemble_for(packets, this_packet_frame, index)
 				end
 			end
 		end
 
-		return packets
-	end
+		-- builds a packet for every client in a single pass: a delta for each allocated client and a full packet for
+		-- each pending (newly-joined) client. the shard loop runs on the outside, each occupied shard resolving its
+		-- existence diff, dirty cells, and staged values against its own mask words and folding every cell's
+		-- per-shard send / removed words into a path through the frame's mask trie (skipped with a single occupied
+		-- shard -- the common case -- where the raw mask word keys the sections directly). the passes that follow
+		-- (see each function above) are shaped so cell work is paid once per cell per occupied shard, and clients
+		-- sharing a node -- across shards included -- have the node's sections, encoded back-to-back into one shared
+		-- buffer, stamped into their packet buffers with a single buffer.copy: a cell visible to everyone encodes a
+		-- single section no matter how many shards are occupied.
+		local function generate_packets(): { [Client]: Packet }
+			local packets = {} :: { [Client]: Packet }
+			local this_packet_frame = next_packet_frame()
+			group_frame += 1
+			reset_frame_state()
 
-	-- UNRELIABLE (ALWAYS-REPLICATE) PACKET GENERATION
-
-	-- the chunk frame counter, cycling 0..2^32-1 like the packet frame: every chunk of one call carries it,
-	-- and clients drop chunks older than the newest reconciled (wrap-aware), so reordered delivery never snaps
-	-- values backward. independent of the packet frame counter above.
-	local chunk_frame = -1
-
-	-- per-call accumulators of the unreliable pass, mirroring the reliable frame accumulators above: drafts
-	-- collect per accumulated-visibility node, keyed [node][cell id] (the component, or the packed pair id), and
-	-- the finalize loop turns each node's drafts into its shared chunk list. both maps are cleared at entry so
-	-- an errored call's stranded tables are abandoned to the GC, mirroring reset_frame_state's policy (the
-	-- salvage guard contains user encode throws, but an internal error can still unwind mid-call).
-	local unreliable_node_drafts = {} :: { [VisibilityNode]: { [Id]: SectionDraft } }
-	local unreliable_node_chunks = {} :: { [VisibilityNode]: { buffer } }
-
-	-- the running call's escaping result map, held as an upvalue only while the expansion pass scatters into it
-	-- (the pass functions are shared top-level closures, like the reliable passes')
-	local unreliable_packets: { [Client]: { buffer } }? = nil
-
-	-- the walked cell's per-shard last trees, prefetched once per cell id by prefetch_unreliable_visibility
-	-- (false for shards holding none), plus the walk's one-entry cache: consecutive entities usually share their
-	-- visibility, so the previous entity's node and draft are reused whenever the resolve matches --
-	-- single-shard via a word comparison against the cached node key, multi-shard via the per-shard words of the
-	-- previous entity (unreliable_cell_words, valid while unreliable_words_valid), which skips the trie walk
-	-- entirely. a cached node of 0 marks an invisible entity, so equal-words runs of invisible entities skip on
-	-- the comparison alone. entries past shard_count are stale and never read.
-	local unreliable_cell_visibility = {} :: { { [Entity]: VisibilityMask } | false }
-	local unreliable_cell_words = {} :: { VisibilityMask }
-	local unreliable_words_valid = false
-	local unreliable_cached_node: VisibilityNode = 0
-	local unreliable_cached_draft: SectionDraft? = nil
-
-	local function prefetch_unreliable_visibility(cell: Id): boolean
-		local any_visible = false
-		for shard = 1, shard_count do
-			local shard_last_visibilities = last_visibilities[shard]
-			local visibility = if shard_last_visibilities then shard_last_visibilities[cell] else nil
-			if visibility ~= nil then
-				unreliable_cell_visibility[shard] = visibility
-				any_visible = true
-			else
-				unreliable_cell_visibility[shard] = false
+			-- drain the name states staged since the last call; with nobody allocated there is no delta to ride
+			-- (joiners get the full set, and nobody holds a mapping a retraction would need to end), so the drain
+			-- discards them instead of collecting
+			if shared_names.has_staged() then
+				local collected: { [number]: string }? = if client_count > 0 then fetch_scratch() else nil
+				shared_names.drain_staged(collected)
+				frame_names = collected
 			end
-		end
-		unreliable_words_valid = false
-		unreliable_cached_node = 0
-		unreliable_cached_draft = nil
-		return any_visible
-	end
 
-	-- appends one archetype's cells of one unreliable cell id to the per-node drafts: per entity, the prefetched
-	-- last masks resolve to a node (the raw word with one occupied shard, a trie path otherwise -- exactly the
-	-- reliable pass's keying), and the live column read lands in the node's draft for the cell -- values under
-	-- the ids, nils under nulled. masks intersect each shard's allocated word so a departed client's stale bit
-	-- never creates or widens a chunk; a cell with no last mask is invisible (or not yet sent -- its membership
-	-- add is still in flight) and skips. cell names the mask-store row and the draft key (the component, or the
-	-- packed pair id); component/relation/target are the draft's wire naming, relation and target gen-qualified
-	-- as chunk pair sections encode them.
-	local function accumulate_unreliable_archetype(
-		entities: { any },
-		column: { any },
-		cell: Id,
-		component: number?,
-		relation: number?,
-		target: number?
-	)
-		for row, entity in entities do
-			local node: VisibilityNode
-			if multi_shard then
-				-- probe the shards' words against the previous entity's: while they keep matching nothing is appended, so
-				-- a full match reuses the cached node (0 included -- an invisible run) with no trie walk at all; the
-				-- first divergence replays the equal prefix into the trie and the loop appends inline from there, so a
-				-- miss costs the plain fused walk plus the comparisons
-				local same = unreliable_words_valid
-				local accumulated: VisibilityNode = 0
-				for shard = 1, shard_count do
-					local word = 0
-					local visibility = unreliable_cell_visibility[shard]
-					if visibility ~= false then
-						local mask = (visibility :: { [Entity]: VisibilityMask })[entity]
-						if mask ~= nil then
-							word = bit32.band(mask, allocated_masks[shard])
-						end
+			local has_changed_values = next(changed_values) ~= nil
+
+			-- resolve passes, per occupied shard: the existence diff first (the component cells drop removals against
+			-- its record), then the dirty visibility cells, then the staged values.
+			for shard = 1, shard_count do
+				local shard_next_visibilities = next_visibilities[shard]
+				local allocated = allocated_masks[shard]
+				local existing_last = last_visibilities[shard]
+				-- a shard resolves if it has staged visibility, or if a staged value could land in it -- which takes
+				-- allocated clients, a last tree for the value's mask to match, and staged values at all
+				if
+					shard_next_visibilities == nil
+					and (allocated == 0 or existing_last == nil or not has_changed_values)
+				then
+					continue
+				end
+
+				-- the shard's last tree is ensured up front so the resolve passes merge through it directly; it's pruned
+				-- again at the end of the iteration if nothing landed.
+				local shard_last_visibilities = existing_last
+				if shard_last_visibilities == nil then
+					shard_last_visibilities = {}
+					last_visibilities[shard] = shard_last_visibilities
+				end
+
+				local base_index = (shard - 1) * 32
+				local shard_key_base = shard * shard_key_span
+
+				if shard_next_visibilities then
+					local entity_unreplicate_masks =
+						resolve_existence_diff(shard_next_visibilities, shard_last_visibilities, allocated, base_index)
+
+					resolve_visibility_cells(
+						shard_next_visibilities,
+						shard_last_visibilities,
+						allocated,
+						shard_key_base,
+						entity_unreplicate_masks
+					)
+
+					release_scratch(entity_unreplicate_masks)
+					next_visibilities[shard] = nil
+				end
+
+				if allocated ~= 0 then
+					resolve_value_cells(shard_last_visibilities, allocated, shard_key_base)
+				end
+
+				if next(shard_last_visibilities) == nil then
+					last_visibilities[shard] = nil
+				end
+			end
+			changed_values = {}
+			-- the resolve passes above were the last readers of the gens retired since the previous call
+			table.clear(retired_target_gens)
+			table.clear(retired_relation_gens)
+
+			bucket_dirty_groups()
+			finalize_node_sections()
+			expand_to_clients()
+			assemble_client_packets(packets, this_packet_frame)
+			release_frame_state()
+
+			-- allocate pending joiners only now, after the delta has been resolved against the existing slots
+			for client in pending_clients do
+				pending_clients[client] = nil
+				allocate_client(client)
+				packets[client] = full_packet(client, this_packet_frame)
+			end
+
+			-- fresh clients' fulls build at the same point, where the slot's last masks exactly equal current
+			-- visibility (the resolve passes merged this frame's changes in), so full_packet re-marks the same bits it
+			-- finds and the next delta diffs correctly. the full replaces whatever delta the frame assembled for the
+			-- client: built after the delta resolved, it already contains everything the delta carried.
+			for client in fresh_clients do
+				fresh_clients[client] = nil
+				packets[client] = full_packet(client, this_packet_frame)
+			end
+
+			compact_shards()
+
+			-- eviction sweep: drop groups untouched for a full interval, so dead ids don't pin their arrays forever.
+			-- safe at any frame boundary -- a group with rows was touched this frame by definition.
+			if group_frame - last_group_sweep >= group_sweep_interval then
+				last_group_sweep = group_frame
+				for component, group in groups do
+					if group_frame - group.frame >= group_sweep_interval then
+						groups[component] = nil
 					end
-					if same then
-						if unreliable_cell_words[shard] ~= word then
-							same = false
-							unreliable_cell_words[shard] = word
-							for s = 1, shard - 1 do
-								local prefix = unreliable_cell_words[s]
-								if prefix ~= 0 then
-									accumulated = append_mask_run(accumulated, prefix + s * shard_key_span)
+				end
+				for relation_dense, group in pair_groups do
+					if group_frame - group.frame >= group_sweep_interval then
+						pair_groups[relation_dense] = nil
+					end
+				end
+			end
+
+			return packets
+		end
+
+		-- UNRELIABLE (ALWAYS-REPLICATE) PACKET GENERATION
+
+		-- the chunk frame counter, cycling 0..2^32-1 like the packet frame: every chunk of one call carries it,
+		-- and clients drop chunks older than the newest reconciled (wrap-aware), so reordered delivery never snaps
+		-- values backward. independent of the packet frame counter above.
+		local chunk_frame = -1
+
+		-- per-call accumulators of the unreliable pass, mirroring the reliable frame accumulators above: drafts
+		-- collect per accumulated-visibility node, keyed [node][cell id] (the component, or the packed pair id), and
+		-- the finalize loop turns each node's drafts into its shared chunk list. both maps are cleared at entry so
+		-- an errored call's stranded tables are abandoned to the GC, mirroring reset_frame_state's policy (the
+		-- salvage guard contains user encode throws, but an internal error can still unwind mid-call).
+		local unreliable_node_drafts = {} :: { [VisibilityNode]: { [Id]: SectionDraft } }
+		local unreliable_node_chunks = {} :: { [VisibilityNode]: { buffer } }
+
+		-- the running call's escaping result map, held as an upvalue only while the expansion pass scatters into it
+		-- (the pass functions are shared top-level closures, like the reliable passes')
+		local unreliable_packets: { [Client]: { buffer } }? = nil
+
+		-- the walked cell's per-shard last trees, prefetched once per cell id by prefetch_unreliable_visibility
+		-- (false for shards holding none), plus the walk's one-entry cache: consecutive entities usually share their
+		-- visibility, so the previous entity's node and draft are reused whenever the resolve matches --
+		-- single-shard via a word comparison against the cached node key, multi-shard via the per-shard words of the
+		-- previous entity (unreliable_cell_words, valid while unreliable_words_valid), which skips the trie walk
+		-- entirely. a cached node of 0 marks an invisible entity, so equal-words runs of invisible entities skip on
+		-- the comparison alone. entries past shard_count are stale and never read.
+		local unreliable_cell_visibility = {} :: { { [Entity]: VisibilityMask } | false }
+		local unreliable_cell_words = {} :: { VisibilityMask }
+		local unreliable_words_valid = false
+		local unreliable_cached_node: VisibilityNode = 0
+		local unreliable_cached_draft: SectionDraft? = nil
+
+		local function prefetch_unreliable_visibility(cell: Id): boolean
+			local any_visible = false
+			for shard = 1, shard_count do
+				local shard_last_visibilities = last_visibilities[shard]
+				local visibility = if shard_last_visibilities then shard_last_visibilities[cell] else nil
+				if visibility ~= nil then
+					unreliable_cell_visibility[shard] = visibility
+					any_visible = true
+				else
+					unreliable_cell_visibility[shard] = false
+				end
+			end
+			unreliable_words_valid = false
+			unreliable_cached_node = 0
+			unreliable_cached_draft = nil
+			return any_visible
+		end
+
+		-- appends one archetype's cells of one unreliable cell id to the per-node drafts: per entity, the prefetched
+		-- last masks resolve to a node (the raw word with one occupied shard, a trie path otherwise -- exactly the
+		-- reliable pass's keying), and the live column read lands in the node's draft for the cell -- values under
+		-- the ids, nils under nulled. masks intersect each shard's allocated word so a departed client's stale bit
+		-- never creates or widens a chunk; a cell with no last mask is invisible (or not yet sent -- its membership
+		-- add is still in flight) and skips. cell names the mask-store row and the draft key (the component, or the
+		-- packed pair id); component/relation/target are the draft's wire naming, relation and target gen-qualified
+		-- as chunk pair sections encode them.
+		local function accumulate_unreliable_archetype(
+			entities: { any },
+			column: { any },
+			cell: Id,
+			component: number?,
+			relation: number?,
+			target: number?
+		)
+			for row, entity in entities do
+				local node: VisibilityNode
+				if multi_shard then
+					-- probe the shards' words against the previous entity's: while they keep matching nothing is appended, so
+					-- a full match reuses the cached node (0 included -- an invisible run) with no trie walk at all; the
+					-- first divergence replays the equal prefix into the trie and the loop appends inline from there, so a
+					-- miss costs the plain fused walk plus the comparisons
+					local same = unreliable_words_valid
+					local accumulated: VisibilityNode = 0
+					for shard = 1, shard_count do
+						local word = 0
+						local visibility = unreliable_cell_visibility[shard]
+						if visibility ~= false then
+							local mask = (visibility :: { [Entity]: VisibilityMask })[entity]
+							if mask ~= nil then
+								word = bit32.band(mask, allocated_masks[shard])
+							end
+						end
+						if same then
+							if unreliable_cell_words[shard] ~= word then
+								same = false
+								unreliable_cell_words[shard] = word
+								for s = 1, shard - 1 do
+									local prefix = unreliable_cell_words[s]
+									if prefix ~= 0 then
+										accumulated = append_mask_run(accumulated, prefix + s * shard_key_span)
+									end
+								end
+								if word ~= 0 then
+									accumulated = append_mask_run(accumulated, word + shard * shard_key_span)
 								end
 							end
+						else
+							unreliable_cell_words[shard] = word
 							if word ~= 0 then
 								accumulated = append_mask_run(accumulated, word + shard * shard_key_span)
 							end
 						end
-					else
-						unreliable_cell_words[shard] = word
-						if word ~= 0 then
-							accumulated = append_mask_run(accumulated, word + shard * shard_key_span)
-						end
 					end
-				end
-				if same then
-					if unreliable_cached_node == 0 then
-						continue
-					end
-					node = unreliable_cached_node
-				else
-					unreliable_words_valid = true
-					if accumulated == 0 then
-						unreliable_cached_node = 0
-						unreliable_cached_draft = nil
-						continue
-					end
-					node = accumulated
-				end
-			else
-				local visibility = unreliable_cell_visibility[1]
-				local mask = (visibility :: { [Entity]: VisibilityMask })[entity]
-				if mask == nil then
-					continue
-				end
-				mask = bit32.band(mask, allocated_masks[1])
-				if mask == 0 then
-					continue
-				end
-				node = mask
-			end
-
-			local draft: SectionDraft
-			if node == unreliable_cached_node and unreliable_cached_draft ~= nil then
-				draft = unreliable_cached_draft :: SectionDraft
-			else
-				local drafts = unreliable_node_drafts[node]
-				if drafts == nil then
-					drafts = fetch_scratch()
-					unreliable_node_drafts[node] = drafts
-				end
-				local existing = drafts[cell]
-				if existing == nil then
-					existing = fetch_draft(component, relation)
-					existing.target = target
-					drafts[cell] = existing
-				end
-				draft = existing
-				unreliable_cached_node = node
-				unreliable_cached_draft = draft
-			end
-
-			local value = column[row]
-			if value == nil then
-				local nulled = draft.nulled
-				if nulled == nil then
-					nulled = fetch_scratch()
-					draft.nulled = nulled
-				end
-				table.insert(nulled :: { number }, entity)
-			else
-				local ids = draft.ids
-				local values
-				if ids == nil then
-					ids = fetch_scratch()
-					values = fetch_scratch()
-					draft.ids = ids
-					draft.values = values
-				else
-					values = draft.values :: { any }
-				end
-				table.insert(ids :: { number }, entity)
-				table.insert(values, value)
-			end
-		end
-	end
-
-	-- appends one node's chunk list to one client's packet list, creating the list on first touch. the chunk
-	-- list and its length ride in as arguments, resolved once per node by the callers like scatter's. the lists
-	-- escape to the caller, but the chunk buffers inside are shared by reference across every client of the
-	-- node. the element-wise append is deliberate for the same reason as scatter's.
-	local function unreliable_scatter(client_index: number, node_chunks: { buffer }, chunk_count: number)
-		local packets = unreliable_packets :: { [Client]: { buffer } }
-		local client = clients_by_index[client_index]
-		local target_chunks = packets[client]
-		if target_chunks == nil then
-			target_chunks = {}
-			packets[client] = target_chunks
-		end
-		for i = 1, chunk_count do
-			table.insert(target_chunks, node_chunks[i])
-		end
-	end
-
-	-- the unreliable expansion mirrors expand_node -- the same depth-first walk, run decoding through path_bases
-	-- / path_words, and node recycling -- but scatters chunk lists instead of section buffers; kept separate so
-	-- neither hot path pays for threading the other's accumulators.
-	local function unreliable_expand_node(node: MaskTrieNode, depth: number)
-		local node_chunks = unreliable_node_chunks[node]
-		if node_chunks then
-			local chunk_count = #node_chunks
-			for i = 1, depth do
-				local base_index = path_bases[i]
-				local m = path_words[i]
-				while m ~= 0 do
-					local index = bit32.countrz(m)
-					m = bit32.band(m, m - 1)
-					unreliable_scatter(base_index + index, node_chunks, chunk_count)
-				end
-			end
-		end
-		for run, child in node do
-			local child_depth = depth + 1
-			path_bases[child_depth] = (run // shard_key_span - 1) * 32
-			path_words[child_depth] = run % shard_key_span
-			unreliable_expand_node(child, child_depth)
-			table.clear(child)
-			trie_node_pool_count += 1
-			trie_node_pool[trie_node_pool_count] = child
-		end
-	end
-
-	-- builds the always-replicate chunks for every client in a single pass: every visible NetworkedUnreliable
-	-- cell's current value is re-read live and re-sent, so the caller should send the returned chunks through an
-	-- unreliable transport every frame -- a dropped or reordered chunk costs one frame of staleness, never
-	-- state. visibility is read from the last-sent masks (what each client's reliable stream currently holds),
-	-- so membership and privacy shifts take effect on this channel at the next generate_packets: a client
-	-- legitimately holds a cell until the reliable removal reaches it, so the two channels always agree, and the
-	-- two calls may run at independent cadences. cells walk per component through jecs' per-component archetype
-	-- records (the world_each scheme -- undocumented internals, like get_components' sparse_array read), so
-	-- archetypes without unreliable cells cost nothing -- a tag definition contributing only its pairs with
-	-- data-component targets, the one cell shape of a tag that carries values; per entity the work is one mask
-	-- probe per occupied shard, a column read, and the serdes encode, with cells of equal cross-shard
-	-- visibility sharing one serialization no matter how many clients receive it. chunk buffers are shared by reference across every
-	-- client of a node -- never mutate them -- and clients with nothing visible are omitted from the returned
-	-- map.
-	local function generate_unreliable_chunks(chunk_bytes: number?): { [Client]: { buffer } }
-		local budget = default_chunk_bytes
-		if chunk_bytes ~= nil then
-			if chunk_bytes ~= chunk_bytes // 1 or chunk_bytes < min_chunk_bytes or chunk_bytes > max_chunk_bytes then
-				fail(
-					`chunk_bytes must be an integer between {min_chunk_bytes} and {max_chunk_bytes}! (got {chunk_bytes})`
-				)
-			end
-			budget = chunk_bytes
-		end
-
-		chunk_frame = (chunk_frame + 1) % 2 ^ 32
-		local packets = {} :: { [Client]: { buffer } }
-		if next(networked_unreliable) == nil then
-			return packets
-		end
-
-		-- clear whatever an errored call stranded; stale trie nodes are harmless (both expansion passes clear and
-		-- pool whatever they walk, and node payloads always live in the per-call maps)
-		table.clear(unreliable_node_drafts)
-		table.clear(unreliable_node_chunks)
-		multi_shard = shard_count > 1
-
-		local archetypes = world.archetypes
-
-		for component in networked_unreliable do
-			-- a tag definition streams only its data pairs: its bare cells -- and its pairs with tag targets,
-			-- filtered in the pair walk below -- are valueless tag cells whose membership already rides the
-			-- reliable path, and streaming them would re-send every one as a data null each call, which the
-			-- client applies via world:set and world:set errors on tags. the tag-ness read is the cached one the
-			-- reliable resolve uses (tracked_relation_tags; every unreliable member is tracked, so the entry
-			-- always exists).
-			local relation_is_tag = tracked_relation_tags[dense(component)]
-
-			-- target-specific modes: a definition lands in this set with *any* unreliable mode among its plain tag
-			-- and designations, so the bare cells stream only under a plain NetworkedUnreliable tag, and each pair
-			-- streams only when its governing mode -- its target's designation, else the plain tag -- is
-			-- NetworkedUnreliable (the pair walk below reads both hoisted here).
-			local plain_unreliable = tracked_by[component] == NetworkedUnreliable
-			local designated = designations[component]
-
-			-- unpaired cells: the component's own archetype records
-			if relation_is_tag ~= true and plain_unreliable then
-				local idr = component_index[component]
-				if idr ~= nil and prefetch_unreliable_visibility(component) then
-					for archetype_id in idr.records do
-						local archetype = archetypes[archetype_id]
-						local entities = archetype.entities
-						if #entities > 0 then
-							accumulate_unreliable_archetype(
-								entities,
-								archetype.columns_map[component],
-								component,
-								component :: any,
-								nil,
-								nil
-							)
-						end
-					end
-				end
-			end
-
-			-- pair cells: the relation's wildcard record covers exactly the archetypes holding at least one pair of
-			-- this relation, and same-relation pairs sit contiguously in archetype.types (see each_target), so the
-			-- record's records/counts hand each archetype its exact pair slice with no types scan. the target gen
-			-- resolves through the pair index, which covers every live pair of a tracked relation. a tag relation's
-			-- pairs follow their target's tag-ness (the reliable resolve's rule), so its tag-target pairs -- tag
-			-- pairs, carrying no value -- skip like its bare cells above.
-			local idr_pair = component_index[pair(component, jecs.Wildcard)]
-			if idr_pair ~= nil then
-				local pair_counts = idr_pair.counts
-				for archetype_id, slice_start in idr_pair.records do
-					local archetype = archetypes[archetype_id]
-					local entities = archetype.entities
-					if #entities == 0 then
-						continue
-					end
-					local archetype_types = archetype.types
-					for i = slice_start, slice_start + pair_counts[archetype_id] - 1 do
-						local cell = archetype_types[i]
-						local dense_target = ECS_PAIR_SECOND(cell)
-						local target = tracked_target_gens[dense_target]
-						if target == nil then
+					if same then
+						if unreliable_cached_node == 0 then
 							continue
 						end
-						-- a designated target's mode overrides the plain tag; an undesignated one falls back to it
-						-- (with no designations at all the set membership already implies a plain unreliable tag)
-						if designated ~= nil then
-							local mode = designated[dense_target]
-							if mode == nil then
-								if not plain_unreliable then
-									continue
-								end
-							elseif mode ~= NetworkedUnreliable then
-								continue
+						node = unreliable_cached_node
+					else
+						unreliable_words_valid = true
+						if accumulated == 0 then
+							unreliable_cached_node = 0
+							unreliable_cached_draft = nil
+							continue
+						end
+						node = accumulated
+					end
+				else
+					local visibility = unreliable_cell_visibility[1]
+					local mask = (visibility :: { [Entity]: VisibilityMask })[entity]
+					if mask == nil then
+						continue
+					end
+					mask = bit32.band(mask, allocated_masks[1])
+					if mask == 0 then
+						continue
+					end
+					node = mask
+				end
+
+				local draft: SectionDraft
+				if node == unreliable_cached_node and unreliable_cached_draft ~= nil then
+					draft = unreliable_cached_draft :: SectionDraft
+				else
+					local drafts = unreliable_node_drafts[node]
+					if drafts == nil then
+						drafts = fetch_scratch()
+						unreliable_node_drafts[node] = drafts
+					end
+					local existing = drafts[cell]
+					if existing == nil then
+						existing = fetch_draft(component, relation)
+						existing.target = target
+						drafts[cell] = existing
+					end
+					draft = existing
+					unreliable_cached_node = node
+					unreliable_cached_draft = draft
+				end
+
+				local value = column[row]
+				if value == nil then
+					local nulled = draft.nulled
+					if nulled == nil then
+						nulled = fetch_scratch()
+						draft.nulled = nulled
+					end
+					table.insert(nulled :: { number }, entity)
+				else
+					local ids = draft.ids
+					local values
+					if ids == nil then
+						ids = fetch_scratch()
+						values = fetch_scratch()
+						draft.ids = ids
+						draft.values = values
+					else
+						values = draft.values :: { any }
+					end
+					table.insert(ids :: { number }, entity)
+					table.insert(values, value)
+				end
+			end
+		end
+
+		-- appends one node's chunk list to one client's packet list, creating the list on first touch. the chunk
+		-- list and its length ride in as arguments, resolved once per node by the callers like scatter's. the lists
+		-- escape to the caller, but the chunk buffers inside are shared by reference across every client of the
+		-- node. the element-wise append is deliberate for the same reason as scatter's.
+		local function unreliable_scatter(client_index: number, node_chunks: { buffer }, chunk_count: number)
+			local packets = unreliable_packets :: { [Client]: { buffer } }
+			local client = clients_by_index[client_index]
+			local target_chunks = packets[client]
+			if target_chunks == nil then
+				target_chunks = {}
+				packets[client] = target_chunks
+			end
+			for i = 1, chunk_count do
+				table.insert(target_chunks, node_chunks[i])
+			end
+		end
+
+		-- the unreliable expansion mirrors expand_node -- the same depth-first walk, run decoding through path_bases
+		-- / path_words, and node recycling -- but scatters chunk lists instead of section buffers; kept separate so
+		-- neither hot path pays for threading the other's accumulators.
+		local function unreliable_expand_node(node: MaskTrieNode, depth: number)
+			local node_chunks = unreliable_node_chunks[node]
+			if node_chunks then
+				local chunk_count = #node_chunks
+				for i = 1, depth do
+					local base_index = path_bases[i]
+					local m = path_words[i]
+					while m ~= 0 do
+						local index = bit32.countrz(m)
+						m = bit32.band(m, m - 1)
+						unreliable_scatter(base_index + index, node_chunks, chunk_count)
+					end
+				end
+			end
+			for run, child in node do
+				local child_depth = depth + 1
+				path_bases[child_depth] = (run // shard_key_span - 1) * 32
+				path_words[child_depth] = run % shard_key_span
+				unreliable_expand_node(child, child_depth)
+				table.clear(child)
+				trie_node_pool_count += 1
+				trie_node_pool[trie_node_pool_count] = child
+			end
+		end
+
+		-- builds the always-replicate chunks for every client in a single pass: every visible NetworkedUnreliable
+		-- cell's current value is re-read live and re-sent, so the caller should send the returned chunks through an
+		-- unreliable transport every frame -- a dropped or reordered chunk costs one frame of staleness, never
+		-- state. visibility is read from the last-sent masks (what each client's reliable stream currently holds),
+		-- so membership and privacy shifts take effect on this channel at the next generate_packets: a client
+		-- legitimately holds a cell until the reliable removal reaches it, so the two channels always agree, and the
+		-- two calls may run at independent cadences. cells walk per component through jecs' per-component archetype
+		-- records (the world_each scheme -- undocumented internals, like get_components' sparse_array read), so
+		-- archetypes without unreliable cells cost nothing -- a tag definition contributing only its pairs with
+		-- data-component targets, the one cell shape of a tag that carries values; per entity the work is one mask
+		-- probe per occupied shard, a column read, and the serdes encode, with cells of equal cross-shard
+		-- visibility sharing one serialization no matter how many clients receive it. chunk buffers are shared by reference across every
+		-- client of a node -- never mutate them -- and clients with nothing visible are omitted from the returned
+		-- map.
+		local function generate_unreliable_chunks(chunk_bytes: number?): { [Client]: { buffer } }
+			local budget = default_chunk_bytes
+			if chunk_bytes ~= nil then
+				if
+					chunk_bytes ~= chunk_bytes // 1
+					or chunk_bytes < min_chunk_bytes
+					or chunk_bytes > max_chunk_bytes
+				then
+					fail(
+						`chunk_bytes must be an integer between {min_chunk_bytes} and {max_chunk_bytes}! (got {chunk_bytes})`
+					)
+				end
+				budget = chunk_bytes
+			end
+
+			chunk_frame = (chunk_frame + 1) % 2 ^ 32
+			local packets = {} :: { [Client]: { buffer } }
+			if next(networked_unreliable) == nil then
+				return packets
+			end
+
+			-- clear whatever an errored call stranded; stale trie nodes are harmless (both expansion passes clear and
+			-- pool whatever they walk, and node payloads always live in the per-call maps)
+			table.clear(unreliable_node_drafts)
+			table.clear(unreliable_node_chunks)
+			multi_shard = shard_count > 1
+
+			local archetypes = world.archetypes
+
+			for component in networked_unreliable do
+				-- a tag definition streams only its data pairs: its bare cells -- and its pairs with tag targets,
+				-- filtered in the pair walk below -- are valueless tag cells whose membership already rides the
+				-- reliable path, and streaming them would re-send every one as a data null each call, which the
+				-- client applies via world:set and world:set errors on tags. the tag-ness read is the cached one the
+				-- reliable resolve uses (tracked_relation_tags; every unreliable member is tracked, so the entry
+				-- always exists).
+				local relation_is_tag = tracked_relation_tags[dense(component)]
+
+				-- target-specific modes: a definition lands in this set with *any* unreliable mode among its plain tag
+				-- and designations, so the bare cells stream only under a plain NetworkedUnreliable tag, and each pair
+				-- streams only when its governing mode -- its target's designation, else the plain tag -- is
+				-- NetworkedUnreliable (the pair walk below reads both hoisted here).
+				local plain_unreliable = tracked_by[component] == NetworkedUnreliable
+				local designated = designations[component]
+
+				-- unpaired cells: the component's own archetype records
+				if relation_is_tag ~= true and plain_unreliable then
+					local idr = component_index[component]
+					if idr ~= nil and prefetch_unreliable_visibility(component) then
+						for archetype_id in idr.records do
+							local archetype = archetypes[archetype_id]
+							local entities = archetype.entities
+							if #entities > 0 then
+								accumulate_unreliable_archetype(
+									entities,
+									archetype.columns_map[component],
+									component,
+									component :: any,
+									nil,
+									nil
+								)
 							end
 						end
-						if relation_is_tag and jecs.is_tag(world, target) then
+					end
+				end
+
+				-- pair cells: the relation's wildcard record covers exactly the archetypes holding at least one pair of
+				-- this relation, and same-relation pairs sit contiguously in archetype.types (see each_target), so the
+				-- record's records/counts hand each archetype its exact pair slice with no types scan. the target gen
+				-- resolves through the pair index, which covers every live pair of a tracked relation. a tag relation's
+				-- pairs follow their target's tag-ness (the reliable resolve's rule), so its tag-target pairs -- tag
+				-- pairs, carrying no value -- skip like its bare cells above.
+				local idr_pair = component_index[pair(component, jecs.Wildcard)]
+				if idr_pair ~= nil then
+					local pair_counts = idr_pair.counts
+					for archetype_id, slice_start in idr_pair.records do
+						local archetype = archetypes[archetype_id]
+						local entities = archetype.entities
+						if #entities == 0 then
 							continue
 						end
-						if prefetch_unreliable_visibility(cell) then
-							accumulate_unreliable_archetype(
-								entities,
-								archetype.columns_map[cell],
-								cell,
-								nil,
-								component :: any,
-								target :: any
-							)
+						local archetype_types = archetype.types
+						for i = slice_start, slice_start + pair_counts[archetype_id] - 1 do
+							local cell = archetype_types[i]
+							local dense_target = ECS_PAIR_SECOND(cell)
+							local target = tracked_target_gens[dense_target]
+							if target == nil then
+								continue
+							end
+							-- a designated target's mode overrides the plain tag; an undesignated one falls back to it
+							-- (with no designations at all the set membership already implies a plain unreliable tag)
+							if designated ~= nil then
+								local mode = designated[dense_target]
+								if mode == nil then
+									if not plain_unreliable then
+										continue
+									end
+								elseif mode ~= NetworkedUnreliable then
+									continue
+								end
+							end
+							if relation_is_tag and jecs.is_tag(world, target) then
+								continue
+							end
+							if prefetch_unreliable_visibility(cell) then
+								accumulate_unreliable_archetype(
+									entities,
+									archetype.columns_map[cell],
+									cell,
+									nil,
+									component :: any,
+									target :: any
+								)
+							end
 						end
 					end
 				end
 			end
-		end
 
-		if next(unreliable_node_drafts) == nil then
+			if next(unreliable_node_drafts) == nil then
+				return packets
+			end
+
+			-- finalize: each node's drafts encode once into its shared chunk list, behind the salvage guard (see
+			-- wire.finalize_chunks): a user encode failure -- a throwing hook, a violated size contract, a value no
+			-- chunk can fit, or missing hooks entirely -- drops exactly the offending values from this call's
+			-- chunks instead of erroring the whole call. warn-and-continue like measure_section_guarded, except the
+			-- always-replicate cadence re-sends the dropped values next call, failing (and warning) again until the
+			-- hook or value is fixed.
+			local chunk_scratch = buffer.create(budget)
+			for node, drafts in unreliable_node_drafts do
+				unreliable_node_drafts[node] = nil
+				local chunks: { buffer } = fetch_scratch()
+				local pruned, salvage_error, salvage_id =
+					finalize_chunks(chunk_frame, drafts, budget, resolve_serdes, chunk_scratch, chunks)
+				if salvage_error ~= nil then
+					warn(
+						`a serdes encode failed while chunking {id_to_string(salvage_id, world)}! {pruned} value(s) were dropped from this call's chunks and will not replicate until the hook or value is fixed: {salvage_error}`
+					)
+				end
+				for _, draft in drafts do
+					release_draft(draft)
+				end
+				release_scratch(drafts)
+				unreliable_node_chunks[node] = chunks
+			end
+
+			-- expansion: append each node's chunks to its clients' lists
+			unreliable_packets = packets
+			if multi_shard then
+				unreliable_expand_node(mask_trie, 0)
+				table.clear(mask_trie)
+			else
+				for mask, node_chunks in unreliable_node_chunks do
+					local m = mask :: number
+					local chunk_count = #node_chunks
+					while m ~= 0 do
+						local index = bit32.countrz(m)
+						m = bit32.band(m, m - 1)
+						unreliable_scatter(index, node_chunks, chunk_count)
+					end
+				end
+			end
+			unreliable_packets = nil
+
+			for node, chunks in unreliable_node_chunks do
+				release_scratch(chunks)
+				unreliable_node_chunks[node] = nil
+			end
+
 			return packets
 		end
 
-		-- finalize: each node's drafts encode once into its shared chunk list, behind the salvage guard (see
-		-- wire.finalize_chunks): a user encode failure -- a throwing hook, a violated size contract, a value no
-		-- chunk can fit, or missing hooks entirely -- drops exactly the offending values from this call's
-		-- chunks instead of erroring the whole call. warn-and-continue like measure_section_guarded, except the
-		-- always-replicate cadence re-sends the dropped values next call, failing (and warning) again until the
-		-- hook or value is fixed.
-		local chunk_scratch = buffer.create(budget)
-		for node, drafts in unreliable_node_drafts do
-			unreliable_node_drafts[node] = nil
-			local chunks: { buffer } = fetch_scratch()
-			local pruned, salvage_error, salvage_id =
-				finalize_chunks(chunk_frame, drafts, budget, resolve_serdes, chunk_scratch, chunks)
-			if salvage_error ~= nil then
-				warn(
-					`a serdes encode failed while chunking {id_to_string(salvage_id, world)}! {pruned} value(s) were dropped from this call's chunks and will not replicate until the hook or value is fixed: {salvage_error}`
-				)
-			end
-			for _, draft in drafts do
-				release_draft(draft)
-			end
-			release_scratch(drafts)
-			unreliable_node_chunks[node] = chunks
-		end
-
-		-- expansion: append each node's chunks to its clients' lists
-		unreliable_packets = packets
-		if multi_shard then
-			unreliable_expand_node(mask_trie, 0)
-			table.clear(mask_trie)
-		else
-			for mask, node_chunks in unreliable_node_chunks do
-				local m = mask :: number
-				local chunk_count = #node_chunks
-				while m ~= 0 do
-					local index = bit32.countrz(m)
-					m = bit32.band(m, m - 1)
-					unreliable_scatter(index, node_chunks, chunk_count)
-				end
-			end
-		end
-		unreliable_packets = nil
-
-		for node, chunks in unreliable_node_chunks do
-			release_scratch(chunks)
-			unreliable_node_chunks[node] = nil
-		end
-
-		return packets
+		return generate_packets, generate_unreliable_chunks
 	end
+
+	local generate_packets, generate_unreliable_chunks = create_packet_generation()
 
 	-- CONSTRUCTION CATCH-UP
 
