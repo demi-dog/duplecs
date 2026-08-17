@@ -191,6 +191,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local Private = components.Private
 	local InheritsPrivacy = components.InheritsPrivacy
 
+	-- the tracking tags' names for diagnostics, keyed by tag: the guards below name whichever tag was added
+	-- (or owns the tracking) in their messages, and the tags are foreign entities with no jecs.Name to render.
+	local tracking_tag_names = {
+		[Networked] = "Networked",
+		[NetworkedOnce] = "NetworkedOnce",
+		[NetworkedUnreliable] = "NetworkedUnreliable",
+	}
+
 	-- synthetic cell id: entity existence flows through the per-cell visibility stores keyed by this id, never
 	-- added to any entity as a real component. only the packet resolve pass treats it specially, routing its
 	-- diff into the per-client replicated / unreplicated lists instead of a component group.
@@ -1141,7 +1149,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- modes, and a replicated entity cannot become a (partially) tracked definition. each firing guard removes
 	-- the just-added pair -- which the removed hook recognizes as an undo by the designation entry being absent
 	-- or owned by a different tag -- and errors.
-	local function on_designation_added(component: Component, id: Id, tag: Component, tag_name: string)
+	local function on_designation_added(component: Component, id: Id, tag: Component)
+		local tag_name = tracking_tag_names[tag]
 		local dense_target = ECS_PAIR_SECOND(id)
 		if dense_target == dense(jecs.Wildcard) then
 			world:remove(component, id)
@@ -1245,11 +1254,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- component already carrying one of the other two exclusive tags, and reject a Replicated component (paired
 	-- adds route to on_designation_added, which guards its own shapes). each firing guard removes the
 	-- just-added tag -- undoing the add so the matching removed hook recognizes it (see
-	-- on_tracking_tag_removed) -- and errors. tag names the added tag for the exclusivity check to skip, and
-	-- tag_name spells it for the messages (the caller has both at hand; on_replicated_added, which resolves its
-	-- tag from the tracking state, spells it out itself). returns normally only when the add is clean; the
+	-- on_tracking_tag_removed) -- and errors. tag names the added tag for the exclusivity check to skip, with
+	-- tracking_tag_names spelling it for the messages. returns normally only when the add is clean; the
 	-- caller then applies any tag-specific guards of its own before tracking.
-	local function guard_networked_added(component: Component, tag: Component, tag_name: string)
+	local function guard_networked_added(component: Component, tag: Component)
+		local tag_name = tracking_tag_names[tag]
 		if
 			(tag ~= Networked and world:has(component, Networked))
 			or (tag ~= NetworkedOnce and world:has(component, NetworkedOnce))
@@ -1314,10 +1323,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- errors. a paired add is a target designation (see on_designation_added), as for all three tags.
 	local function on_networked_once_added(component: Component, id: Id)
 		if id ~= NetworkedOnce then
-			on_designation_added(component, id, NetworkedOnce, "NetworkedOnce")
+			on_designation_added(component, id, NetworkedOnce)
 			return
 		end
-		guard_networked_added(component, NetworkedOnce, "NetworkedOnce")
+		guard_networked_added(component, NetworkedOnce)
 
 		start_tracking_component(component, NetworkedOnce)
 	end
@@ -1328,10 +1337,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	local function on_networked_added(component: Component, id: Id)
 		if id ~= Networked then
-			on_designation_added(component, id, Networked, "Networked")
+			on_designation_added(component, id, Networked)
 			return
 		end
-		guard_networked_added(component, Networked, "Networked")
+		guard_networked_added(component, Networked)
 
 		start_tracking_component(component, Networked)
 	end
@@ -1352,10 +1361,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- generate_unreliable_chunks). exclusive with the other Networked tags, like they are with each other.
 	local function on_networked_unreliable_added(component: Component, id: Id)
 		if id ~= NetworkedUnreliable then
-			on_designation_added(component, id, NetworkedUnreliable, "NetworkedUnreliable")
+			on_designation_added(component, id, NetworkedUnreliable)
 			return
 		end
-		guard_networked_added(component, NetworkedUnreliable, "NetworkedUnreliable")
+		guard_networked_added(component, NetworkedUnreliable)
 
 		start_tracking_component(component, NetworkedUnreliable)
 	end
@@ -1495,9 +1504,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- any of the three tracking tags refuses Replicated (see guard_networked_added and on_designation_added
 		-- for the mirror direction), so the message names whichever one owns the tracking -- the plain tag, or
-		-- any designation's tag for a definition tracked only through designations. spelled out here rather than
-		-- read from a shared table: a shared table would cost create_server a local for a rare diagnostic path
-		-- (its 200-local budget is finite -- see create_packet_generation), and these locals are the hook's own.
+		-- any designation's tag for a definition tracked only through designations.
 		local tracking_tag = tracked_by[entity]
 		if tracking_tag == nil then
 			local designated = designations[entity]
@@ -1508,11 +1515,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		if tracking_tag then
 			world:remove(entity, Replicated)
-			local tag_name = if tracking_tag == Networked
-				then "Networked"
-				elseif tracking_tag == NetworkedOnce then "NetworkedOnce"
-				else "NetworkedUnreliable"
-			fail(`{tag_name} components cannot be replicated!`)
+			fail(`{tracking_tag_names[tracking_tag]} components cannot be replicated!`)
 		end
 
 		local dense_id = dense(entity)
