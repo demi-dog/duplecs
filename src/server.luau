@@ -269,6 +269,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- owner's genuine removal may stop the tracking (see on_tracking_tag_removed).
 	local tracked_by = {} :: { [Component]: Component }
 
+	-- target-specific mode designations, keyed [definition][dense target] -> the designating tag:
+	-- pair(Networked*, Target) on a definition makes pairs of the definition-as-relation aimed at Target
+	-- replicate under the designated tag's mode, overriding the definition's unpaired tag -- or standing in
+	-- for one entirely, in which case only designated targets' pairs replicate and the bare component and
+	-- undesignated pairs don't (see on_designation_added). dense target keys match what packed pair ids
+	-- carry; a designation pair's halves are alive when it lands, and a target's death removes the pair (and
+	-- with it the entry) before its dense id can recycle, so an entry never names a stale tenant.
+	local designations = {} :: { [Component]: { [number]: Component } }
+
+	-- designations already warned about an unreplicable target, keyed by the gameplay pair id their relation
+	-- and target halves pack into: the unreplicable-designated-target warning fires once per designation, at
+	-- the first moment a gameplay pair actually aims at the unreplicable target, and the designation's
+	-- removal re-arms it (see warn_unreplicable_designation).
+	local designation_warned = {} :: { [Id]: true }
+
 	-- gen-qualified ids of the tracked components, keyed by dense id and maintained alongside tracked_by by
 	-- start_tracking_component / stop_tracking_component: packed pair ids only carry their relation's dense
 	-- half, so the pair resolve paths would otherwise pay jecs.pair_first per staged change. dense ids are
@@ -410,19 +425,49 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return replicated_entities[dense_target] ~= nil or named_entities[dense_target] ~= nil
 	end
 
+	-- the mode governing one pair cell: the target's designated tag when the relation designates it, else the
+	-- relation's plain tracking tag. nil means the pair doesn't replicate at all -- an undesignated target on
+	-- a definition tracked only through designations.
+	local function resolve_pair_mode(relation: Component, dense_target: number): Component?
+		local designated = designations[relation]
+		if designated ~= nil then
+			local mode = designated[dense_target]
+			if mode ~= nil then
+				return mode
+			end
+		end
+		return tracked_by[relation]
+	end
+
+	-- the eligibility half of resolve_pair_mode -- whether *some* mode governs the pair -- ordered so
+	-- plain-tracked relations, the common case on the staging and restage paths, answer from one tracked_by hit
+	-- with no designation probe (which mode wins only matters to the mode-sensitive readers: the mixed changed
+	-- hook and the unreliable walk).
+	local function is_pair_mode_tracked(relation: Component, dense_target: number): boolean
+		if tracked_by[relation] ~= nil then
+			return true
+		end
+		local designated = designations[relation]
+		if designated ~= nil then
+			return designated[dense_target] ~= nil
+		end
+		return false
+	end
+
 	-- resolves whether the component is replication-eligible, the privacy key gating it per entity, and (for
 	-- pair ids) the gen-qualified target half. pair halves resolve through the dense-keyed gen caches instead of
 	-- jecs.pair_first/pair_second: every pair that reaches here is indexed, so a missing entry is a dead half or
 	-- an untracked relation -- ineligible either way.
 	local function resolve_component_eligibility(component: Id): (boolean, Id, Entity?)
 		if IS_PAIR(component) then
-			local target = tracked_target_gens[ECS_PAIR_SECOND(component)]
+			local dense_target = ECS_PAIR_SECOND(component)
+			local target = tracked_target_gens[dense_target]
 			if target == nil or is_pair_target_replicable(target) ~= true then
 				return false, component, nil
 			end
 
 			local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
-			if relation == nil then
+			if relation == nil or is_pair_mode_tracked(relation, dense_target) ~= true then
 				return false, component, nil
 			end
 
@@ -756,7 +801,51 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- for: iterating exactly them once per frame, rather than filtering tracked_by by owner. networked_cleanup
 	-- holds every tracked component's hook disconnectors, whichever tag owns the tracking.
 	local networked_unreliable = {} :: { [Component]: true }
-	local networked_cleanup = {} :: { [Component]: { () -> () } }
+	local networked_cleanup = {} :: {
+		[Component]: {
+			added: () -> (),
+			removed: () -> (),
+			changed: (() -> ())?,
+			mixed: boolean?,
+		},
+	}
+
+	-- the lazy footgun warning for target-specific modes: a designated target that is neither Replicated nor
+	-- named can never ship its pairs -- silently, since an unreplicable target is ordinary gameplay state
+	-- everywhere else -- but a designated one is a schema-level marker whose silence is almost always a missing
+	-- name, so the first gameplay pair actually aimed at one warns, once per designation (its removal re-arms
+	-- the warning). fires from pair indexing and from a designation landing over already-indexed pairs, the
+	-- two moments a designation first meets a real pair; the bucket check keeps a designation with no pairs of
+	-- its own relation silent even while other relations' pairs share the target.
+	local function warn_unreplicable_designation(pair_id: Id)
+		local relation = tracked_relation_gens[ECS_PAIR_FIRST(pair_id)]
+		if relation == nil then
+			return
+		end
+		local designated = designations[relation]
+		if designated == nil then
+			return
+		end
+		local dense_target = ECS_PAIR_SECOND(pair_id)
+		if designated[dense_target] == nil or designation_warned[pair_id] ~= nil then
+			return
+		end
+		local bucket = tracked_pairs_by_target[dense_target]
+		if bucket == nil or bucket[pair_id] == nil then
+			return
+		end
+		local target = tracked_target_gens[dense_target]
+		if target == nil or is_pair_target_replicable(target) then
+			return
+		end
+		designation_warned[pair_id] = true
+		warn(
+			`a designated target of {id_to_string(relation, world)} is neither Replicated nor named! pairs aimed at it cannot replicate -- give the target a jecs.Name (or Replicated) so clients can map it. ({id_to_string(
+				target,
+				world
+			)})`
+		)
+	end
 
 	local function index_tracked_pair(pair_id: Id)
 		local target = ECS_PAIR_SECOND(pair_id)
@@ -776,6 +865,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 		bucket[pair_id] = (bucket[pair_id] or 0) + 1
+		warn_unreplicable_designation(pair_id)
 	end
 
 	local function deindex_tracked_pair(pair_id: Id)
@@ -802,24 +892,115 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					retired_target_gens[target] = target_gen
 				end
 				-- the target's last tracked pair is gone: withdraw its announced name unless it is also a tracked
-				-- component definition
+				-- component definition (through a plain tag or target designations)
 				local announced = shared_names.announced_id(target)
-				if announced ~= nil and tracked_by[announced] == nil then
+				if announced ~= nil and tracked_by[announced] == nil and designations[announced] == nil then
 					shared_names.retract(target)
 				end
 			end
 		end
 	end
 
-	-- the tracking setup the three tracking tags share: record the owning tag, announce the component's name,
-	-- stage the initial visibility of existing cells, and connect the per-component hooks. only Networked
-	-- connects the changed hook -- under NetworkedOnce and NetworkedUnreliable, value changes after the add
-	-- never replicate through the reliable stream, so no callback (or its lookups) runs per set.
-	local function start_tracking_component(component: Component, tag: Component)
-		-- record the owner first so the staging below resolves visibility correctly
-		tracked_by[component] = tag
-		if tag == NetworkedUnreliable then
+	-- reconciles the mode-dependent tracking state after a definition's mode set changes (a plain tag or
+	-- designation added or removed): whether the definition streams through the unreliable channel at all, and
+	-- whether the changed hook is connected. the changed hook connects while any mode -- plain or designated --
+	-- is Networked, in one of two shapes: the plain shape -- a plain Networked tag with no designations, the
+	-- common case -- keeps the pre-designation body with no mode lookups per set (benched: the per-cell resolve
+	-- costs ~20ns on bare sets and ~40ns on pair sets, real money on the hottest event path), while the mixed
+	-- shape resolves the governing mode per cell, so sets on a mixed definition's non-Networked cells pay the
+	-- hook invocation and mode lookup (the documented cost of mixing modes on one definition). a definition
+	-- with no Networked mode anywhere keeps the no-changed-hook guarantee. the changed disconnector lives in
+	-- networked_cleanup's changed slot with mixed marking its shape, so reconnection happens exactly when the
+	-- needed shape differs.
+	local function reconcile_tracking_modes(component: Component)
+		local plain = tracked_by[component]
+		local has_networked = plain == Networked
+		local has_unreliable = plain == NetworkedUnreliable
+		local designated = designations[component]
+		if designated ~= nil then
+			for _, mode in designated do
+				if mode == Networked then
+					has_networked = true
+				elseif mode == NetworkedUnreliable then
+					has_unreliable = true
+				end
+			end
+		end
+		if has_unreliable then
 			networked_unreliable[component] = true
+		else
+			networked_unreliable[component] = nil
+		end
+		local cleanup = networked_cleanup[component]
+		if not has_networked then
+			local disconnect = cleanup.changed
+			if disconnect ~= nil then
+				disconnect()
+				cleanup.changed = nil
+				cleanup.mixed = nil
+			end
+			return
+		end
+		local needs_mixed = designated ~= nil or plain ~= Networked
+		local connected = cleanup.changed
+		if connected ~= nil then
+			if (cleanup.mixed == true) == needs_mixed then
+				return
+			end
+			connected()
+		end
+		if needs_mixed then
+			cleanup.changed = hooks.changed(world, component, function(entity: Entity, id: Id, value: any)
+				if id == component then
+					if tracked_by[component] == Networked then
+						stage_value(id, entity, if value == nil then _nulled else value)
+					end
+					return
+				end
+				if resolve_pair_mode(component, ECS_PAIR_SECOND(id)) == Networked and is_pair_replicable(id) then
+					stage_value(id, entity, if value == nil then _nulled else value)
+				end
+			end)
+			cleanup.mixed = true
+		else
+			cleanup.changed = hooks.changed(world, component, function(entity: Entity, id: Id, value: any)
+				if id == component or is_pair_replicable(id) then
+					stage_value(id, entity, if value == nil then _nulled else value)
+				end
+			end)
+			cleanup.mixed = nil
+		end
+	end
+
+	-- the tracking setup the three tracking tags and their target designations share: record the owning tag
+	-- (plain tags only -- a designation is recorded by its own handler before this runs), announce the
+	-- component's name, stage the initial visibility of existing cells, connect the per-component hooks, and
+	-- reconcile the mode-dependent state (the changed hook and unreliable membership -- see
+	-- reconcile_tracking_modes, which is also why no callback or its lookups runs per set unless some mode is
+	-- Networked). a definition already tracked through designations skips straight to staging its newly-eligible
+	-- cells: its hooks, mirrors, announcement, and pair index are already live, and re-indexing its pairs would
+	-- double their reverse-index counts.
+	local function start_tracking_component(component: Component, tag: Component?)
+		if tag ~= nil then
+			-- record the owner first so the staging below resolves visibility correctly
+			tracked_by[component] = tag
+			if networked_cleanup[component] ~= nil then
+				-- already tracked via designations: stage the newly-eligible cells -- the bare cells and the
+				-- undesignated pairs (designated pairs' masks are unchanged, so their stages are no-ops)
+				for entity in world:each(component) do
+					stage_visibility(component, entity)
+				end
+				for entity in world:each(pair(component, jecs.Wildcard)) do
+					for target in each_target(entity, component) do
+						local pair_id = pair(component, target)
+						if is_pair_replicable(pair_id) then
+							stage_visibility(pair_id, entity)
+						end
+					end
+				end
+				reconcile_tracking_modes(component)
+				return
+			end
 		end
 		local dense_id = dense(component)
 		tracked_relation_gens[dense_id] = component
@@ -829,9 +1010,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		shared_names.announce(component)
 
 		-- stage initial visibility of existing cells; newly-visible clients read live values during the resolve
-		-- pass
-		for entity in world:each(component) do
-			stage_visibility(component, entity)
+		-- pass. with no plain tag the bare cells are ineligible, so only the pair walk stages anything.
+		if tag ~= nil then
+			for entity in world:each(component) do
+				stage_visibility(component, entity)
+			end
 		end
 
 		for entity in world:each(pair(component, jecs.Wildcard)) do
@@ -844,10 +1027,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		local cleanup = {
-			hooks.added(world, component, function(entity: Entity, id: Id, value: any)
+		networked_cleanup[component] = {
+			added = hooks.added(world, component, function(entity: Entity, id: Id, value: any)
 				-- pairs index regardless of the target's current replicability; restaging on a target's visibility shift
-				-- must find them
+				-- must find them. staging an ineligible cell (an undesignated pair, or the bare cell of a
+				-- designation-only definition) resolves to no-ops, so no mode check is needed here.
 				if id ~= component then
 					index_tracked_pair(id)
 				end
@@ -856,7 +1040,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					stage_value(id, entity, if value == nil then _nulled else value)
 				end
 			end),
-			hooks.removed(world, component, function(entity: Entity, id: Id)
+			removed = hooks.removed(world, component, function(entity: Entity, id: Id)
 				if id ~= component then
 					deindex_tracked_pair(id)
 					-- the removal must stage whenever the target is dead or replicable; the gen caches can't answer that
@@ -873,26 +1057,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				stage_removed(id, entity)
 			end),
 		}
-
-		if tag == Networked then
-			table.insert(
-				cleanup,
-				hooks.changed(world, component, function(entity: Entity, id: Id, value: any)
-					if id == component or is_pair_replicable(id) then
-						stage_value(id, entity, if value == nil then _nulled else value)
-					end
-				end)
-			)
-		end
-
-		networked_cleanup[component] = cleanup
+		reconcile_tracking_modes(component)
 	end
 
 	local function stop_tracking_component(component: Component)
 		local cleanup = networked_cleanup[component]
 		if cleanup then
-			for _, remove in cleanup do
-				remove()
+			cleanup.added()
+			cleanup.removed()
+			local changed_disconnect = cleanup.changed
+			if changed_disconnect ~= nil then
+				changed_disconnect()
 			end
 			networked_cleanup[component] = nil
 		end
@@ -925,20 +1100,156 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the guards the Networked, NetworkedOnce, and NetworkedUnreliable add hooks share: reject a paired add
-	-- (none of the three is a valid relation), reject a component already carrying one of the other two
-	-- exclusive tags, and reject a Replicated component. each firing guard removes the just-added tag -- undoing
-	-- the add so the matching removed hook recognizes it (see on_tracking_tag_removed) -- and errors. tag names
-	-- the added tag for the exclusivity check to skip, and tag_name spells it for the messages (the caller has
-	-- both at hand; on_replicated_added, which resolves its tag from tracked_by, spells it out itself). returns
-	-- normally only when the add is clean; the caller then applies any tag-specific guards of its own before
-	-- tracking.
-	local function guard_networked_added(component: Component, id: Id, tag: Component, tag_name: string)
-		if id ~= tag then
+	-- stages one designated target's existing gameplay pairs after a designation change: visibility for every
+	-- subject (newly-eligible pairs ship their values through the newly-visible live read; pairs whose mask is
+	-- unchanged stage no-ops), plus -- when the change moved the pairs *out of* unreliable mode -- their
+	-- current values, so the reliable stream re-establishes a fresh baseline instead of leaving each client at
+	-- whatever its last received chunk held (the unreliable channel keeps no reliable baseline to fall back
+	-- on, so without the restage a dropped final chunk would stay stale until the cell's next server-side
+	-- change -- under NetworkedOnce, forever). a tag relation's only value-carrying pairs are those with
+	-- data-component targets, so its tag pairs -- which never streamed -- veto the value restage here rather
+	-- than at every call site.
+	local function stage_designated_pairs(pair_id: Id, restage_values: boolean)
+		if restage_values and tracked_relation_tags[ECS_PAIR_FIRST(pair_id)] then
+			local target_gen = tracked_target_gens[ECS_PAIR_SECOND(pair_id)]
+			restage_values = target_gen ~= nil and jecs.is_tag(world, target_gen) ~= true
+		end
+		local idr = component_index[pair_id]
+		if idr == nil then
+			return
+		end
+		local world_archetypes = world.archetypes
+		for archetype_id in idr.records do
+			local archetype = world_archetypes[archetype_id]
+			local column = if restage_values then archetype.columns_map[pair_id] else nil
+			for row, subject in archetype.entities do
+				stage_visibility(pair_id, subject)
+				if column ~= nil then
+					local value = column[row]
+					stage_value(pair_id, subject, if value == nil then _nulled else value)
+				end
+			end
+		end
+	end
+
+	-- a tracking tag added as a pair -- pair(tag, Target) on a definition -- designates a target-specific
+	-- mode: pairs of the definition-as-relation aimed at Target replicate under the designated tag's mode,
+	-- overriding the definition's unpaired tag for exactly those pairs -- or, with no unpaired tag present,
+	-- gating them entirely: only designated targets' pairs replicate then, and the bare component and
+	-- undesignated pairs don't. the guards mirror the unpaired adds': a wildcard target designates nothing
+	-- concrete (an unpaired tag already networks every pair), one target cannot be designated by two different
+	-- modes, and a replicated entity cannot become a (partially) tracked definition. each firing guard removes
+	-- the just-added pair -- which the removed hook recognizes as an undo by the designation entry being absent
+	-- or owned by a different tag -- and errors.
+	local function on_designation_added(component: Component, id: Id, tag: Component, tag_name: string)
+		local dense_target = ECS_PAIR_SECOND(id)
+		if dense_target == dense(jecs.Wildcard) then
 			world:remove(component, id)
-			fail(`{tag_name} is not meant to be paired! ({id_to_string(component, world)})`)
+			fail(
+				`{tag_name} designations must name a concrete target, not jecs.Wildcard! ({id_to_string(
+					component,
+					world
+				)})`
+			)
 		end
 
+		if world:has(component, Replicated) then
+			world:remove(component, id)
+			fail(`cannot add {tag_name} to replicated entities!`)
+		end
+
+		local designated = designations[component]
+		if designated == nil then
+			designated = {}
+			designations[component] = designated
+		elseif designated[dense_target] ~= nil and designated[dense_target] ~= tag then
+			local target: Entity = jecs.pair_second(world, id) :: any
+			world:remove(component, id)
+			fail(
+				`Networked, NetworkedOnce, and NetworkedUnreliable designations are exclusive per target! ({id_to_string(
+					component,
+					world
+				)} -> {id_to_string(target, world)})`
+			)
+		end
+		designated[dense_target] = tag
+
+		if networked_cleanup[component] == nil then
+			-- the definition's first tracking: the full setup indexes and stages its existing pairs (the designated
+			-- ones resolve eligible, and the index walk fires the unreplicable-target warning), connects the hooks,
+			-- and reconciles the modes itself
+			start_tracking_component(component, nil)
+			return
+		end
+
+		-- already tracked: stage the target's existing pairs -- newly eligible without a plain tag (their values
+		-- ship through the newly-visible read), mask-unchanged no-ops under one -- restaging their current values
+		-- when the designation moved them out of unreliable mode (see stage_designated_pairs)
+		local gameplay_pair = pair(component, dense_target :: any)
+		stage_designated_pairs(
+			gameplay_pair,
+			tracked_by[component] == NetworkedUnreliable and tag ~= NetworkedUnreliable
+		)
+		warn_unreplicable_designation(gameplay_pair)
+		reconcile_tracking_modes(component)
+	end
+
+	-- a designation pair's removal: a genuine removal narrows (or fully stops) the definition's tracking, while
+	-- a guard's undo -- recognized by the designation entry being absent or owned by a different tag -- passes
+	-- through untouched, exactly like on_tracking_tag_removed's owner check below.
+	local function on_designation_removed(component: Component, id: Id, tag: Component)
+		local designated = designations[component]
+		if designated == nil then
+			return
+		end
+		local dense_target = ECS_PAIR_SECOND(id)
+		if designated[dense_target] ~= tag then
+			return
+		end
+		designated[dense_target] = nil
+		if next(designated) == nil then
+			designations[component] = nil
+		end
+		local gameplay_pair = pair(component, dense_target :: any)
+		designation_warned[gameplay_pair] = nil
+
+		local plain = tracked_by[component]
+		if plain == nil and designations[component] == nil then
+			-- the definition's last mode source: the full stop stages every pair's removal and retires the relation
+			stop_tracking_component(component)
+			return
+		end
+
+		if plain == nil then
+			-- no plain tag to fall back to: the target's pairs stop replicating. the walk mirrors
+			-- stage_designated_pairs' (staging never moves a subject, so it is iteration-safe).
+			local idr = component_index[gameplay_pair]
+			if idr ~= nil then
+				local world_archetypes = world.archetypes
+				for archetype_id in idr.records do
+					for _, subject in world_archetypes[archetype_id].entities do
+						stage_removed(gameplay_pair, subject)
+					end
+				end
+			end
+		elseif tag == NetworkedUnreliable and plain ~= NetworkedUnreliable then
+			-- the pairs fall back to the plain mode, out of unreliable streaming: restage their current values so
+			-- the reliable stream re-establishes a fresh baseline (masks are unchanged, so nothing else ships)
+			stage_designated_pairs(gameplay_pair, true)
+		end
+
+		reconcile_tracking_modes(component)
+	end
+
+	-- the guards the Networked, NetworkedOnce, and NetworkedUnreliable unpaired add hooks share: reject a
+	-- component already carrying one of the other two exclusive tags, and reject a Replicated component (paired
+	-- adds route to on_designation_added, which guards its own shapes). each firing guard removes the
+	-- just-added tag -- undoing the add so the matching removed hook recognizes it (see
+	-- on_tracking_tag_removed) -- and errors. tag names the added tag for the exclusivity check to skip, and
+	-- tag_name spells it for the messages (the caller has both at hand; on_replicated_added, which resolves its
+	-- tag from the tracking state, spells it out itself). returns normally only when the add is clean; the
+	-- caller then applies any tag-specific guards of its own before tracking.
+	local function guard_networked_added(component: Component, tag: Component, tag_name: string)
 		if
 			(tag ~= Networked and world:has(component, Networked))
 			or (tag ~= NetworkedOnce and world:has(component, NetworkedOnce))
@@ -958,19 +1269,39 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- identically whether the tag was genuinely removed or whether a guard above stripped an add it refused, and
 	-- only the former may stop the tracking. tracked_by tells them apart -- a guard's undo is never the recorded
 	-- owner, whether because another tag owns the tracking (the exclusivity guard) or because nothing does (the
-	-- paired, Replicated, and tag guards all fire before tracking starts). letting an undo through would stop
-	-- tracking the component still has, or, for a never-tracked component, run stop_tracking_component for an id
-	-- it never tracked: the removal walks only stage no-ops there (cells the id keys were never visible, so
-	-- their masks are already 0), but the gen retirement writes tracked_relation_gens[dense] (nil here) over
+	-- Replicated and tag guards fire before tracking starts). letting an undo through would stop tracking the
+	-- component still has, or, for a never-tracked component, run stop_tracking_component for an id it never
+	-- tracked: the removal walks only stage no-ops there (cells the id keys were never visible, so their masks
+	-- are already 0), but the gen retirement writes tracked_relation_gens[dense] (nil here) over
 	-- retired_relation_gens[dense], erasing a retirement an earlier real stop on the same dense id staged this
 	-- frame.
 	local function on_tracking_tag_removed(component: Component, id: Id, tag: Component)
-		-- a pair using the tag as its relation never owns tracking
+		-- a pair using the tag as its relation is a target designation, with its own genuine-vs-undo telling
 		if id ~= tag then
+			on_designation_removed(component, id, tag)
 			return
 		end
 		-- not the recorded owner: a guard's undo, not a genuine removal
 		if tracked_by[component] ~= tag then
+			return
+		end
+		if designations[component] ~= nil then
+			-- designations remain: only the plain tag's cells stop -- the bare cells and the undesignated pairs --
+			-- while designated pairs keep replicating under their own modes, with the hooks, mirrors, pair index,
+			-- and announcement staying live
+			tracked_by[component] = nil
+			for entity in world:each(component) do
+				stage_removed(component, entity)
+			end
+			local designated = designations[component] :: { [number]: Component }
+			for entity in world:each(pair(component, jecs.Wildcard)) do
+				for target in each_target(entity, component) do
+					if designated[dense(target)] == nil then
+						stage_removed(pair(component, target), entity)
+					end
+				end
+			end
+			reconcile_tracking_modes(component)
 			return
 		end
 		stop_tracking_component(component)
@@ -980,9 +1311,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- relation) whose value the client can simulate on its own (e.g. timers): initial values, removals, and full
 	-- snapshots replicate, later value changes don't. use force_replicate to push unexpected changes. exclusive
 	-- with the other two tracking tags -- adding one while another is present removes the newly added tag and
-	-- errors.
+	-- errors. a paired add is a target designation (see on_designation_added), as for all three tags.
 	local function on_networked_once_added(component: Component, id: Id)
-		guard_networked_added(component, id, NetworkedOnce, "NetworkedOnce")
+		if id ~= NetworkedOnce then
+			on_designation_added(component, id, NetworkedOnce, "NetworkedOnce")
+			return
+		end
+		guard_networked_added(component, NetworkedOnce, "NetworkedOnce")
 
 		start_tracking_component(component, NetworkedOnce)
 	end
@@ -992,7 +1327,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	local function on_networked_added(component: Component, id: Id)
-		guard_networked_added(component, id, Networked, "Networked")
+		if id ~= Networked then
+			on_designation_added(component, id, Networked, "Networked")
+			return
+		end
+		guard_networked_added(component, Networked, "Networked")
 
 		start_tracking_component(component, Networked)
 	end
@@ -1004,14 +1343,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- NetworkedUnreliable is the always-replicate mode, for values that change every frame (positions,
 	-- velocities): its reliable tracking is exactly NetworkedOnce's -- membership adds with their initial value,
 	-- removals, visibility shifts, and full packets all ride the reliable path, with no changed hook connected,
-	-- so per-set cost is zero -- while current values are re-read and re-sent every generate_unreliable_chunks
-	-- call, intended for an unreliable transport where a dropped chunk costs one frame of staleness. on a tag
-	-- definition only its pairs with data-component targets stream -- the one cell shape of a tag that carries
-	-- values (target-typed, with serdes hooks deriving from the target's registration) -- while its valueless
-	-- tag cells ride the reliable path alone (see generate_unreliable_chunks). exclusive with the other
-	-- Networked tags, like they are with each other.
+	-- so per-set cost is zero (unless another mode on the definition is Networked -- see
+	-- reconcile_tracking_modes) -- while current values are re-read and re-sent every
+	-- generate_unreliable_chunks call, intended for an unreliable transport where a dropped chunk costs one
+	-- frame of staleness. on a tag definition only its pairs with data-component targets stream -- the one cell
+	-- shape of a tag that carries values (target-typed, with serdes hooks deriving from the target's
+	-- registration) -- while its valueless tag cells ride the reliable path alone (see
+	-- generate_unreliable_chunks). exclusive with the other Networked tags, like they are with each other.
 	local function on_networked_unreliable_added(component: Component, id: Id)
-		guard_networked_added(component, id, NetworkedUnreliable, "NetworkedUnreliable")
+		if id ~= NetworkedUnreliable then
+			on_designation_added(component, id, NetworkedUnreliable, "NetworkedUnreliable")
+			return
+		end
+		guard_networked_added(component, NetworkedUnreliable, "NetworkedUnreliable")
 
 		start_tracking_component(component, NetworkedUnreliable)
 	end
@@ -1064,8 +1408,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		for _, component in get_components(entity) do
 			if IS_PAIR(component) then
 				local relation = tracked_relation_gens[ECS_PAIR_FIRST(component)]
-				local target = tracked_target_gens[ECS_PAIR_SECOND(component)]
-				if relation ~= nil and target ~= nil and is_pair_target_replicable(target) then
+				local dense_target = ECS_PAIR_SECOND(component)
+				local target = tracked_target_gens[dense_target]
+				if
+					relation ~= nil
+					and target ~= nil
+					and is_pair_target_replicable(target)
+					and is_pair_mode_tracked(relation, dense_target)
+				then
 					local cell_masks = if entity_masks then entity_masks[relation] else nil
 					local target_masks: ShardMasks? = nil
 					if replicated_entities[dense(target)] ~= nil then
@@ -1143,10 +1493,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			fail(`Replicated is not meant to be paired! ({id_to_string(entity, world)})`)
 		end
 
-		-- any of the three tracking tags refuses Replicated (see guard_networked_added for the mirror direction),
-		-- so the message names whichever one owns the tracking. spelled out here rather than read from a shared
-		-- table: create_server sits at luau's 200-local ceiling, and these locals are the hook's own.
+		-- any of the three tracking tags refuses Replicated (see guard_networked_added and on_designation_added
+		-- for the mirror direction), so the message names whichever one owns the tracking -- the plain tag, or
+		-- any designation's tag for a definition tracked only through designations. spelled out here rather than
+		-- read from a shared table: create_server sits at luau's 200-local ceiling, and these locals are the
+		-- hook's own.
 		local tracking_tag = tracked_by[entity]
+		if tracking_tag == nil then
+			local designated = designations[entity]
+			if designated ~= nil then
+				local _, first_designation = next(designated)
+				tracking_tag = first_designation
+			end
+		end
 		if tracking_tag then
 			world:remove(entity, Replicated)
 			local tag_name = if tracking_tag == Networked
@@ -1206,10 +1565,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		named_entities[dense_id] = true
 		-- pairs targeting the entity may just have gained a replicable target
 		restage_pairs_targeting(entity)
-		-- announce the relevant: a tracked definition, or an unreplicated target of tracked pairs (replicated
-		-- targets map through their creation entry instead)
+		-- announce the relevant: a tracked definition (through a plain tag or target designations), or an
+		-- unreplicated target of tracked pairs (replicated targets map through their creation entry instead)
 		if
 			tracked_by[entity] ~= nil
+			or designations[entity] ~= nil
 			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
 		then
 			shared_names.announce(entity)
@@ -1226,6 +1586,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local dense_id = dense(entity)
 		if
 			tracked_by[entity] ~= nil
+			or designations[entity] ~= nil
 			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
 		then
 			shared_names.announce(entity)
@@ -2241,11 +2602,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					if relation == nil then
 						continue
 					end
-					local target_gen = tracked_target_gens[ECS_PAIR_SECOND(component)]
+					local dense_target = ECS_PAIR_SECOND(component)
+					local target_gen = tracked_target_gens[dense_target]
 					if target_gen == nil or is_pair_target_replicable(target_gen) ~= true then
 						continue
 					end
-					if replicated_entities[ECS_PAIR_SECOND(component)] ~= nil then
+					if is_pair_mode_tracked(relation, dense_target) ~= true then
+						continue
+					end
+					if replicated_entities[dense_target] ~= nil then
 						local gate = entity_gate_masks(target_gen)
 						if gate ~= nil and bit32.band(gate[shard] or 0, bit) == 0 then
 							continue
@@ -3745,8 +4110,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- always exists).
 			local relation_is_tag = tracked_relation_tags[dense(component)]
 
+			-- target-specific modes: a definition lands in this set with *any* unreliable mode among its plain tag
+			-- and designations, so the bare cells stream only under a plain NetworkedUnreliable tag, and each pair
+			-- streams only when its governing mode -- its target's designation, else the plain tag -- is
+			-- NetworkedUnreliable (the pair walk below reads both hoisted here).
+			local plain_unreliable = tracked_by[component] == NetworkedUnreliable
+			local designated = designations[component]
+
 			-- unpaired cells: the component's own archetype records
-			if relation_is_tag ~= true then
+			if relation_is_tag ~= true and plain_unreliable then
 				local idr = component_index[component]
 				if idr ~= nil and prefetch_unreliable_visibility(component) then
 					for archetype_id in idr.records do
@@ -3784,9 +4156,22 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local archetype_types = archetype.types
 					for i = slice_start, slice_start + pair_counts[archetype_id] - 1 do
 						local cell = archetype_types[i]
-						local target = tracked_target_gens[ECS_PAIR_SECOND(cell)]
+						local dense_target = ECS_PAIR_SECOND(cell)
+						local target = tracked_target_gens[dense_target]
 						if target == nil then
 							continue
+						end
+						-- a designated target's mode overrides the plain tag; an undesignated one falls back to it
+						-- (with no designations at all the set membership already implies a plain unreliable tag)
+						if designated ~= nil then
+							local mode = designated[dense_target]
+							if mode == nil then
+								if not plain_unreliable then
+									continue
+								end
+							elseif mode ~= NetworkedUnreliable then
+								continue
+							end
 						end
 						if relation_is_tag and jecs.is_tag(world, target) then
 							continue
@@ -3901,11 +4286,16 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return subjects, pair_ids
 	end
 
+	-- pre-existing target designations replay before the tag's plain definitions, but either order converges:
+	-- a designation replayed first tracks the definition and stages its designated pairs, and the plain tag's
+	-- replay then stages the rest through start_tracking_component's already-tracked branch (staging against
+	-- zero occupied shards writes nothing anyway -- the replay establishes mirrors, hooks, and announcements).
+	-- misuse pairs (a designation on a Replicated subject, or a wildcard target) error from here like a live
+	-- add would.
 	local function catch_up_tracking_tag(tag: Component, on_added: (Entity, Id) -> ())
 		local definitions = collect_holders(tag)
 		local subjects, pair_ids = collect_pair_holders(tag)
 		for index, entity in subjects do
-			-- always the paired misuse; the handler removes the pair and errors
 			on_added(entity, pair_ids[index])
 		end
 		for _, definition in definitions do

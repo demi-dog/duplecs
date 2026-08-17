@@ -11161,18 +11161,46 @@ test("a nil-valued data pair of a tag relation streams as a nulled entry", funct
 	expect_equal(c.world:get(le, pair(CTagRel, CTarget)), nil, "the value is nil after the nulled transition")
 end)
 
-test("guard: NetworkedUnreliable cannot be used as a pair", function(env)
-	local s = env.server
-	local e = s.world:entity()
-	local t = s.world:entity()
-	expect_error(function()
-		s.world:add(e, pair(s.net.NetworkedUnreliable, t))
-	end, "adding NetworkedUnreliable as a pair", "NetworkedUnreliable is not meant to be paired")
+test("a paired NetworkedUnreliable designates one target's mode rather than being refused", function(env)
+	-- pairing a tracking tag onto a definition is a target-specific mode designation rather than a misuse:
+	-- pairs of the definition-as-relation aimed at the designated target stream, and with no unpaired tag on
+	-- the definition nothing else of it replicates at all. section 33 covers designations in full; this pins
+	-- the unreliable one's streaming behavior where the rest of the unreliable mode lives.
+	local s, c = env.server, env.client
+	local Transform = s.world:component()
+	local CTransform = c.world:component()
+	c.net.set_client_entity(Transform, CTransform)
+	s.world:set(Transform, s.net.Serdes, f64_serdes)
+	c.world:set(CTransform, c.net.Serdes, f64_serdes)
+
+	local Dynamic = s.world:entity()
+	local CDynamic = c.world:entity()
+	c.net.set_client_entity(Dynamic, CDynamic)
+	s.world:set(Dynamic, jecs.Name, "PairedUnreliableDynamic")
+
+	s.world:add(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
 	expect_equal(
-		s.world:has(e, pair(s.net.NetworkedUnreliable, t)),
-		false,
-		"the pair was removed by the guard before erroring"
+		s.world:has(Transform, pair(s.net.NetworkedUnreliable, Dynamic)),
+		true,
+		"the designation pair is left standing"
 	)
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Dynamic), 1.5)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 1.5, "the membership add carried the initial value")
+
+	-- and the designated pairs behave exactly like a plain NetworkedUnreliable definition's: no changed hook
+	-- runs for them, and their current values ride the chunk channel instead
+	s.world:set(e, pair(Transform, Dynamic), 9.5)
+	local packet = env.sync(env.player_a)
+	expect_equal(next(packet.components), nil, "the set staged no reliable change")
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 9.5, "the unreliable channel streamed the new value")
 end)
 
 test("guard: NetworkedUnreliable is rejected on Replicated entities", function(env)
@@ -13844,21 +13872,56 @@ test("a multi-parent delegation DAG built before construction gates and fans out
 	expect(client.net.get_client_entity(sibling_a) ~= nil, "while group_a's member is untouched")
 end)
 
-test("guard: a tracking tag paired before construction errors from the construction call", function()
+test("a tracking tag paired before construction designates its target's mode from the construction call", function()
+	-- a paired tracking tag is a target-specific mode designation (see section 33), so the catch-up replays it
+	-- like any other pre-existing schema: the designated target's pairs replicate from the first packet, and
+	-- the definition's other cells -- its undesignated pairs and its bare component -- do not.
 	local world = jecs.world()
 	local components = duplecs.shared(world)
-	local target = world:entity()
-	local entity = world:entity()
-	world:add(entity, pair(components.Networked, target))
 
-	expect_error(function()
-		duplecs.server(world)
-	end, "constructing over a pre-existing Networked pair", "Networked is not meant to be paired")
+	local Transform = world:component()
+	local Static = world:entity()
+	world:set(Static, jecs.Name, "PreConstructionStatic")
+	local Other = world:entity()
+	world:set(Other, jecs.Name, "PreConstructionOther")
+	world:add(Transform, pair(components.Networked, Static))
+
+	local entity = world:entity()
+	world:add(entity, components.Replicated)
+	world:set(entity, pair(Transform, Static), 1)
+	world:set(entity, pair(Transform, Other), 2)
+	world:set(entity, Transform, 3)
+
+	local net = duplecs.server(world)
+	expect_equal(world:has(Transform, pair(components.Networked, Static)), true, "the designation survived the replay")
+
+	local player = fake_player("PreDesignationViewer")
+	net.add_client(player)
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	local client_transform = client_world:component()
+	client_net.set_client_entity(Transform, client_transform)
+	local client_static = client_world:entity()
+	client_net.set_client_entity(Static, client_static)
+	local client_other = client_world:entity()
+	client_net.set_client_entity(Other, client_other)
+
+	client_net.reconcile_packet(deep_copy(net.generate_packets()[player]))
+
+	local le = client_net.get_client_entity(entity)
+	expect(le ~= nil, "the joiner's full packet created the subject")
 	expect_equal(
-		world:has(entity, pair(components.Networked, target)),
-		false,
-		"the pair was removed by the guard before erroring"
+		client_world:get(le, pair(client_transform, client_static)),
+		1,
+		"the pre-construction designation's pairs replicate"
 	)
+	expect_equal(
+		client_world:has(le, pair(client_transform, client_other)),
+		false,
+		"an undesignated target's pairs do not"
+	)
+	expect_equal(client_world:has(le, client_transform), false, "and neither does the bare component")
 end)
 
 test("guard: Replicated paired before construction errors from the construction call", function()
@@ -14601,6 +14664,784 @@ test("the spec's warnings-and-errors appendix quotes no message the sources no l
 		end
 		expect(checked > 0, `the appendix entry "{message.text}" has no run long enough to compare against src/`)
 	end
+end)
+
+-- 33) target-specific modes (tracking tag designations)
+
+-- the three tracking tags pick one mode per definition; a tag added *as a pair* -- pair(Networked, Target) on
+-- a definition -- designates one on top, for exactly the pairs of the definition-as-relation aimed at that
+-- target. with no unpaired tag on the definition the designations are the whole gate (only designated
+-- targets' pairs replicate, and the bare component and undesignated pairs don't); with one, designated
+-- targets follow their designation and everything else follows the plain tag. the tests below cover the two
+-- compositions, each mode's behavior under a designation, the four guards, the transitions a designation edit
+-- causes, the lazy unreplicable-target warning, and the retargeting flow the feature exists for.
+
+-- a fresh data relation, mapped across sides and deliberately left untagged: each test picks the modes it
+-- wants (a plain tag, designations, or both). serdes hooks ride along on both sides so the same relation can
+-- also stream through the unreliable channel, which has no side-array fallback.
+local function make_designation_relation(env)
+	local s, c = env.server, env.client
+	local rel_s = s.world:component()
+	local rel_c = c.world:component()
+	c.net.set_client_entity(rel_s, rel_c)
+	s.world:set(rel_s, s.net.Serdes, f64_serdes)
+	c.world:set(rel_c, c.net.Serdes, f64_serdes)
+	return rel_s, rel_c
+end
+
+-- a marker entity to designate (or to leave undesignated as a control): a jecs.Name is what makes an
+-- unreplicated pair target replicable, and the client maps it explicitly, so the announcement the name makes
+-- is inert here -- exactly like make_unreliable_pair_target above.
+local function make_designation_marker(env, name)
+	local s, c = env.server, env.client
+	local marker_s = s.world:entity()
+	local marker_c = c.world:entity()
+	c.net.set_client_entity(marker_s, marker_c)
+	s.world:set(marker_s, jecs.Name, name)
+	return marker_s, marker_c
+end
+
+test("a designation-only definition replicates exactly its designated target's pairs", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "GatedStatic")
+	local Other, COther = make_designation_marker(env, "GatedOther")
+
+	-- the definition's only mode source: pairs aimed at Static replicate, and nothing else the definition keys
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 11)
+	s.world:set(e, pair(Transform, Other), 22)
+	s.world:set(e, Transform, 33)
+	local packet = env.sync(env.player_a)
+
+	local designated = packet.components[pair(Transform, Static)]
+	expect(designated ~= nil and designated.values ~= nil and designated.values[1] == 11, "the designated pair ships")
+	expect_equal(packet.components[pair(Transform, Other)], nil, "the undesignated pair ships nothing")
+	expect_equal(packet.components[Transform], nil, "and neither does the bare component")
+
+	local le = c.net.get_client_entity(e)
+	expect(le ~= nil, "the subject itself replicated")
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 11, "the designated pair arrived with its value")
+	expect_equal(c.world:has(le, pair(CTransform, COther)), false, "the undesignated pair stayed server-side")
+	expect_equal(c.world:has(le, CTransform), false, "the bare component stayed server-side too")
+
+	-- the designation names Networked, so its target's pairs track their changes like any Networked cell
+	s.world:set(e, pair(Transform, Static), 44)
+	s.world:set(e, pair(Transform, Other), 55)
+	s.world:set(e, Transform, 66)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 44, "the designated pair tracks its changes")
+	expect_equal(c.world:has(le, pair(CTransform, COther)), false, "the undesignated pair still ships nothing")
+	expect_equal(c.world:has(le, CTransform), false, "and neither does the bare component")
+end)
+
+test("a joiner's full packet carries a designation-only definition's designated pairs alone", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "FullStatic")
+	local Other, COther = make_designation_marker(env, "FullOther")
+
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 7)
+	s.world:set(e, pair(Transform, Other), 8)
+	s.world:set(e, Transform, 9)
+
+	-- a full packet is built from live state rather than from staged deltas, so it resolves the designation
+	-- gate on its own path; the joiner reconciles into the standard client, which already maps both halves
+	local packet = env.join(fake_player("DesignationJoiner"))
+
+	expect_equal(packet.replicated[1], e, "the full packet announced the subject")
+	local designated = packet.components[pair(Transform, Static)]
+	expect(designated ~= nil and designated.values ~= nil and designated.values[1] == 7, "the designated pair ships")
+	expect_equal(packet.components[pair(Transform, Other)], nil, "the undesignated pair is absent from the full")
+	expect_equal(packet.components[Transform], nil, "and so is the bare component")
+
+	local le = c.net.get_client_entity(e)
+	expect(le ~= nil, "the joiner's full packet created the subject")
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 7, "the designated pair arrived with its value")
+	expect_equal(c.world:has(le, pair(CTransform, COther)), false, "the undesignated pair did not")
+	expect_equal(c.world:has(le, CTransform), false, "and neither did the bare component")
+end)
+
+test("a NetworkedOnce designation stops change tracking for exactly its target", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Once, COnce = make_designation_marker(env, "OnceDesignated")
+	local Other, COther = make_designation_marker(env, "OnceUndesignated")
+
+	s.world:add(Transform, s.net.Networked)
+	s.world:add(Transform, pair(s.net.NetworkedOnce, Once))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Once), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	s.world:set(e, Transform, 3)
+	env.sync(env.player_a)
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, COnce)), 1, "the designated pair's add carried its value")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "the undesignated pair replicated under the plain tag")
+	expect_equal(c.world:get(le, CTransform), 3, "and so did the bare component")
+
+	s.world:set(e, pair(Transform, Once), 10)
+	s.world:set(e, pair(Transform, Other), 20)
+	s.world:set(e, Transform, 30)
+	local packet = env.sync(env.player_a)
+
+	expect_equal(packet.components[pair(Transform, Once)], nil, "the designation suppressed its target's change")
+	expect_equal(c.world:get(le, pair(CTransform, COnce)), 1, "so the client holds the value the add shipped")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 20, "the plain tag's pairs tracked as always")
+	expect_equal(c.world:get(le, CTransform), 30, "and so did the bare component")
+
+	-- replicate-once means membership still replicates: only the value changes are suppressed
+	s.world:remove(e, pair(Transform, Once))
+	env.sync(env.player_a)
+	expect_equal(c.world:has(le, pair(CTransform, COnce)), false, "the designated pair's removal still replicates")
+end)
+
+test("a Networked designation tracks changes for exactly its target on a NetworkedOnce definition", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Live, CLive = make_designation_marker(env, "LiveOverOnce")
+	local Other, COther = make_designation_marker(env, "QuietUnderOnce")
+
+	s.world:add(Transform, s.net.NetworkedOnce)
+	s.world:add(Transform, pair(s.net.Networked, Live))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Live), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	s.world:set(e, Transform, 3)
+	env.sync(env.player_a)
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CLive)), 1, "every cell's add carried its initial value")
+
+	s.world:set(e, pair(Transform, Live), 10)
+	s.world:set(e, pair(Transform, Other), 20)
+	s.world:set(e, Transform, 30)
+	env.sync(env.player_a)
+
+	expect_equal(c.world:get(le, pair(CTransform, CLive)), 10, "the Networked designation tracked its target")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "while the plain NetworkedOnce tag suppressed the rest")
+	expect_equal(c.world:get(le, CTransform), 3, "the bare component included")
+end)
+
+test("a Networked designation pulls exactly its target off the unreliable channel", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Live, CLive = make_designation_marker(env, "LiveOverUnreliable")
+	local Other, COther = make_designation_marker(env, "StreamedUnderUnreliable")
+
+	s.world:add(Transform, s.net.NetworkedUnreliable)
+	s.world:add(Transform, pair(s.net.Networked, Live))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Live), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	s.world:set(e, Transform, 3)
+	env.sync(env.player_a)
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CLive)), 1, "every cell's membership add carried its value")
+
+	s.world:set(e, pair(Transform, Live), 10)
+	s.world:set(e, pair(Transform, Other), 20)
+	s.world:set(e, Transform, 30)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CLive)), 10, "the designated target's change rode the reliable path")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "the plain tag's pairs stayed off it")
+	expect_equal(c.world:get(le, CTransform), 3, "and so did the bare component")
+
+	-- the chunk pass reads the same per-target modes: everything the plain unreliable tag governs streams, and
+	-- the Networked-designated target's pairs -- already delivered reliably -- do not
+	local streamed = {}
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		local view = wire.decode_chunk(chunk, function()
+			return f64_serdes
+		end)
+		for _, section in view.sections do
+			streamed[section.component] = true
+		end
+	end
+	expect_equal(streamed[Transform], true, "the bare cells stream under the plain unreliable tag")
+	expect_equal(streamed[pair(Transform, Other)], true, "and so do the undesignated target's pairs")
+	expect_equal(streamed[pair(Transform, Live)], nil, "while the Networked-designated target's pairs do not")
+end)
+
+test("an unreliable designation ships membership reliably and streams its values", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Dynamic, CDynamic = make_designation_marker(env, "StreamedDynamic")
+
+	s.world:add(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Dynamic), 5)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 5, "the membership add carried the initial value")
+
+	-- the definition has no Networked mode anywhere, so no changed hook is connected at all: the raw map (not
+	-- env.frame) so the absence below reads as a missing packet rather than the blank-packet fallback
+	s.world:set(e, pair(Transform, Dynamic), 6)
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "the set produced no reliable packet at all")
+	expect_equal(packets[env.player_b], nil, "and none for the second viewer either")
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 5, "the client still holds what the add shipped")
+
+	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 6, "the unreliable channel carried the new value")
+end)
+
+test("chunks carry only the unreliably-designated target's pairs on a mixed definition", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "MixedStatic")
+	local Dynamic, CDynamic = make_designation_marker(env, "MixedDynamic")
+	local Other = make_designation_marker(env, "MixedOther")
+
+	-- three reliable cell shapes beside one streamed target: a Networked designation, an undesignated target
+	-- falling back to the plain tag, and the bare component
+	s.world:add(Transform, s.net.Networked)
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	s.world:add(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	s.world:set(e, pair(Transform, Dynamic), 2)
+	s.world:set(e, pair(Transform, Other), 3)
+	s.world:set(e, Transform, 4)
+	env.sync(env.player_a)
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "the reliable designation's add replicated")
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 2, "the streamed pair's membership add did too")
+
+	s.world:set(e, pair(Transform, Dynamic), 20)
+	local chunks = s.net.generate_unreliable_chunks()[env.player_a]
+	expect(chunks ~= nil, "the unreliably-designated pair streams")
+
+	local sections = 0
+	for _, chunk in chunks do
+		local view = wire.decode_chunk(chunk, function()
+			return f64_serdes
+		end)
+		for _, section in view.sections do
+			sections += 1
+			expect_equal(section.relation, jecs.ECS_ID(Transform), "the streamed section belongs to the relation")
+			expect_equal(section.target, jecs.ECS_ID(Dynamic), "...aimed at the unreliably-designated target alone")
+		end
+	end
+	expect_equal(sections, 1, "no reliable-designated or plain-tagged cell of the definition streamed")
+
+	for _, chunk in chunks do
+		c.net.reconcile_chunk(chunk)
+	end
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 20, "the chunk applied the streamed value")
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "and left the reliable designation's cell alone")
+end)
+
+test("guard: two modes designating one target error and leave the first designation standing", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "ConflictStatic")
+
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	expect_error(function()
+		s.world:add(Transform, pair(s.net.NetworkedOnce, Static))
+	end, "designating one target with a second mode", "designations are exclusive per target")
+	expect_equal(
+		s.world:has(Transform, pair(s.net.NetworkedOnce, Static)),
+		false,
+		"the refused designation was removed by the guard before erroring"
+	)
+	expect_equal(
+		s.world:has(Transform, pair(s.net.Networked, Static)),
+		true,
+		"the designation it collided with is left in place"
+	)
+
+	-- and the incumbent designation still governs the target, Networked semantics included
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "the surviving designation still replicates its pairs")
+
+	s.world:set(e, pair(Transform, Static), 2)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 2, "and still tracks their changes")
+end)
+
+test("guard: a designation may not name jecs.Wildcard", function(env)
+	local s = env.server
+	local Transform = make_designation_relation(env)
+	local Static = make_designation_marker(env, "WildcardStatic")
+
+	-- the definition holds no pair of the tag yet, so the wildcard pair genuinely stores and the guard fires
+	expect_error(function()
+		s.world:add(Transform, pair(s.net.Networked, jecs.Wildcard))
+	end, "designating jecs.Wildcard", "designations must name a concrete target")
+	expect_equal(
+		s.world:has(Transform, pair(s.net.Networked, jecs.Wildcard)),
+		false,
+		"the wildcard pair was removed by the guard before erroring"
+	)
+	expect_equal(s.world:target(Transform, s.net.Networked, 0), nil, "the refusal left no designation behind")
+
+	-- the jecs quirk the guard cannot cover: with a designation already present, world:add reads the wildcard
+	-- pair as "has any pair of this relation" and returns early -- storing nothing and firing no hook -- so
+	-- there is no add for the guard to refuse
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	s.world:add(Transform, pair(s.net.Networked, jecs.Wildcard))
+	expect_equal(s.world:target(Transform, s.net.Networked, 0), Static, "the concrete designation is untouched")
+	expect_equal(s.world:target(Transform, s.net.Networked, 1), nil, "and the wildcard add stored no second pair")
+end)
+
+test("guard: a designation is rejected on Replicated entities", function(env)
+	local s, c = env.server, env.client
+	local Static = make_designation_marker(env, "RejectedStatic")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 30)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect(le ~= nil, "the entity replicated before the refused add")
+
+	expect_error(function()
+		s.world:add(e, pair(s.net.Networked, Static))
+	end, "designating a target on a Replicated entity", "cannot add Networked to replicated entities")
+	expect_equal(
+		s.world:has(e, pair(s.net.Networked, Static)),
+		false,
+		"the designation was removed by the guard before erroring"
+	)
+	-- the guard undoes the offending add, never the role it collided with
+	expect_equal(s.world:has(e, s.net.Replicated), true, "the Replicated tag is left in place")
+
+	local packet = env.sync(env.player_a)
+	expect_equal(#packet.unreplicated, 0, "the refused add announced no deletion")
+	expect_equal(next(packet.components), nil, "and staged no change of any kind")
+
+	s.world:set(e, s.defs.Health, 31)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, c.defs.Health), 31, "the entity goes on replicating after the refusal")
+end)
+
+test("guard: Replicated is rejected on a definition tracked only through designations", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Once, COnce = make_designation_marker(env, "DesignationOnlyOnce")
+
+	-- the error names whichever tag owns the tracking, which for a designation-only definition is the
+	-- designating tag rather than Networked
+	s.world:add(Transform, pair(s.net.NetworkedOnce, Once))
+	expect_error(function()
+		s.world:add(Transform, s.net.Replicated)
+	end, "replicating a designation-only definition", "NetworkedOnce components cannot be replicated")
+	expect_equal(s.world:has(Transform, s.net.Replicated), false, "Replicated removed by the guard before erroring")
+	expect_equal(
+		s.world:has(Transform, pair(s.net.NetworkedOnce, Once)),
+		true,
+		"the designation the error named survives"
+	)
+
+	-- a real gameplay entity in the same frame anchors the packet, so the replicated list reads as the
+	-- definition's absence rather than as an absent packet
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Once), 4)
+	local packet = env.sync(env.player_a)
+	expect_equal(#packet.replicated, 1, "only the gameplay entity is announced as replicated")
+	expect_equal(packet.replicated[1], e, "and it is the one that actually carries Replicated")
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, COnce)), 4, "the refused definition still replicates its pairs")
+end)
+
+test("a designation naming the plain tag's own mode is accepted", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "PinnedStatic")
+	local Other, COther = make_designation_marker(env, "PinnedOther")
+
+	-- pinning a target to the mode the plain tag already names is legal and silent: it fixes that target
+	-- against later changes to the plain tag
+	s.world:add(Transform, s.net.Networked)
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	s.world:set(e, Transform, 3)
+	env.sync(env.player_a)
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "the pinned target's pairs replicate")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "and so does everything the plain tag governs")
+
+	s.world:set(e, pair(Transform, Static), 10)
+	s.world:set(e, pair(Transform, Other), 20)
+	s.world:set(e, Transform, 30)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 10, "the pinned target tracks like any Networked cell")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 20, "the undesignated target too")
+	expect_equal(c.world:get(le, CTransform), 30, "and the bare component")
+end)
+
+test("a same-mode designation added to a tracked definition ships nothing", function(env)
+	local s = env.server
+	local Transform = make_designation_relation(env)
+	local Static = make_designation_marker(env, "QuietStatic")
+
+	s.world:add(Transform, s.net.Networked)
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	s.world:set(e, Transform, 2)
+	env.sync(env.player_a)
+
+	-- a mode change ships nothing while a pair stays replicated, and this one does not even change the mode:
+	-- the raw map (not env.frame) so the absences read as missing packets rather than blank-packet fallbacks
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "the designation produced no packet at all")
+	expect_equal(packets[env.player_b], nil, "and none for the second viewer either")
+end)
+
+test("removing an unreliable designation restages its target's pairs", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Dynamic, CDynamic = make_designation_marker(env, "RestagedDynamic")
+
+	s.world:add(Transform, s.net.Networked)
+	s.world:add(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Dynamic), 1)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 1, "the membership add carried the initial value")
+
+	-- the chunks holding this value are never generated, standing in for the dropped final chunk the restage
+	-- exists to repair: without it the client would sit on the stale value until the cell next changed
+	s.world:set(e, pair(Transform, Dynamic), 2)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 1, "the streamed change never reached the client")
+
+	s.world:remove(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
+	local packet = env.sync(env.player_a)
+	local restaged = packet.components[pair(Transform, Dynamic)]
+	expect(restaged ~= nil and restaged.values ~= nil and restaged.values[1] == 2, "leaving unreliable restages")
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 2, "so the reliable baseline is fresh again")
+
+	-- and the pairs now follow the plain tag they fell back to
+	s.world:set(e, pair(Transform, Dynamic), 3)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 3, "the pairs track under the plain Networked tag")
+end)
+
+test("a designation added over a plain NetworkedUnreliable tag restages its target's pairs", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "RestagedStatic")
+
+	s.world:add(Transform, s.net.NetworkedUnreliable)
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "the membership add carried the initial value")
+
+	s.world:set(e, pair(Transform, Static), 2)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "the streamed change never reached the client")
+
+	-- the same transition from the other direction: the designation moves the target's pairs out of streaming
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 2, "the designation restaged the current value")
+end)
+
+test("removing a designation stops exactly its target's pairs", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "DroppedStatic")
+	local Other, COther = make_designation_marker(env, "KeptOther")
+
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	s.world:add(Transform, pair(s.net.Networked, Other))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "both designated targets replicated")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "...")
+
+	-- with no plain tag to fall back to, the removal stops the target's pairs outright
+	s.world:remove(Transform, pair(s.net.Networked, Static))
+	local packet = env.sync(env.player_a)
+	local dropped = packet.components[pair(Transform, Static)]
+	expect(dropped ~= nil and dropped.removed ~= nil and dropped.removed[1] == e, "the pairs ship explicit removals")
+	expect_equal(packet.components[pair(Transform, Other)], nil, "the other designation stages nothing")
+	expect_equal(c.world:has(le, pair(CTransform, CStatic)), false, "the removed designation's pairs are gone")
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 2, "while the other designation's pairs survive")
+
+	s.world:set(e, pair(Transform, Other), 9)
+	s.world:set(e, pair(Transform, Static), 9)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, COther)), 9, "the surviving designation still tracks")
+	expect_equal(c.world:has(le, pair(CTransform, CStatic)), false, "and the undesignated target stays server-side")
+end)
+
+test("removing the plain tag leaves the designated pairs replicating", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "SurvivingStatic")
+	local Other, COther = make_designation_marker(env, "DroppedOther")
+
+	s.world:add(Transform, s.net.Networked)
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 1)
+	s.world:set(e, pair(Transform, Other), 2)
+	s.world:set(e, Transform, 3)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, CTransform), 3, "the bare component replicated under the plain tag")
+
+	s.world:remove(Transform, s.net.Networked)
+	env.sync(env.player_a)
+	expect_equal(c.world:has(le, CTransform), false, "the bare cells stop with the plain tag")
+	expect_equal(c.world:has(le, pair(CTransform, COther)), false, "so do the undesignated target's pairs")
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 1, "while the designated target's pairs stand")
+
+	s.world:set(e, pair(Transform, Static), 9)
+	s.world:set(e, pair(Transform, Other), 9)
+	s.world:set(e, Transform, 9)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 9, "the designation still tracks its target")
+	expect_equal(c.world:has(le, pair(CTransform, COther)), false, "the undesignated target stays server-side")
+	expect_equal(c.world:has(le, CTransform), false, "and so does the bare component")
+end)
+
+test("an unreplicable designated target warns once, at the first pair aimed at it", function(env)
+	local s = env.server
+	local Transform = make_designation_relation(env)
+
+	-- a marker that was never named (nor replicated) can never ship its pairs, which for a designated target
+	-- is almost always a missing jecs.Name rather than deliberate gameplay state
+	local orphan = s.world:entity()
+	s.world:add(Transform, pair(s.net.Networked, orphan))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	expected_warning("is neither Replicated nor named! pairs aimed at it cannot replicate")
+	s.world:set(e, pair(Transform, orphan), 1)
+
+	-- once per designation, not once per pair: the second subject is silent
+	local e2 = s.world:entity()
+	s.world:add(e2, s.net.Replicated)
+	s.world:set(e2, pair(Transform, orphan), 2)
+
+	-- and an *undesignated* unreplicable target stays silent by design, designation or no designation
+	local quiet = s.world:entity()
+	s.world:set(e, pair(Transform, quiet), 3)
+
+	local packet = env.sync(env.player_a)
+	expect_equal(#packet.replicated, 2, "both subjects replicated, so this is a real packet")
+	expect_equal(packet.components[pair(Transform, orphan)], nil, "the unreplicable target's pairs ship nothing")
+	expect_equal(packet.components[pair(Transform, quiet)], nil, "nor do the undesignated target's")
+end)
+
+test("a designation landing over existing pairs warns for an unreplicable target", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static = make_designation_marker(env, "WarningStatic")
+
+	-- the definition already tracks through a designation of its own, so the add below takes the
+	-- already-tracked path rather than the first-tracking one
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	-- the pairs exist first, and stay silent while their target is undesignated
+	local orphan = s.world:entity()
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, orphan), 1)
+
+	expected_warning("is neither Replicated nor named! pairs aimed at it cannot replicate")
+	s.world:add(Transform, pair(s.net.Networked, orphan))
+
+	-- the designation is kept rather than refused, since naming the target later is what completes it: the
+	-- pairs then replicate from the next packet with no re-add of any kind
+	expect_equal(s.world:has(Transform, pair(s.net.Networked, orphan)), true, "the warned designation is kept")
+	local corphan = c.world:entity()
+	c.net.set_client_entity(orphan, corphan)
+	s.world:set(orphan, jecs.Name, "AdoptedOrphan")
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, corphan)), 1, "naming the target makes its designated pairs ship")
+end)
+
+test("a designation's removal re-arms the unreplicable-target warning", function(env)
+	local s = env.server
+	local Transform = make_designation_relation(env)
+
+	local orphan = s.world:entity()
+	s.world:add(Transform, pair(s.net.Networked, orphan))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	expected_warning("is neither Replicated nor named! pairs aimed at it cannot replicate")
+	s.world:set(e, pair(Transform, orphan), 1)
+
+	-- the designation was the definition's only mode source, so its removal stops the tracking outright and
+	-- re-arms the warning; designating the same target again walks the existing pairs and warns anew
+	s.world:remove(Transform, pair(s.net.Networked, orphan))
+	expected_warning("is neither Replicated nor named! pairs aimed at it cannot replicate")
+	s.world:add(Transform, pair(s.net.Networked, orphan))
+end)
+
+test("jecs.Exclusive retargeting swaps a pair's mode in one set", function(env)
+	local s, c = env.server, env.client
+	local Transform, CTransform = make_designation_relation(env)
+	local Static, CStatic = make_designation_marker(env, "ExclusiveStatic")
+	local Dynamic, CDynamic = make_designation_marker(env, "ExclusiveDynamic")
+
+	-- the shape the feature exists for: one relation, one pair per entity, and a mode per marker
+	s.world:add(Transform, jecs.Exclusive)
+	s.world:add(Transform, pair(s.net.Networked, Static))
+	s.world:add(Transform, pair(s.net.NetworkedUnreliable, Dynamic))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Dynamic), 1)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CDynamic)), 1, "the streamed pair's membership add replicated")
+	expect(s.net.generate_unreliable_chunks()[env.player_a] ~= nil, "and it streams while it stands")
+
+	-- Exclusive makes the retarget a single set: the old pair is displaced and the new one added with its value
+	s.world:set(e, pair(Transform, Static), 7)
+	local packet = env.sync(env.player_a)
+	local departed = packet.components[pair(Transform, Dynamic)]
+	expect(departed ~= nil and departed.removed ~= nil and departed.removed[1] == e, "the old pair ships its removal")
+	local arrived = packet.components[pair(Transform, Static)]
+	expect(arrived ~= nil and arrived.values ~= nil and arrived.values[1] == 7, "the new pair ships with its value")
+
+	expect_equal(c.world:has(le, pair(CTransform, CDynamic)), false, "the client dropped the streamed pair")
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 7, "and holds the reliable one with its value")
+	expect_equal(next(s.net.generate_unreliable_chunks()), nil, "the departed pair stops streaming")
+
+	s.world:set(e, pair(Transform, Static), 8)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 8, "the reliable pair tracks its changes")
+end)
+
+test("a designation tagged beside a plain tag before construction replays both from the catch-up", function()
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+
+	local Transform = world:component()
+	local Once = world:entity()
+	world:set(Once, jecs.Name, "CatchUpOnce")
+	local Other = world:entity()
+	world:set(Other, jecs.Name, "CatchUpOther")
+
+	world:add(Transform, components.Networked)
+	world:add(Transform, pair(components.NetworkedOnce, Once))
+
+	local entity = world:entity()
+	world:add(entity, components.Replicated)
+	world:set(entity, pair(Transform, Once), 1)
+	world:set(entity, pair(Transform, Other), 2)
+	world:set(entity, Transform, 3)
+
+	local net = duplecs.server(world)
+	local player = fake_player("CatchUpMixedViewer")
+	net.add_client(player)
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	local client_transform = client_world:component()
+	client_net.set_client_entity(Transform, client_transform)
+	local client_once = client_world:entity()
+	client_net.set_client_entity(Once, client_once)
+	local client_other = client_world:entity()
+	client_net.set_client_entity(Other, client_other)
+
+	client_net.reconcile_packet(deep_copy(net.generate_packets()[player]))
+
+	local le = client_net.get_client_entity(entity)
+	expect(le ~= nil, "the joiner's full packet created the subject")
+	expect_equal(client_world:get(le, pair(client_transform, client_once)), 1, "the designated pair replayed")
+	expect_equal(client_world:get(le, pair(client_transform, client_other)), 2, "the undesignated pair replayed too")
+	expect_equal(client_world:get(le, client_transform), 3, "and so did the bare component")
+
+	-- the replayed modes govern exactly as a post-construction schema's would
+	world:set(entity, pair(Transform, Once), 10)
+	world:set(entity, pair(Transform, Other), 20)
+	world:set(entity, Transform, 30)
+	client_net.reconcile_packet(deep_copy(net.generate_packets()[player]))
+	expect_equal(client_world:get(le, pair(client_transform, client_once)), 1, "the designation suppressed its target")
+	expect_equal(client_world:get(le, pair(client_transform, client_other)), 20, "while the plain tag's pairs tracked")
+	expect_equal(client_world:get(le, client_transform), 30, "and so did the bare component")
+end)
+
+test("a designation-only definition announces its name, and its marker maps by name", function(env)
+	local s, c = env.server, env.client
+
+	-- neither half is mapped with set_client_entity here: the announcements the designation makes -- for the
+	-- relation itself, and for the marker its first tracked pair aims at -- are what map them
+	local Transform = s.world:component()
+	s.world:set(Transform, jecs.Name, "AnnouncedTransform")
+	local CTransform = c.world:component()
+	c.world:set(CTransform, jecs.Name, "AnnouncedTransform")
+
+	local Static = s.world:entity()
+	s.world:set(Static, jecs.Name, "AnnouncedStatic")
+	local CStatic = c.world:entity()
+	c.world:set(CStatic, jecs.Name, "AnnouncedStatic")
+
+	s.world:add(Transform, pair(s.net.Networked, Static))
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, pair(Transform, Static), 5)
+	local packet = env.sync(env.player_a)
+
+	expect_equal(packet.names[Transform], "AnnouncedTransform", "the designation-only definition announced its name")
+	expect_equal(packet.names[Static], "AnnouncedStatic", "and so did the marker its pairs aim at")
+	expect_equal(c.net.get_client_entity(Transform), CTransform, "the client mapped the relation by name")
+	expect_equal(c.net.get_client_entity(Static), CStatic, "and the marker too")
+
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 5, "so the designated pair resolved on the client")
 end)
 
 -- runner

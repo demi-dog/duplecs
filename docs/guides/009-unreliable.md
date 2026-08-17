@@ -60,6 +60,8 @@ On the reliable path an unreliable component tracks like `NetworkedOnce`: the **
 
 Pairs using the component as the relation stream too. A **tag** relation can be `NetworkedUnreliable` as well: its pairs with data-component targets carry target-typed values, with [serdes hooks derived from the target's registration](008-serdes.md) — so per-target amounts like `pair(Stockpiles, Gold)` can stream every frame with no serdes ceremony beyond the target's own. The tag's valueless cells — the bare tag, and pairs targeting tags or plain entities — carry nothing to stream, so they simply stay on the reliable path, exactly as they would under `Networked`.
 
+A relation's pairs can also stream **selectively**: `pair(NetworkedUnreliable, Dynamic)` beside `pair(Networked, Static)` on one definition streams only the pairs aimed at `Dynamic`, with `Static` pairs staying reliable — and `jecs.Exclusive` retargeting flips an entity between the two in one set. See [target-specific modes](003-pairs.md#target-specific-modes).
+
 ## Why drops don't matter
 
 The channel is drop- and reorder-tolerant by construction, with no bookkeeping on your side:

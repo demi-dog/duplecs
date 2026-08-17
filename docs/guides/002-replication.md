@@ -58,7 +58,7 @@ net.force_replicate(corpse, RespawnAt)
 
 The third mode is for values that change every frame (e.g. positions, velocities): membership stays on the reliable path like `NetworkedOnce`, while current values are re-read and re-sent by every `generate_unreliable_chunks` call through an unreliable transport. `world:set` costs nothing on the server, and a dropped packet costs one frame of staleness. This mode has its own setup requirements (serdes hooks, a second remote) — see [Unreliable values](009-unreliable.md).
 
-The three tracking tags are mutually exclusive on one definition; pick per component. As a rule of thumb:
+The three tracking tags are mutually exclusive on one definition; pick per component — or per pair target, for a relation whose pairs should replicate differently by target (see [target-specific modes](003-pairs.md#target-specific-modes)). As a rule of thumb:
 
 | Mode | Value changes | Fits |
 | --- | --- | --- |
