@@ -38,7 +38,12 @@ export type RemovedOverride = client.RemovedOverride
 return {
 	server = server,
 	client = client,
-	shared = function(world: types.World)
-		return shared(world).components
+	-- nil selects pre-registration mode: the set is minted through jecs's own top-level pre-registration
+	-- methods before any world exists, and every world created afterwards holds it (see shared.luau).
+	shared = function(world: types.World?)
+		if world == nil then
+			return shared.preregister()
+		end
+		return shared.get_record(world).components
 	end,
 }

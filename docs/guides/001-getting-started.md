@@ -58,6 +58,30 @@ end
 
 `PoisonTickTimer` shows a convention worth adopting: you can define *every* component in a shared module, even ones only one side uses. An untagged definition is inert — it costs nothing on the side that never touches it — and every component your game has stays legible in one place.
 
+### Alternative: pre-registering before any world
+
+jecs also supports defining components **before any world exists**, through its top-level `jecs.component()` / `jecs.tag()` / `jecs.meta()` — every world created afterwards then holds them. If your schema modules use that style, `duplecs.shared(nil)` gives you the duplecs set the same way, and the module stops being a function of the world entirely:
+
+```lua
+-- shared/components.luau -- pre-registration style: no world in sight
+local jecs = require("./roblox_packages/jecs")
+local duplecs = require("./roblox_packages/duplecs")
+
+local net = duplecs.shared(nil)
+
+local Health = jecs.component() :: jecs.Entity<number>
+jecs.meta(Health, jecs.Name, "Health")
+jecs.meta(Health, net.Networked)
+
+jecs.meta(jecs.ChildOf, net.Networked)
+
+return {
+	Health = Health,
+}
+```
+
+Both sides simply require the module before creating their world (`local c = require("./shared/components")` — no call), and `duplecs.server(world)` / `duplecs.client(world)` pick everything up as usual. The two styles behave identically on the wire, so one side can even use one style and the other side the other. The rule to respect is jecs's own: **pre-registration must run before `jecs.world()`** — all of it, yours and duplecs's. A world created too early errors at its first duplecs contact for duplecs's set, but duplecs can't see yours, so keep the whole schema module ahead of world creation. The rest of this guide uses the function-of-world style; everything shown works the same either way.
+
 ## Server setup
 
 `duplecs.server(world)` returns the server half of duplecs for a world. The first call constructs the server half, creates its hooks, and picks up anything already tagged. All subsequent calls then return that same instance, so any system can call it directly instead of passing the instance around. Tracking is live from construction, with nothing further to call before the first `generate_packets`.

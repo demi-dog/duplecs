@@ -2215,8 +2215,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- SERDES
 
-	-- the per-world serdes store (see shared.luau / serdes.luau): its Serdes component and validation hooks
-	-- predate every possible registration, so there is nothing to catch up on here
+	-- the per-world serdes store (see shared.luau / serdes.luau): registrations validate at their own call
+	-- site, or -- pre-registered ones, which the store replays at its construction -- from the world's first
+	-- duplecs contact, so this half needs no serdes catch-up of its own
 	local Serdes = components.Serdes
 
 	-- CLIENT SLOTS
@@ -4476,7 +4477,7 @@ export type ServerInstance = typeof(create_server(nil :: any, nil :: any))
 -- catch-up walks) simply propagates with nothing memoized: it is a programming bug to stop and fix, not a
 -- state to recover from.
 return function(world: World): ServerInstance
-	local shared_record = get_shared(world)
+	local shared_record = get_shared.get_record(world)
 	local instance = shared_record.server
 	if instance ~= nil then
 		return instance :: ServerInstance

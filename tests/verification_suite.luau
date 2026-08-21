@@ -281,7 +281,7 @@ local function make_env()
 	-- -- dense component/relation ids and pairs packed from dense halves -- which
 	-- is exactly how the store keys pairs, and test definition entities are
 	-- generation 0, so a dense definition id is its own store key too.
-	local resolve_serdes = shared(world).resolve_serdes
+	local resolve_serdes = shared.get_record(world).resolve_serdes
 
 	local function frame()
 		local packets = net.generate_packets()
@@ -15473,6 +15473,352 @@ test("a designation-only definition announces its name, and its marker maps by n
 	local le = c.net.get_client_entity(e)
 	expect_equal(c.world:get(le, pair(CTransform, CStatic)), 5, "so the designated pair resolved on the client")
 end)
+
+-- 34) pre-registration (duplecs.shared(nil))
+
+-- duplecs.shared(nil) mints the component set through jecs's own top-level pre-registration methods --
+-- jecs.component, jecs.tag, and jecs.meta, all of which must run before any jecs.world call -- so a schema
+-- module written in that style can name definitions, tag them Networked, and register their Serdes hooks at
+-- definition time, with no world in sight. jecs replays pre-registration into every world created afterwards,
+-- and such a world's first duplecs contact then *recognizes* the set -- every accessor handing back the very
+-- table the nil call returned -- instead of minting a per-world one. the tests below cover the minting and
+-- its memo, the recognition, a full round trip driven entirely by pre-registered schema, the two serdes
+-- shapes only pre-registration can produce before a store exists, the InheritsPrivacy cleanup policy the
+-- meta buffer carries, and the two guards.
+--
+-- THIS SECTION MUST STAY LAST IN THE FILE, AND NO TEST THAT CREATES A WORLD MAY BE ADDED AFTER IT. jecs's
+-- pre-registration state is module-global -- its id counters and its meta buffer both -- so the first
+-- duplecs.shared(nil) call below silently flips every world created afterwards, anywhere in the process, into
+-- recognized mode, and the runner builds one env per test whichever section that test sits in. the section's
+-- final test goes further still: it leaves a *misused* serdes registration in the meta buffer permanently, so
+-- every world created past it errors at its own first duplecs contact. see the loud note on that test.
+
+-- created here, at load time, so it necessarily predates the first duplecs.shared(nil) call any test below
+-- makes: jecs replays pre-registration only into worlds created after it, so this is the world the
+-- recognition guard has to refuse (the guard test near the end of the section).
+local preregistration_early_world = jecs.world()
+
+-- the mechanical backstop for the note above: assigned once the section's last test has registered, and
+-- asserted from inside that test, so a test appended below the section fails here naming the cause rather
+-- than only tripping over the poisoned env it would be handed.
+local preregistration_test_count = nil
+
+-- the pre-registered schema, minted once for the whole section by whichever test asks for it first. it is one
+-- shared fixture rather than a per-test one because jecs's counters and meta buffer are module-global: a
+-- second schema would pile onto the same buffer and replay into every later world alongside the first.
+local preregistered_schema = nil
+
+local function preregister_schema()
+	if preregistered_schema ~= nil then
+		return preregistered_schema
+	end
+
+	local net = duplecs.shared(nil)
+
+	-- a networked data component with sizeless serdes hooks. the whole registration -- name, tag, and hooks --
+	-- is buffered here and replayed into both sides' worlds at their creation, so neither side wires anything
+	-- up per world, and the identical names are what map the definition across the boundary.
+	local Health = jecs.component()
+	jecs.meta(Health, jecs.Name, "PreregHealth")
+	jecs.meta(Health, net.Networked)
+	jecs.meta(Health, net.Serdes, f64_serdes)
+
+	-- a networked data relation whose pairs aimed at one marker carry pair-specific hooks: the meta replay
+	-- creates the pair(Serdes, Marker) record at world creation, before the serdes store connects its hooks at
+	-- the world's first duplecs contact -- exactly the pair-records-predate-registration shape src/hooks.luau
+	-- repairs.
+	local Likes = jecs.component()
+	jecs.meta(Likes, jecs.Name, "PreregLikes")
+	jecs.meta(Likes, net.Networked)
+	local Marker = jecs.tag()
+	jecs.meta(Marker, jecs.Name, "PreregMarker")
+	jecs.meta(Likes, pair(net.Serdes, Marker), f64_serdes)
+
+	-- an unreliable tag relation plus a data target: jecs types a tag relation's pair data by the target, so
+	-- the target's own registration is what encodes the pair's values.
+	local TagRel = jecs.tag()
+	jecs.meta(TagRel, jecs.Name, "PreregTagRel")
+	jecs.meta(TagRel, net.NetworkedUnreliable)
+	local Gold = jecs.component()
+	jecs.meta(Gold, jecs.Name, "PreregGold")
+	jecs.meta(Gold, net.Serdes, f64_serdes)
+
+	-- a built-in relation tagged the same way, networked in every world created afterwards
+	jecs.meta(jecs.ChildOf, net.Networked)
+
+	preregistered_schema = {
+		net = net,
+		Health = Health,
+		Likes = Likes,
+		Marker = Marker,
+		TagRel = TagRel,
+		Gold = Gold,
+	}
+	return preregistered_schema
+end
+
+test("duplecs.shared(nil) mints one frozen component set for the whole process", function(env)
+	-- the runner builds this test's env before the body runs, so its worlds -- and the set they minted -- are
+	-- the last per-world ones this process produces. that makes them the right thing to compare the entries
+	-- against: the two modes differ only in where the ids come from.
+	local per_world = duplecs.shared(env.server.world)
+
+	local net = preregister_schema().net
+	expect_equal(table.isfrozen(net), true, "the pre-registered set is frozen, like a per-world one")
+	expect_equal(duplecs.shared(nil), net, "a repeated nil call returns the same set")
+
+	-- a different table, but not necessarily different numbers: both modes draw their two data components from
+	-- a component range that starts at 1, so Private and Serdes routinely collide numerically across them --
+	-- which is exactly the corruption the recognition guard further down refuses a too-early world over
+	expect(net ~= per_world, "the pre-registered set is its own table, not the last per-world one")
+
+	for key in per_world do
+		expect(net[key] ~= nil, `the pre-registered set is missing {key}`)
+	end
+	local walked = 0
+	for key in net do
+		expect(per_world[key] ~= nil, `the pre-registered set carries {key}, which a per-world set does not`)
+		walked += 1
+	end
+	expect(walked > 0, "the pre-registered set is empty")
+end)
+
+test("a world created after pre-registration recognizes the set instead of minting one", function()
+	local schema = preregister_schema()
+	local net = schema.net
+
+	-- whichever accessor makes the world's first contact recognizes the set, and every accessor hands back the
+	-- very table the nil call returned rather than an equal one
+	local server_world = jecs.world()
+	expect_equal(duplecs.shared(server_world), net, "the shared accessor recognized the pre-registered set")
+	local server_net = duplecs.server(server_world)
+	expect_equal(server_net.Networked, net.Networked, "the server half returns the pre-registered ids")
+	expect_equal(server_net.Serdes, net.Serdes, "Serdes included")
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	expect_equal(duplecs.shared(client_world), net, "and so does a world whose first contact is the client half")
+	expect_equal(client_net.Imported, net.Imported, "the client half returns the pre-registered ids")
+
+	-- the dotted names ride the meta buffer, so both worlds carry them without either side setting anything
+	for name, component in net do
+		expect_equal(server_world:get(component, jecs.Name), `duplecs.{name}`, `server world: {name}'s jecs.Name`)
+		expect_equal(client_world:get(component, jecs.Name), `duplecs.{name}`, `client world: {name}'s jecs.Name`)
+	end
+
+	-- and so does the user schema tagged against it, tracking tag and all
+	expect_equal(server_world:get(schema.Health, jecs.Name), "PreregHealth", "the schema's own name replayed")
+	expect_equal(client_world:get(schema.Health, jecs.Name), "PreregHealth", "into both worlds alike")
+	expect_equal(server_world:has(schema.Health, net.Networked), true, "and so did its tracking tag")
+	expect_equal(client_world:has(schema.Health, net.Networked), true, "inert on the client, but present")
+end)
+
+test("a pre-registered schema round-trips between worlds created after it", function()
+	local schema = preregister_schema()
+	local net = schema.net
+
+	local world = jecs.world()
+	local server_net = duplecs.server(world)
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+
+	-- nothing below is mapped with set_client_entity: one pre-registration configured both worlds, so the
+	-- definitions carry identical jecs.Names on either side and the server's announcements bind them
+	local parent = world:entity()
+	local child = world:entity()
+	world:add(parent, net.Replicated)
+	world:add(child, net.Replicated)
+	world:set(child, schema.Health, 100)
+	world:add(child, pair(jecs.ChildOf, parent))
+
+	local player = fake_player("PreregViewer")
+	server_net.add_client(player)
+	local resolve_serdes = shared.get_record(world).resolve_serdes
+	local function sync()
+		local raw = server_net.generate_packets()[player]
+		if raw == nil then
+			return nil
+		end
+		local packet = decode_packet(deep_copy(raw), resolve_serdes)
+		client_net.reconcile_packet(packet)
+		return packet
+	end
+
+	local packet = sync()
+	expect(packet ~= nil, "the joiner received a full packet")
+	expect_equal(#packet.replicated, 2, "the full packet announces both entities")
+	-- the pre-registered hooks are what put the value in the packet's buffer; without them it would ride the
+	-- side array instead, so this is the assertion that the replayed registration reached the store
+	expect_equal(packet.values, nil, "the pre-registered serdes hooks packed the value inline")
+	for _, flags in raw_section_flags(packet) do
+		expect_equal(bit32.band(flags, flag_side_values), 0, "no section fell back to the side array")
+	end
+	local data = packet.components[schema.Health]
+	expect(data ~= nil and data.values ~= nil and data.values[1] == 100, "the inline value decoded in the merged view")
+
+	local le_child = client_net.get_client_entity(child)
+	local le_parent = client_net.get_client_entity(parent)
+	expect(le_child ~= nil and le_parent ~= nil, "the joiner's full packet created both entities")
+	expect_equal(client_world:get(le_child, schema.Health), 100, "the serdes value decoded on the client")
+	expect_equal(client_world:has(le_child, pair(jecs.ChildOf, le_parent)), true, "the ChildOf pair replicated")
+
+	world:set(child, schema.Health, 55)
+	expect(sync() ~= nil, "the edit shipped a delta")
+	expect_equal(client_world:get(le_child, schema.Health), 55, "the delta applied on the client")
+end)
+
+test("a pre-registered pair-specific serdes registration encodes its relation's pairs", function()
+	local schema = preregister_schema()
+	local net = schema.net
+
+	local world = jecs.world()
+	local server_net = duplecs.server(world)
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+
+	-- the pre-registered pair(Serdes, Marker) gives Serdes a pair record from world creation, before the store
+	-- connects its hooks -- the shape jecs 0.11.0 drops the *unpaired* record's broadcast on (see
+	-- src/hooks.luau). so a runtime unpaired registration rides along here as the regression check: if the
+	-- workaround stopped repairing that, Mana's hooks would never reach the store and its value would fall back
+	-- to the side array below.
+	local Mana = world:component()
+	world:set(Mana, jecs.Name, "PreregRuntimeMana")
+	world:add(Mana, net.Networked)
+	world:set(Mana, net.Serdes, f64_serdes)
+	local client_mana = client_world:component()
+	client_world:set(client_mana, jecs.Name, "PreregRuntimeMana")
+	client_world:set(client_mana, net.Serdes, f64_serdes)
+
+	local subject = world:entity()
+	world:add(subject, net.Replicated)
+	world:set(subject, pair(schema.Likes, schema.Marker), 12.5)
+	world:set(subject, Mana, 3.5)
+
+	local player = fake_player("PreregPairViewer")
+	server_net.add_client(player)
+	local resolve_serdes = shared.get_record(world).resolve_serdes
+	local packet = decode_packet(deep_copy(server_net.generate_packets()[player]), resolve_serdes)
+	client_net.reconcile_packet(packet)
+
+	expect_equal(packet.values, nil, "both the pre-registered pair hooks and the runtime unpaired ones packed inline")
+
+	local le = client_net.get_client_entity(subject)
+	expect(le ~= nil, "the joiner's full packet created the subject")
+	expect_equal(
+		client_world:get(le, pair(schema.Likes, schema.Marker)),
+		12.5,
+		"the pair decoded through its pre-registered pair-specific hooks"
+	)
+	expect_equal(client_world:get(le, client_mana), 3.5, "and the runtime unpaired registration round-tripped too")
+
+	world:set(subject, pair(schema.Likes, schema.Marker), 20.5)
+	local delta = decode_packet(deep_copy(server_net.generate_packets()[player]), resolve_serdes)
+	client_net.reconcile_packet(delta)
+	expect_equal(delta.values, nil, "the delta's pair value packed inline as well")
+	expect_equal(client_world:get(le, pair(schema.Likes, schema.Marker)), 20.5, "the delta applied on the client")
+end)
+
+test("a pre-registered unreliable tag relation streams through its target's hooks", function()
+	local schema = preregister_schema()
+	local net = schema.net
+
+	local world = jecs.world()
+	local server_net = duplecs.server(world)
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+
+	local e = world:entity()
+	world:add(e, net.Replicated)
+	world:set(e, pair(schema.TagRel, schema.Gold), 4.5)
+
+	local player = fake_player("PreregUnreliableViewer")
+	server_net.add_client(player)
+	client_net.reconcile_packet(deep_copy(server_net.generate_packets()[player]))
+
+	local le = client_net.get_client_entity(e)
+	expect(le ~= nil, "the joiner's full packet created the subject")
+	expect_equal(
+		client_world:get(le, pair(schema.TagRel, schema.Gold)),
+		4.5,
+		"the pair's membership carried its value reliably"
+	)
+
+	-- an unreliable definition connects no changed hook, so the edit stages no reliable delta at all
+	world:set(e, pair(schema.TagRel, schema.Gold), 8.5)
+	expect_equal(server_net.generate_packets()[player], nil, "the edit staged no reliable delta")
+
+	local chunks = server_net.generate_unreliable_chunks()
+	expect(chunks[player] ~= nil, "the pre-registered tag relation streams its data-target pair")
+	for _, chunk in chunks[player] do
+		client_net.reconcile_chunk(chunk)
+	end
+	expect_equal(
+		client_world:get(le, pair(schema.TagRel, schema.Gold)),
+		8.5,
+		"the chunk decoded through the target definition's pre-registered hooks"
+	)
+end)
+
+test("a pre-registered InheritsPrivacy carries its cleanup policy into every world", function()
+	-- the policy is jecs.meta(InheritsPrivacy, pair(OnDeleteTarget, Delete)) at pre-registration time, replayed
+	-- at world creation -- before any user pair of the relation can exist there, which is the ordering the
+	-- per-world mint gets for free by adding the flag at minting.
+	local net = preregister_schema().net
+
+	local world = jecs.world()
+	expect_equal(duplecs.shared(world), net, "precondition: the world recognized the pre-registered set")
+
+	local group = world:entity()
+	local member = world:entity()
+	world:add(member, pair(net.InheritsPrivacy, group))
+
+	world:delete(group)
+	expect_equal(world:contains(member), false, "deleting the group deleted the entity delegating to it")
+end)
+
+test("guard: a world created before pre-registration is refused at its first duplecs contact", function()
+	-- preregistration_early_world was created at load time, so it holds none of the pre-registered ids while
+	-- its own world:component() / world:entity() ids collide numerically with them. minting a second set on top
+	-- would corrupt silently, so the fingerprint refuses the world outright.
+	preregister_schema()
+
+	expect_error(function()
+		duplecs.shared(preregistration_early_world)
+	end, "contacting a world created before pre-registration", "does not hold the pre-registered duplecs component set")
+
+	-- the refusal is the world's first contact whichever accessor makes it, and a refused contact anchors
+	-- nothing, so it is not a one-off
+	expect_error(function()
+		duplecs.server(preregistration_early_world)
+	end, "constructing a half on that same world", "does not hold the pre-registered duplecs component set")
+end)
+
+test("guard: a pre-registered serdes misuse errors from a world's first duplecs contact", function()
+	-- THIS IS DELIBERATELY THE LAST TEST IN THE FILE, AND NOTHING THAT CREATES A WORLD MAY FOLLOW IT. the
+	-- misuse below stays in jecs's module-global meta buffer for the rest of the process, so every world
+	-- created past this point replays it and errors at its own first duplecs contact -- including the env the
+	-- runner builds for any test added below. only one such test can ever exist for a second reason too: world
+	-- creation replays meta bundles in hash order, so with two buffered misuses there would be no telling which
+	-- one errors first.
+	--
+	-- what it pins: a registration made through jecs.meta has no store to validate it at its own call site (no
+	-- world exists yet), so the store's construction catch-up validates it instead, and the misuse guards
+	-- surface from the first duplecs contact rather than from the offending call.
+	local net = preregister_schema().net
+
+	local Broken = jecs.tag()
+	jecs.meta(Broken, jecs.Name, "PreregBrokenTag")
+	jecs.meta(Broken, net.Serdes, f64_serdes)
+
+	local world = jecs.world()
+	expect_error(function()
+		duplecs.shared(world)
+	end, "the first contact of a world holding a pre-registered serdes misuse", "cannot be assigned to tags")
+
+	expect_equal(#tests, preregistration_test_count, "a test was registered after the pre-registration section")
+end)
+
+preregistration_test_count = #tests
 
 -- runner
 
