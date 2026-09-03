@@ -481,19 +481,28 @@ local function read_chunk_section_header(
 	return flags, next_offset, offset, first_id, target_id, ids_count, nulled_count
 end
 
--- sizing half of a serdes registration, shared by both finalizers' sizing passes: encodes each value once,
--- appending the encoded buffers to the caller's stash for the write pass to copy -- so there is no size call
--- and no second serialization -- and returns the values' summed wire size (2 + len behind each u16 prefix, or
--- exactly the static size with no prefix) plus the advanced stash count. a length the prefix can't carry, or
--- one disagreeing with a static size, would corrupt the packet, so both error here instead.
+-- the encode pass of a serdes registration, shared by the packet finalizers' sizing passes and the chunk
+-- finalizer's pre-encode: encodes each value once, appending the encoded buffers to the caller's stash for the
+-- write pass to copy -- so there is no size call and no second serialization -- and returns the values' summed
+-- wire size (2 + len behind each u16 prefix, or exactly the static size with no prefix) plus the advanced
+-- stash count. a length the prefix can't carry, or one disagreeing with a static size, would corrupt the
+-- packet, so both error here instead. limit is the chunk finalizer's bound -- the largest value its budget can
+-- pack -- so a value past it errors here rather than surfacing as a budget error mid-packing, and a static
+-- size past it, which means every value is, refuses before anything encodes; the packet finalizers pass none.
 local function encode_buffer_values(
 	component: any,
 	encode: (value: any) -> buffer,
 	static: number?,
 	values: { any },
 	stash: { buffer },
-	stash_count: number
+	stash_count: number,
+	limit: number?
 ): (number, number)
+	if limit ~= nil and static ~= nil and static > limit then
+		fail(
+			`an unreliable value exceeds the chunk byte budget! ({id_to_string(component)} encodes {static} bytes, limit {limit})`
+		)
+	end
 	local values_size = 0
 	for _, value in values do
 		local encoded = encode(value)
@@ -509,6 +518,11 @@ local function encode_buffer_values(
 			if length > narrow_limit then
 				fail(
 					`serdes values must encode to fewer than 2^16 bytes! ({id_to_string(component)} encoded {length} bytes)`
+				)
+			end
+			if limit ~= nil and length > limit then
+				fail(
+					`an unreliable value exceeds the chunk byte budget! ({id_to_string(component)} encoded {length} bytes, limit {limit})`
 				)
 			end
 			values_size += 2 + length
@@ -1153,53 +1167,14 @@ local function finalize_section(draft: SectionDraft, resolve_serdes: ResolveSerd
 	return data, side
 end
 
--- the pre-encode pass of finalize_chunks, one draft's values into its stash: enforces the same contract
--- encode_buffer_values does (a buffer back, a static size matched exactly, the u16 prefix limit respected)
--- plus the chunk-specific bound -- limit is the largest value the caller's budget can pack, so anything past
--- it errors here rather than surfacing as a budget error mid-packing. runs under finalize_chunks' per-draft
--- pcall: user hooks run nowhere else, so packing never throws out of a half-written section.
-local function encode_chunk_values(
-	component: any,
-	encode: (value: any) -> buffer,
-	static: number?,
-	values: { any },
-	count: number,
-	stash: { buffer },
-	limit: number
-)
-	if static ~= nil and static > limit then
-		fail(
-			`an unreliable value exceeds the chunk byte budget! ({id_to_string(component)} encodes {static} bytes, limit {limit})`
-		)
-	end
-	for i = 1, count do
-		local encoded = encode(values[i])
-		local length = buffer.len(encoded)
-		if static ~= nil then
-			if length ~= static then
-				fail(
-					`serdes hooks with a static size must encode exactly that size! ({id_to_string(component)} encoded {length} bytes, size is {static})`
-				)
-			end
-		elseif length > narrow_limit then
-			fail(
-				`serdes values must encode to fewer than 2^16 bytes! ({id_to_string(component)} encoded {length} bytes)`
-			)
-		elseif length > limit then
-			fail(
-				`an unreliable value exceeds the chunk byte budget! ({id_to_string(component)} encoded {length} bytes, limit {limit})`
-			)
-		end
-		stash[i] = encoded
-	end
-end
-
 -- encodes one visibility group's unreliable drafts into chunk buffers of at most `budget` bytes each (the
 -- chunk layout above), appended to `chunks`. cells pack greedily in draft order: when the next cell would
 -- overflow the open chunk, the chunk closes and a fresh section naming the same component opens the next one,
 -- so every chunk stands alone. every value encodes up front through the draft's resolved serdes hooks
--- (required: chunking needs byte-exact sizing) into a per-draft stash the packing loop sizes and copies from,
--- so user code runs only in the pre-encode pass -- which is also the salvage guard, the chunk counterpart to
+-- (required: chunking needs byte-exact sizing) into a per-draft stash the packing loop sizes and copies from --
+-- encode_buffer_values under a per-draft pcall, bounded by the budget's limit -- so user code runs only in the
+-- pre-encode pass and packing never throws out of a half-written section. that pass is also the salvage
+-- guard, the chunk counterpart to
 -- measure_section_salvaging: a draft whose values can't encode -- a throwing hook, a violated size contract,
 -- a value no chunk could fit, or missing hooks entirely -- fails its per-draft pcall before any of it packs,
 -- has the offenders pruned via prune_failing_values and the survivors re-encoded, and packs whatever remains
@@ -1277,17 +1252,8 @@ local function finalize_chunks(
 					encoded = shared_stash :: { buffer }
 					table.clear(encoded)
 				end
-				-- cast: encode_chunk_values returns nothing, so the solver rejects binding pcall's error slot
-				local ok, encode_error = pcall(
-					encode_chunk_values :: any,
-					serdes_key,
-					serdes.encode,
-					static,
-					values :: { any },
-					ids_count,
-					encoded,
-					limit
-				)
+				local ok, encode_error =
+					pcall(encode_buffer_values, serdes_key, serdes.encode, static, values :: { any }, encoded, 0, limit)
 				if not ok then
 					-- the per-draft salvage, mirroring measure_section_salvaging: re-encode the values one at
 					-- a time, prune exactly the offenders in place, and re-run the pre-encode over the
@@ -1301,13 +1267,13 @@ local function finalize_chunks(
 					ids_count = #(ids :: { number })
 					table.clear(encoded)
 					ok, encode_error = pcall(
-						encode_chunk_values :: any,
+						encode_buffer_values,
 						serdes_key,
 						serdes.encode,
 						static,
 						values :: { any },
-						ids_count,
 						encoded,
+						0,
 						limit
 					)
 					if not ok then
