@@ -10636,6 +10636,67 @@ test("a networked definition with an empty jecs.Name warns and is never announce
 	expect_equal(c.net.get_client_entity(new_comp), nil, "the definition never auto-maps without an announcement")
 end)
 
+test("a rename to an empty name warns, retracts the announcement, and re-announces once fixed", function(env)
+	-- a refused rename used to warn and leave the old announcement standing, leaving every client bound to a
+	-- name the server no longer holds; the store now withdraws whatever announcement the id already held.
+	local s, c = env.server, env.client
+	local new_comp = s.world:component()
+	s.world:set(new_comp, jecs.Name, "RenamedAway")
+	s.world:add(new_comp, s.net.Networked)
+
+	local client_comp = c.world:component()
+	c.world:set(client_comp, jecs.Name, "RenamedAway")
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, new_comp, 5)
+	env.sync(env.player_a) -- the announcement maps the definition by name
+	expect_equal(c.net.get_client_entity(new_comp), client_comp, "the definition auto-mapped by name")
+	local le = c.net.get_client_entity(e)
+	expect_equal(c.world:get(le, client_comp), 5, "and its data rode the mapping")
+
+	expected_warning("shared names must not be empty!")
+	s.world:set(new_comp, jecs.Name, "") -- refused, and the announcement it already held goes with it
+	local retracted = env.sync(env.player_a)
+
+	expect_equal(retracted.names[new_comp], "", "the refused rename rides to the client as a retraction")
+	expect_equal(c.net.get_client_entity(new_comp), nil, "the retraction ends the name-established mapping")
+	expect_equal(c.world:has(client_comp, c.net.Imported), false, "the client's own definition is imported no more")
+	expect_equal(c.world:contains(client_comp), true, "the client's definition entity itself is never deleted")
+	expect_equal(c.world:get(le, client_comp), nil, "ending the mapping swept the cells that rode it")
+
+	-- a later valid rename announces the definition after all, and the client maps it again
+	s.world:set(new_comp, jecs.Name, "RenamedAway")
+	s.world:set(e, new_comp, 6)
+	local reannounced = env.sync(env.player_a)
+
+	expect_equal(reannounced.names[new_comp], "RenamedAway", "the valid rename announces the definition again")
+	expect_equal(c.net.get_client_entity(new_comp), client_comp, "the announcement re-establishes the mapping")
+	expect_equal(c.world:get(le, client_comp), 6, "the definition's data reconciles onto it once more")
+end)
+
+test("a rename to an over-long name retracts the announcement too", function(env)
+	local s, c = env.server, env.client
+	local new_comp = s.world:component()
+	s.world:set(new_comp, jecs.Name, "OutgrowsTheWire")
+	s.world:add(new_comp, s.net.Networked)
+
+	local client_comp = c.world:component()
+	c.world:set(client_comp, jecs.Name, "OutgrowsTheWire")
+
+	env.sync(env.player_a) -- the announcement maps the definition by name
+	expect_equal(c.net.get_client_entity(new_comp), client_comp, "the definition auto-mapped by name")
+
+	expected_warning("shared names must be at most 255 bytes!")
+	s.world:set(new_comp, jecs.Name, string.rep("x", 256)) -- one byte past the wire's u8 length
+	local retracted = env.sync(env.player_a)
+
+	expect_equal(retracted.names[new_comp], "", "the over-long rename rides to the client as a retraction")
+	expect_equal(c.net.get_client_entity(new_comp), nil, "the retraction ends the name-established mapping")
+	expect_equal(c.world:has(client_comp, c.net.Imported), false, "the client's own definition is imported no more")
+	expect_equal(c.world:contains(client_comp), true, "the client's definition entity itself is never deleted")
+end)
+
 test("a name refused at announce time announces once it's fixed", function(env)
 	-- on_name_changed used to only re-announce ids that were already announced
 	-- (the store's announced_id(dense) == entity), so a tracked definition whose
