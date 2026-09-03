@@ -22,7 +22,8 @@
 -- announcement -- a no-op). the drain sends the staged states to every allocated client (names are schema,
 -- never gated by visibility), with retractions riding as empty-name entries; full packets carry the whole live
 -- set, which never includes retractions. names longer than 255 bytes don't fit the wire's u8 length, and empty
--- names would read as retractions; both are refused with a warning.
+-- names would read as retractions; both are refused with a warning, and a refused name withdraws whatever
+-- announcement the id already held.
 
 local jecs = require("../roblox_packages/jecs")
 
@@ -46,28 +47,6 @@ return function(world: World, warn: (message: string) -> ())
 	local ids = {} :: { [number]: Entity }
 	local staged = {} :: { [number]: true | Entity }
 
-	local function announce(entity: Entity)
-		local name = world:get(entity, jecs.Name)
-		if type(name) ~= "string" then
-			return
-		end
-		if #name == 0 then
-			warn(`shared names must not be empty! ({id_to_string(entity, world)})`)
-			return
-		end
-		if #name > 255 then
-			warn(`shared names must be at most 255 bytes! ({id_to_string(entity, world)})`)
-			return
-		end
-		local dense_id = dense(entity)
-		if ids[dense_id] == entity and names[dense_id] == name then
-			return
-		end
-		ids[dense_id] = entity
-		names[dense_id] = name
-		staged[dense_id] = true
-	end
-
 	-- a re-announcement staged later this frame overwrites the retraction: the dense id recycled (or turned
 	-- relevant again) within one interval, and the announcement alone carries enough for clients to supersede
 	-- their stale mapping (see map_shared_name's generation check).
@@ -81,6 +60,35 @@ return function(world: World, warn: (message: string) -> ())
 		ids[dense_id] = nil
 		names[dense_id] = nil
 		staged[dense_id] = entity_gen
+	end
+
+	-- announces the entity's current jecs.Name. a name that cannot be announced -- empty or over the wire's u8
+	-- length, both warned, or not a string at all (a type violation jecs.Name's own typing rules out, so no
+	-- warning of its own) -- instead withdraws whatever announcement the entity already holds: an announced
+	-- definition renamed to a refused name would otherwise stay bound under its old name on every client, with
+	-- the warning as the only trace. a later valid rename announces it again.
+	local function announce(entity: Entity)
+		local dense_id = dense(entity)
+		local name = world:get(entity, jecs.Name)
+		if type(name) == "string" and #name > 0 and #name <= 255 then
+			if ids[dense_id] == entity and names[dense_id] == name then
+				return
+			end
+			ids[dense_id] = entity
+			names[dense_id] = name
+			staged[dense_id] = true
+			return
+		end
+		if type(name) == "string" then
+			if #name == 0 then
+				warn(`shared names must not be empty! ({id_to_string(entity, world)})`)
+			else
+				warn(`shared names must be at most 255 bytes! ({id_to_string(entity, world)})`)
+			end
+		end
+		if ids[dense_id] == entity then
+			retract(dense_id)
+		end
 	end
 
 	-- the gen-qualified id currently announced under a dense id, nil when nothing is: what the callers whose
