@@ -603,12 +603,97 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- RECONCILE
 
+	-- the fused parse-and-apply loop for one list of serdes-encoded values at data[offset] -- `count` ids with
+	-- their values following the id list -- shared by both reconcile entry points. each value decodes from a
+	-- fresh value-sized buffer, its length read off the u16 prefix unless the registration declares a static
+	-- size, and applies through changed_override when one is registered, else world:set. entities that don't
+	-- resolve locally hop the value by its length without decoding it, as do entities the guard excludes:
+	-- guarded is the unreliable path's rule that a value applies only where the entity currently has the
+	-- component (see apply_chunk_lists), never set alongside an override, which owns application. decode runs
+	-- under pcall: the framing gives every value's length before it decodes, so a throwing hook skips exactly
+	-- its own value and the stream stays aligned for the rest of the packet (or chunk), which a mid-reconcile
+	-- unwind would lose unrecoverably (deltas are exactly-once and applied entries aren't safely
+	-- re-appliable). returns the offset just past the values, the skipped count, and the first captured error --
+	-- the caller owns the warning.
+	local function apply_values(
+		data: buffer,
+		offset: number,
+		component: Id,
+		count: number,
+		serdes: Serdes,
+		changed_override: ChangedOverride?,
+		guarded: boolean
+	): (number, number, any)
+		local decode = serdes.decode
+		local static: number? = serdes.size
+		local value_offset = offset + count * id_width
+		local skipped = 0
+		local first_error: any = nil
+		for _ = 1, count do
+			local entity = get_client_entity_from_dense(read_id(data, offset))
+			offset += id_width
+			local length: number
+			if static ~= nil then
+				length = static
+			else
+				length = buffer.readu16(data, value_offset)
+				value_offset += 2
+			end
+			if entity ~= nil and (not guarded or world:has(entity, component)) then
+				local encoded = buffer.create(length)
+				buffer.copy(encoded, 0, data, value_offset, length)
+				local ok, value = pcall(decode, encoded)
+				if not ok then
+					skipped += 1
+					if first_error == nil then
+						first_error = value
+					end
+				elseif changed_override then
+					changed_override(entity, value)
+				else
+					world:set(entity, component, value)
+				end
+			end
+			value_offset += length
+		end
+		return value_offset, skipped, first_error
+	end
+
+	-- the nulled-list counterpart: `count` ids at data[offset] whose cells are present but hold no value.
+	-- changed_override receives them with no value; otherwise a tag is added and a data component set to nil
+	-- (world:add is a no-op when the component is already present and would leave a stale value behind).
+	-- guarded is the unreliable path's presence rule, as in apply_values. returns the offset just past the list.
+	local function apply_nulled(
+		data: buffer,
+		offset: number,
+		component: Id,
+		count: number,
+		changed_override: ChangedOverride?,
+		guarded: boolean
+	): number
+		-- resolved once per list: tag-ness is the same for every entry
+		local is_tag = changed_override == nil and jecs.is_tag(world, component)
+		for _ = 1, count do
+			local entity = get_client_entity_from_dense(read_id(data, offset))
+			offset += id_width
+			if entity ~= nil and (not guarded or world:has(entity, component)) then
+				if changed_override then
+					changed_override(entity)
+				elseif is_tag then
+					world:add(entity, component)
+				else
+					world:set(entity, component, nil)
+				end
+			end
+		end
+		return offset
+	end
+
 	-- applies one section's -- or one grouped run's -- lists at data[offset]: ids with inline or side-array
-	-- values, then nulled, then removed. these are the fused parse-and-apply loops, shared so both layouts
-	-- stream through identical code; side_base is the caller's cursor into the side array (always 0 for a plain
-	-- section, which owns its array whole), and relation_changed / relation_removed are the relation-level
-	-- override fallbacks, fixed for a whole section so the caller resolves them once rather than per run.
-	-- returns the offset just past the lists.
+	-- values, then nulled, then removed. shared so both layouts stream through identical code; side_base is the
+	-- caller's cursor into the side array (always 0 for a plain section, which owns its array whole), and
+	-- relation_changed / relation_removed are the relation-level override fallbacks, fixed for a whole section
+	-- so the caller resolves them once rather than per run. returns the offset just past the lists.
 	local function apply_lists(
 		data: buffer,
 		offset: number,
@@ -636,74 +721,11 @@ local function create_client(world: World, shared_record: get_shared.Record)
 						`received serialized values for {id_to_string(component, world)} but no serdes hooks are assigned!`
 					)
 				end
-				-- cast: fail never returns, but the solver doesn't treat user functions as diverging
-				local serdes_hooks = serdes :: Serdes
-				local decode = serdes_hooks.decode
-				-- ids and values advance in lockstep: ids at offset, values past them. each value decodes from a fresh
-				-- value-sized buffer, its length read off the u16 prefix unless the registration declares a static size;
-				-- unmapped entities hop the value by its length without decoding it. decode runs under pcall: the
-				-- framing gives every value's length before it decodes, so a throwing hook skips exactly its own value --
-				-- keeping the stream aligned for the rest of the packet, which a mid-reconcile unwind would lose
-				-- unrecoverably (deltas are exactly-once and applied entries aren't safely re-appliable) -- with one
-				-- warning per list carrying the first error
-				local static: number? = serdes_hooks.size
-				local value_offset = offset + ids_count * id_width
-				local skipped = 0
-				local first_error: any = nil
-				if changed_override then
-					for _ = 1, ids_count do
-						local entity = get_client_entity_from_dense(read_id(data, offset))
-						offset += id_width
-						local length: number
-						if static ~= nil then
-							length = static
-						else
-							length = buffer.readu16(data, value_offset)
-							value_offset += 2
-						end
-						if entity then
-							local encoded = buffer.create(length)
-							buffer.copy(encoded, 0, data, value_offset, length)
-							local ok, value = pcall(decode, encoded)
-							if ok then
-								changed_override(entity, value)
-							else
-								skipped += 1
-								if first_error == nil then
-									first_error = value
-								end
-							end
-						end
-						value_offset += length
-					end
-				else
-					for _ = 1, ids_count do
-						local entity = get_client_entity_from_dense(read_id(data, offset))
-						offset += id_width
-						local length: number
-						if static ~= nil then
-							length = static
-						else
-							length = buffer.readu16(data, value_offset)
-							value_offset += 2
-						end
-						if entity then
-							local encoded = buffer.create(length)
-							buffer.copy(encoded, 0, data, value_offset, length)
-							local ok, value = pcall(decode, encoded)
-							if ok then
-								world:set(entity, component, value)
-							else
-								skipped += 1
-								if first_error == nil then
-									first_error = value
-								end
-							end
-						end
-						value_offset += length
-					end
-				end
-				offset = value_offset
+				-- cast: fail never returns, but the solver doesn't treat user functions as diverging. one warning per
+				-- list carries the first error
+				local values_end, skipped, first_error =
+					apply_values(data, offset, component, ids_count, serdes :: Serdes, changed_override, false)
+				offset = values_end
 				if skipped > 0 then
 					warn(
 						`a serdes decode hook threw while decoding {id_to_string(component, world)}! {skipped} value(s) were skipped and their cells will not update until they next change server-side: {first_error}`
@@ -711,19 +733,13 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				end
 			else
 				local side = side_values :: { any }
-				if changed_override then
-					for i = 1, ids_count do
-						local entity = get_client_entity_from_dense(read_id(data, offset))
-						offset += id_width
-						if entity then
+				for i = 1, ids_count do
+					local entity = get_client_entity_from_dense(read_id(data, offset))
+					offset += id_width
+					if entity then
+						if changed_override then
 							changed_override(entity, side[side_base + i])
-						end
-					end
-				else
-					for i = 1, ids_count do
-						local entity = get_client_entity_from_dense(read_id(data, offset))
-						offset += id_width
-						if entity then
+						else
 							world:set(entity, component, side[side_base + i])
 						end
 					end
@@ -732,32 +748,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		if nulled_count > 0 then
-			if changed_override then
-				for _ = 1, nulled_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
-						changed_override(entity)
-					end
-				end
-			elseif jecs.is_tag(world, component) then
-				for _ = 1, nulled_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
-						world:add(entity, component)
-					end
-				end
-			else
-				-- data components must be nulled with :set(); world:add is a no-op when the component is already present
-				for _ = 1, nulled_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
-						world:set(entity, component, nil)
-					end
-				end
-			end
+			offset = apply_nulled(data, offset, component, nulled_count, changed_override, false)
 		end
 
 		if removed_count > 0 then
@@ -765,19 +756,13 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			if removed_override == nil then
 				removed_override = relation_removed
 			end
-			if removed_override then
-				for _ = 1, removed_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
+			for _ = 1, removed_count do
+				local entity = get_client_entity_from_dense(read_id(data, offset))
+				offset += id_width
+				if entity then
+					if removed_override then
 						removed_override(entity)
-					end
-				end
-			else
-				for _ = 1, removed_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
+					else
 						world:remove(entity, component)
 					end
 				end
@@ -920,11 +905,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- applies one unreliable chunk section's lists at data[offset]: ids with their serdes-encoded values, then
 	-- nulled. the unreliable stream only *updates* cells -- membership is authoritative on the reliable path --
-	-- so with no override registered a value applies only where the entity currently has the component: a chunk
-	-- arriving after the reliable removal of a cell (drops and reordering make that inevitable) must not
-	-- resurrect it with a stale value the server would never correct, since the cell is no longer streamed. a
-	-- registered override is invoked unguarded instead -- it owns application, and cannot resurrect anything.
-	-- values of unmapped or guarded entities are hopped by their length without decoding.
+	-- so with no override registered a value applies only where the entity currently has the component (the
+	-- guard apply_values and apply_nulled take): a chunk arriving after the reliable removal of a cell (drops
+	-- and reordering make that inevitable) must not resurrect it with a stale value the server would never
+	-- correct, since the cell is no longer streamed. a registered override is invoked unguarded instead -- it
+	-- owns application, and cannot resurrect anything. a throwing decode is contained like apply_lists', under
+	-- this path's own warning: a poisoned value would otherwise error every chunk carrying it, taking the whole
+	-- unreliable channel down until the value changes -- and chunks are self-healing frame to frame, so the
+	-- skipped cell is only stale, never lost.
 	local function apply_chunk_lists(
 		data: buffer,
 		offset: number,
@@ -937,6 +925,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if changed_override == nil and relation ~= nil then
 			changed_override = changed_overrides[relation]
 		end
+		local guarded = changed_override == nil
 
 		if ids_count > 0 then
 			local serdes = resolve_serdes(component, relation)
@@ -946,72 +935,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				)
 			end
 			-- cast: fail never returns, but the solver doesn't treat user functions as diverging
-			local serdes_hooks = serdes :: Serdes
-			local decode = serdes_hooks.decode
-			-- ids and values advance in lockstep: ids at offset, values past them. each value decodes from a fresh
-			-- value-sized buffer, its length read off the u16 prefix unless the registration declares a static size;
-			-- skipped entities hop the value by its length without decoding it. decode runs under pcall like
-			-- apply_lists': a throwing hook skips exactly its own value with a warning -- a poisoned value would
-			-- otherwise error every chunk carrying it, taking the whole unreliable channel down until the value
-			-- changes -- and chunks are self-healing frame to frame, so the skipped cell is only stale, never lost
-			local static: number? = serdes_hooks.size
-			local value_offset = offset + ids_count * id_width
-			local skipped = 0
-			local first_error: any = nil
-			if changed_override then
-				for _ = 1, ids_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					local length: number
-					if static ~= nil then
-						length = static
-					else
-						length = buffer.readu16(data, value_offset)
-						value_offset += 2
-					end
-					if entity then
-						local encoded = buffer.create(length)
-						buffer.copy(encoded, 0, data, value_offset, length)
-						local ok, value = pcall(decode, encoded)
-						if ok then
-							changed_override(entity, value)
-						else
-							skipped += 1
-							if first_error == nil then
-								first_error = value
-							end
-						end
-					end
-					value_offset += length
-				end
-			else
-				for _ = 1, ids_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					local length: number
-					if static ~= nil then
-						length = static
-					else
-						length = buffer.readu16(data, value_offset)
-						value_offset += 2
-					end
-					if entity ~= nil and world:has(entity, component) then
-						local encoded = buffer.create(length)
-						buffer.copy(encoded, 0, data, value_offset, length)
-						local ok, value = pcall(decode, encoded)
-						if ok then
-							world:set(entity, component, value)
-						else
-							skipped += 1
-							if first_error == nil then
-								first_error = value
-							end
-						end
-					end
-					value_offset += length
-				end
-			end
-			offset = value_offset
+			local values_end, skipped, first_error =
+				apply_values(data, offset, component, ids_count, serdes :: Serdes, changed_override, guarded)
+			offset = values_end
 			if skipped > 0 then
 				warn(
 					`a serdes decode hook threw while decoding {id_to_string(component, world)}! {skipped} value(s) were skipped from this chunk; they re-send next frame: {first_error}`
@@ -1020,25 +946,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		if nulled_count > 0 then
-			-- unreliable cells on the wire are never tags (the server streams only value-carrying cells, so a tag
-			-- definition's tag cells stay off this channel), so nulled entries always apply as data nulls
-			if changed_override then
-				for _ = 1, nulled_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity then
-						changed_override(entity)
-					end
-				end
-			else
-				for _ = 1, nulled_count do
-					local entity = get_client_entity_from_dense(read_id(data, offset))
-					offset += id_width
-					if entity ~= nil and world:has(entity, component) then
-						world:set(entity, component, nil)
-					end
-				end
-			end
+			-- unreliable cells on the wire are never tags (the server streams only value-carrying cells), so these
+			-- always apply as data nulls
+			offset = apply_nulled(data, offset, component, nulled_count, changed_override, guarded)
 		end
 
 		return offset
