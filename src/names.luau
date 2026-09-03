@@ -2,28 +2,23 @@
 --!native
 --!optimize 2
 
--- the server's shared-name store, one per instance (constructed by create_server): the announced set, the
--- transitions staged against it, and the two refusals announcing can warn on. server.luau owns *which* ids are
--- announcement-relevant -- its refresh_announcement derives that from its mirrors whenever a tracking,
--- Replicated, or jecs.Name hook moves an input, and calls in -- while this module owns the store itself and the
--- drains the packet passes read out of it. the warn it takes is the
--- instance's reporter's (diagnostics.create_reporter), so its refusals ride the same injectable hook as every
--- other warning in the half.
+-- the server's shared-name store, one per instance: the announced set, the transitions staged against it, and
+-- the two refusals announcing warns on. server.luau owns *which* ids are announcement-relevant
+-- (refresh_announcement derives it from its mirrors and calls in); this module owns the store and the drains
+-- the packet passes read. warn is the instance's reporter's, so refusals ride the same injectable hook.
 --
--- shared names: named ids the client maps automatically. tracked component definitions and named
--- (unreplicated) pair targets announce their jecs.Name on the wire -- (id, name) entries in packet headers --
--- so a client world defining the same names resolves them without set_client_entity. keyed by dense id,
--- matching server.luau's tracked_pairs_by_target (whose removal paths may run with the entity already dead),
--- with ids carrying the gen-qualified id the wire needs. staged collects the changes since the last drain, one
--- state per dense id: true means announce the id's current name, a number is a *retraction* carrying the
--- withdrawn gen-qualified id -- clients must end the mapping the announcement established before the dense id
--- can recycle into a new tenant they would misbind (the client's provenance and generation checks make a
--- retraction reaching a client whose mapping outlived it -- adopted by a creation, or superseded by a newer
--- announcement -- a no-op). the drain sends the staged states to every allocated client (names are schema,
--- never gated by visibility), with retractions riding as empty-name entries; full packets carry the whole live
--- set, which never includes retractions. names longer than 255 bytes don't fit the wire's u8 length, and empty
--- names would read as retractions; both are refused with a warning, and a refused name withdraws whatever
--- announcement the id already held.
+-- shared names: tracked definitions and named (unreplicated) pair targets announce their jecs.Name as (id,
+-- name) entries in packet headers, so a client world defining the same names maps them without
+-- set_client_entity. keyed by dense id, matching server.luau's tracked_pairs_by_target (whose removal paths
+-- may run with the entity already dead), with ids holding the gen-qualified id the wire needs. staged holds
+-- one state per dense id since the last drain: true announces the id's current name, a number is a
+-- *retraction* carrying the withdrawn gen-qualified id -- clients must end the mapping before the dense id
+-- recycles into a tenant they would misbind (a retraction reaching a mapping that outlived it -- adopted by a
+-- creation, or superseded by a newer announcement -- is a no-op there). drains go to every allocated client
+-- (names are schema, never gated by visibility), retractions riding as empty-name entries; full packets carry
+-- the whole live set, never retractions. names over 255 bytes don't fit the wire's u8 length and empty names
+-- would read as retractions, so both are refused with a warning, and a refused name withdraws whatever
+-- announcement the id held.
 
 local jecs = require("../roblox_packages/jecs")
 
@@ -35,9 +30,8 @@ local id_to_string = diagnostics.id_to_string
 type World = types.World
 type Entity = types.Entity
 
--- the generation-stripping jecs.ECS_ID, under the name its call sites use. every path here runs at schema-edit
--- rate or once per packet call, so it calls the jecs original rather than mirroring the id math the way
--- server.luau's hot paths do. like the mirrors, it takes branded ids and plain numbers alike.
+-- the generation-stripping jecs.ECS_ID; nothing here is hot, so it calls the jecs original rather than
+-- mirroring the id math the way server.luau does. takes branded ids and plain numbers alike.
 local dense = (jecs.ECS_ID :: any) :: (entity_gen: unknown) -> number
 
 return function(world: World, warn: (message: string) -> ())
@@ -47,9 +41,8 @@ return function(world: World, warn: (message: string) -> ())
 	local ids = {} :: { [number]: Entity }
 	local staged = {} :: { [number]: true | Entity }
 
-	-- a re-announcement staged later this frame overwrites the retraction: the dense id recycled (or turned
-	-- relevant again) within one interval, and the announcement alone carries enough for clients to supersede
-	-- their stale mapping (see map_shared_name's generation check).
+	-- a re-announcement staged later this frame overwrites the retraction: the announcement alone carries enough
+	-- for clients to supersede their stale mapping (see map_shared_name's generation check).
 	local function retract(id: number)
 		-- the stores key by dense id; taking the dense half here keeps a gen-qualified caller safe
 		local dense_id = dense(id)
@@ -62,11 +55,10 @@ return function(world: World, warn: (message: string) -> ())
 		staged[dense_id] = entity_gen
 	end
 
-	-- announces the entity's current jecs.Name. a name that cannot be announced -- empty or over the wire's u8
-	-- length, both warned, or not a string at all (a type violation jecs.Name's own typing rules out, so no
-	-- warning of its own) -- instead withdraws whatever announcement the entity already holds: an announced
-	-- definition renamed to a refused name would otherwise stay bound under its old name on every client, with
-	-- the warning as the only trace. a later valid rename announces it again.
+	-- announces the entity's current jecs.Name. an unannounceable name (empty or over the u8 length, both
+	-- warned; a non-string is a type violation jecs.Name's own typing rules out) instead withdraws whatever
+	-- announcement the entity holds: a renamed definition would otherwise stay bound under its old name on every
+	-- client. a later valid rename announces again.
 	local function announce(entity: Entity)
 		local dense_id = dense(entity)
 		local name = world:get(entity, jecs.Name)
@@ -112,9 +104,8 @@ return function(world: World, warn: (message: string) -> ())
 		return next(staged) ~= nil
 	end
 
-	-- drains the states staged since the last drain into collected, announcements under their current name and
-	-- retractions as empty names under the withdrawn id. a nil collected discards them instead, for a drain
-	-- with nobody to deliver to.
+	-- drains the staged states into collected: announcements under their current name, retractions as empty
+	-- names under the withdrawn id. a nil collected discards them (a drain with nobody to deliver to).
 	local function drain_staged(collected: { [number]: string }?)
 		if collected ~= nil then
 			for dense_id, state in staged do

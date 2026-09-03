@@ -4,8 +4,8 @@
 
 -- the server's recycling pools, one set per instance (constructed by create_server): a generic pool of
 -- scratch tables, and the draft / run pools backing the section shapes wire.luau encodes. server.luau owns
--- what the pooled tables are used *for*; this module owns their lifecycle -- fetches, clearing releases, and
--- the escaped side-array exception threaded through release_draft.
+-- what the pooled tables are used *for*; this module owns their lifecycle, including the escaped side-array
+-- exception threaded through release_draft.
 
 local wire = require("./wire")
 
@@ -34,10 +34,9 @@ return function()
 		scratch_pool[scratch_pool_count] = scratch
 	end
 
-	-- section drafts and runs pool separately so record-shaped tables never mix with array reuse. escaped
-	-- threads finalize_section's side-array return through the releases: whichever values list left in a packet
-	-- by reference (the one escape -- see the Packet type) must not be pooled, while inlined or
-	-- concatenated-away lists recycle like the others.
+	-- drafts and runs pool separately so record-shaped tables never mix with array reuse. escaped is
+	-- write_section's side-array return: the values list left in a packet by reference (see the Packet type)
+	-- must not be pooled, while inlined or concatenated-away lists recycle like the others.
 	local draft_pool = {} :: { SectionDraft }
 	local draft_pool_count = 0
 

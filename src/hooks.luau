@@ -3,30 +3,23 @@
 -- WORKAROUND (jecs 0.11.0): thin wrappers around world:added / world:changed / world:removed that repair the
 -- unpaired id's hook after registering. every hook registration in duplecs goes through here.
 --
--- the bug: the broadcast closure a first registration mints is written to the component's unpaired record
--- and to its pair records in an either/or branch -- `if component_index[pair(component, Wildcard)] then
--- <patch every pair record> else <patch the unpaired record> end` -- so a component that already has a pair
--- record never gets the closure onto its unpaired record. that is harmless while the unpaired record doesn't
--- exist yet (a record made afterwards reads the EcsOnAdd / EcsOnChange / EcsOnRemove value the registration
--- writes onto the component itself), and permanent once it does: an existing record never re-reads that
--- value, and registering again can't recover it (the whole block is guarded by `if not listeners`). the
--- listener then never fires for the unpaired id while every pair using the component as its relation keeps
--- firing normally -- no error, no warning.
+-- the bug: the broadcast closure a first registration mints is written to the component's unpaired record and
+-- to its pair records in an either/or branch -- `if component_index[pair(component, Wildcard)] then <patch
+-- every pair record> else <patch the unpaired record> end` -- so a component that already has a pair record
+-- never gets the closure onto its unpaired record. harmless while that record doesn't exist yet (a record
+-- made later reads the EcsOnAdd / EcsOnChange / EcsOnRemove value the registration writes onto the component
+-- itself), permanent once it does, and registering again can't recover it (the block is guarded by `if not
+-- listeners`): the listener silently never fires for the unpaired id while every pair using the component
+-- keeps firing. duplecs hits it through ordinary shapes -- Private set in both forms before
+-- duplecs.server(world) runs, or a tracked definition already used as a relation when its Networked tag
+-- lands.
 --
--- the shapes duplecs reaches it through are ordinary ones: Private is documented in both forms (an
--- entity-level filter and pair(Private, component)), so a schema module setting one of each before
--- duplecs.server(world) runs would leave every later entity-level filter edit silently ignored; and any
--- tracked definition already used as a relation when its Networked tag lands hits it the same way, since
--- start_tracking_component connects that definition's hooks at tag time.
---
--- the repair asserts jecs's own invariant rather than reaching around it: the value a registration leaves on
--- the component *is* the composed broadcast closure (any pre-existing raw hook merged into its listener
--- list), and it is exactly what a record created afterwards reads for itself, so writing it to the unpaired
--- record is what the unbranched write would have done. it runs only on the registration that mints that
--- closure -- the one call that can hit the bug -- so a raw hook assigned to the component afterwards is never
--- clobbered, and against a jecs that fixes the branch the write only stores the value already there. removing
--- this module once that lands is cleanup rather than a fix: every wrapper call becomes the world method it
--- names.
+-- the repair re-asserts jecs's own invariant: the value a registration leaves on the component *is* the
+-- composed broadcast closure, exactly what a record created afterwards reads for itself, so writing it to the
+-- unpaired record is what the unbranched write would have done. it runs only on the registration that mints
+-- the closure -- the one call that can hit the bug -- so a raw hook assigned afterwards is never clobbered,
+-- and against a fixed jecs the write stores the value already there. once upstream fixes the branch, delete
+-- this module: every wrapper call becomes the world method it names.
 
 local jecs = require("../roblox_packages/jecs")
 

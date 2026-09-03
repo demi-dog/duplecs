@@ -6,18 +6,15 @@
 -- decodes their bytes lives in this module -- the server's packet passes (server.luau) drive the writers, the
 -- client's reconcile (client.luau) consumes the header readers.
 
--- note: in warn/error strings, `$` prefixes verified-live entity ids and `?` unverifiable ones (this module
--- never has a world to verify against, so its ids all print behind `?`) -- see diagnostics.luau, which owns
--- the convention and the [duplecs] prefix every message carries.
+-- in warn/error strings every id here prints behind `?` (unverifiable: this module has no world to check
+-- liveness against) -- see diagnostics.luau, which owns the convention and the [duplecs] prefix.
 
--- entity, component, relation, and target ids on the wire are 24-bit dense ids (u16 low half + u8 high half,
--- little-endian): jecs packs a gen-qualified id as index + generation * 2^24 with index < 2^24 and generation
--- < 2^16, and the server never holds two live entities sharing a dense id, so 3 bytes identify any live id.
--- the generation matters in exactly two places -- the replicated (creation) list and the names list, where a
--- client first learns an id (including the generation get_server_entity exposes for client->server requests) --
--- so their entries stay full-gen 40-bit ids (u32 low half + u8 high half) at 5 bytes. write_id / read_id and
--- write_gen_id / read_gen_id below are the one encode/decode authority; write_id truncates whatever
--- gen-qualified id it is handed to its dense half.
+-- ids on the wire are 24-bit dense ids (u16 low half + u8 high half, little-endian): jecs packs a
+-- gen-qualified id as index + generation * 2^24 with index < 2^24 and generation < 2^16, and the server never
+-- holds two live entities sharing a dense id. the generation matters only where a client first learns an
+-- id -- the replicated (creation) list and the names list -- so those entries are full-gen 40-bit ids (u32
+-- low half + u8 high half). write_id / read_id and write_gen_id / read_gen_id are the one encode/decode
+-- authority; write_id truncates whatever gen-qualified id it is handed to its dense half.
 
 -- counts and section lengths are u16 by default; a writer whose section (or packet lists) would overflow one
 -- sets its wide flag and writes u32s instead, so the narrow common case never pays for the pathological one.
@@ -38,11 +35,10 @@
 --   sections back-to-back until the end of the buffer
 -- (uN is u16, or u32 when packet_flag_wide is set) the names list announces shared definitions (networked
 -- components and named pair targets) as (id, jecs.Name) entries, so a client world defining the same names
--- maps them automatically; announcements apply after the entity lists and before any section resolves. an
--- entry with length 0 is a *retraction* -- the announcement is withdrawn and clients end the mapping it
--- established -- and applies only after every section: a retracting packet's sections may still reference the
--- id (e.g. the explicit pair removals a named target's death stages). names are never empty strings, so the
--- zero length is unambiguous.
+-- maps them automatically; announcements apply after the entity lists and before any section resolves. a
+-- length-0 entry is a *retraction* (names are never empty, so it is unambiguous), applied only after every
+-- section: a retracting packet's sections may still reference the id (e.g. the pair removals a named target's
+-- death stages).
 
 -- section layout within the packet buffer (little-endian, in order):
 --   u8  flags                    flag_pair | flag_inline_values | flag_has_ids
@@ -61,15 +57,13 @@
 --   id24 nulled[nulled_count]
 --   id24 removed[removed_count]
 -- (uN is u16, or u32 when flag_wide is set) the length prefix lets the reconciler skip a section it cannot
--- resolve locally without decoding it; only inline values need one (serdes-encoded bytes have no computable
--- size without the hooks), while every other section skips through its counts, mirroring the runs of the
--- grouped layout below.
+-- resolve locally; only inline values need one (serdes-encoded bytes have no computable size without the
+-- hooks), every other section skips through its counts, as do the runs of the grouped layout below.
 
--- each serdes-encoded inline value rides as a u16 length prefix followed by its encoded bytes (see the Serdes
--- type in types.luau); a registration with a static size omits the prefix. the framing is part of the value
--- stream's encoding, not a flag-gated field -- hooks are required to be symmetric, so both sides already
--- agree on the sizing -- and the prefix stays u16 even in wide sections, so a value encoding to 2^16 bytes or
--- more is refused at packet generation.
+-- each serdes-encoded inline value rides as a u16 length prefix followed by its bytes; a static-size
+-- registration omits the prefix (see the Serdes type in types.luau). the framing is part of the value stream,
+-- not flag-gated -- hooks must be symmetric, so both sides already agree -- and the prefix stays u16 even in
+-- wide sections, so a value encoding to 2^16 bytes or more is refused at generation.
 
 -- a pair section carrying several targets of one relation encodes the grouped layout instead, paying the
 -- relation id once and framing each target's lists as a run; a single-target pair draft keeps the plain
@@ -98,18 +92,16 @@
 --     serdes-encoded values      (only when flag_inline_values is set)
 --     id24 nulled[nulled_count]
 --     id24 removed[removed_count]
--- (uN is u16, or u32 when the section's flag_wide is set) hookless runs' values do not ride runs
--- individually: they concatenate, in run order, into a single entry of the packet's side array -- marked by
--- flag_side_values so a reader always consumes exactly one entry per flagged section -- with each hookless
--- run claiming ids_count entries, so a reader that skips runs (or the whole section) keeps the side cursor
--- aligned without decoding anything.
+-- (uN is u16, or u32 when the section's flag_wide is set) hookless runs' values concatenate, in run order,
+-- into a single entry of the packet's side array, marked by flag_side_values so a reader consumes exactly one
+-- entry per flagged section; each hookless run claims ids_count entries, so a reader skipping runs (or the
+-- whole section) keeps the side cursor aligned without decoding anything.
 
--- an unreliable chunk is the self-contained unit of the always-replicate (NetworkedUnreliable) channel: the
--- server re-reads every visible unreliable cell each call and packs the values into chunks of at most the
--- caller's byte budget, so a dropped or reordered chunk costs one frame of staleness, never state. chunks
--- carry values and nulled ids only -- membership and removals ride the reliable path -- and their values are
--- always serdes-encoded (chunking requires byte-exact sizing, so unreliable components must have hooks; there
--- is no side array). unreliable chunk layout (little-endian, in order):
+-- an unreliable chunk is the self-contained unit of the always-replicate (NetworkedUnreliable) channel: every
+-- visible unreliable cell is re-read and re-packed each call, so a dropped or reordered chunk costs one frame
+-- of staleness, never state. chunks carry values and nulled ids only (membership and removals ride the
+-- reliable path), always serdes-encoded: chunking needs byte-exact sizing, so unreliable components must have
+-- hooks and there is no side array. unreliable chunk layout (little-endian, in order):
 --   u8  version                  wire_version + chunk_version_flag: the high
 --                                bit keeps a chunk loudly distinguishable from
 --                                a reliable packet, so either buffer handed to
@@ -139,18 +131,15 @@
 -- a fresh section naming the same component opens the next chunk -- section headers repeat, cells never
 -- split. nulled ids fill a section only once the value cells are exhausted.
 
--- read_packet_header / read_section_header below are the one decode authority for the header half of each
--- layout (everything above the id lists); readers walk the lists themselves from the returned counts and
--- offset, so the client's reconcile stays a fused stream-parse-and-apply allocating nothing of its own --
--- only decode's per-value buffers (see client.luau). built on the same readers, decode_packet /
--- decode_section parse a packet into an allocating record view of raw wire ids for the verification suite and
--- diagnostics.
+-- read_packet_header / read_section_header are the one decode authority for each layout's header; readers
+-- walk the lists themselves from the returned counts and offset, so the client's reconcile stays a fused
+-- stream-parse-and-apply allocating only decode's per-value buffers. decode_packet / decode_section build
+-- allocating record views on the same readers for the verification suite and diagnostics.
 
 local jecs = require("../roblox_packages/jecs")
 
--- jecs.pair under the plain-number domain this module works in (draft and wire ids are numbers, and the
--- packed pair id they combine into is one too), so the serdes-key and record-view call sites don't cast
--- per call. every id is a number at runtime, so this is a retyped view of the original, not a copy.
+-- jecs.pair retyped to the plain-number domain this module works in (every id is a number at runtime), so the
+-- serdes-key and record-view call sites don't cast per call.
 local pair = (jecs.pair :: any) :: (relation: number, target: number) -> number
 
 local types = require("./types")
@@ -182,32 +171,27 @@ local packet_flag_replicated = 0b0010
 local packet_flag_wide = 0b0100
 local packet_flag_names = 0b1000
 
--- bytes per dense (id24) and full-gen (id40) wire id, the widths of the packet header's leading version byte
--- and packet frame, and the largest value a narrow (u16) count or length can carry before a writer must set
--- its wide flag
+-- bytes per dense (id24) and full-gen (id40) wire id, the packet header's version and frame widths, and the
+-- largest value a narrow (u16) count or length can carry before a writer must set its wide flag
 local id_width = 3
 local gen_id_width = 5
 local version_width = 1
 local packet_frame_width = 4
 local narrow_limit = 0xffff
 
--- the wire format version, written as the packet buffer's leading u8 -- ahead of the packet frame, so it sits
--- at a fixed offset no matter how the rest of the layout shifts across versions. the client's
--- reconcile_packet refuses any packet whose version isn't this one.
+-- the wire format version, the packet buffer's leading u8 -- fixed at offset 0 no matter how the rest of the
+-- layout shifts across versions; reconcile_packet refuses any other version.
 --
--- BUMP THIS on any change to the byte layout of a packet, section, run, id, count, or unreliable chunk in
--- this module -- a client on an older build must reject a newer packet loudly rather than silently misparse
--- it -- and on any change to how the two sides agree on a packet's framing even when no layout moves: version
--- 3 changed no byte layout, it marks serdes target-derivation (see resolve_serdes in serdes.luau), which
--- moves affected schemas' pair values between the inline and side-array framings, so mixed builds would tear
--- mid-reconcile instead of refusing up front. retrofitting a version field after 1.0.0 would itself have been
--- a breaking wire change, which is why it ships now. (the byte's high bit is claimed by chunk_version_flag
--- below, so 127 format revisions of headroom remain -- still ample.)
+-- BUMP THIS on any change to the byte layout of a packet, section, run, id, count, or unreliable chunk, and
+-- on any change to how the two sides agree on framing even when no layout moves: version 3 changed no bytes,
+-- it marks serdes target-derivation (see resolve_serdes in serdes.luau), which moves pair values between the
+-- inline and side-array framings, so mixed builds would tear mid-reconcile instead of refusing up front. the
+-- byte's high bit is chunk_version_flag's.
 local wire_version = 3
 
--- the leading version byte of an unreliable chunk is wire_version with this high bit set, keeping the two
--- buffer kinds mutually unparseable: check_version / check_chunk_version each refuse the other kind with a
--- pointed error instead of a bogus version mismatch.
+-- an unreliable chunk's version byte is wire_version with this high bit set, so check_version /
+-- check_chunk_version each refuse the other buffer kind with a pointed error instead of a bogus version
+-- mismatch.
 local chunk_version_flag = 0x80
 
 -- the width of a chunk's header: the version byte plus the u32 unreliable frame counter; sections follow
@@ -215,17 +199,15 @@ local chunk_version_flag = 0x80
 local chunk_frame_width = 4
 local chunk_header_width = version_width + chunk_frame_width
 
--- the chunk budget bounds generate_unreliable_chunks accepts, both derived from the layout above rather than
--- picked. the floor is the smallest budget an empty chunk can still fit one cell of *any* section into: a
--- chunk header, the widest section header (flags, length, and a pair section's relation and target), one
--- count field, and one id -- below it the packing loop could open a chunk that fits nothing at all. the
--- ceiling is what a chunk section's u16 length field can address.
+-- the chunk budget bounds generate_unreliable_chunks accepts, derived from the layout: the floor is what an
+-- empty chunk needs to fit one cell of *any* section (chunk header, the widest section header, one count
+-- field, one id) -- below it the packing loop could open a chunk that fits nothing; the ceiling is what a
+-- chunk section's u16 length field can address.
 local min_chunk_bytes = chunk_header_width + (1 + 2 + id_width * 2) + 2 + id_width
 local max_chunk_bytes = narrow_limit
 
--- the split points of the ids' wire halves. the dense encoding leans on jecs' index/generation split at 2^24:
--- a dense id is a gen-qualified id's low 24 bits, so write_id truncates the generation of whatever id it is
--- handed and gets the dense half for free.
+-- the split points of the ids' wire halves; a dense id is a gen-qualified id's low 24 bits (jecs splits the
+-- index from the generation at 2^24), so write_id's truncation yields the dense half for free.
 local id_split = 2 ^ 16
 local gen_id_split = 2 ^ 32
 
@@ -247,16 +229,13 @@ local function read_gen_id(data: buffer, offset: number): number
 	return buffer.readu32(data, offset) + buffer.readu8(data, offset + 4) * gen_id_split
 end
 
--- reads a packet buffer's leading wire format version byte. it sits at offset 0 ahead of every other field
--- precisely so it stays readable no matter how the rest of the layout changes between versions.
+-- reads a buffer's leading wire format version byte (offset 0, so it stays readable across layout changes)
 local function read_version(data: buffer): number
 	return buffer.readu8(data, 0)
 end
 
--- validates a packet buffer's leading version byte against wire_version, erroring loudly on a mismatch. every
--- entry point that consumes a whole packet buffer -- the client's reconcile_packet and get_packet_frame, and
--- the record-view decode_packet below -- gates on this before reading any other field, so a build handed a
--- packet from a different wire format refuses it rather than misparsing it.
+-- validates a packet buffer's version byte against wire_version; every whole-packet entry point (the client's
+-- reconcile_packet and get_packet_frame, decode_packet below) gates on this before reading any other field.
 local function check_version(data: buffer)
 	local version = read_version(data)
 	if version ~= wire_version then
@@ -292,9 +271,7 @@ local function read_chunk_frame(data: buffer): number
 	return buffer.readu32(data, version_width)
 end
 
--- reads a packet buffer's frame counter (the field just past the version byte). the full header read below
--- returns it too; this is the standalone accessor for callers that want only the packet frame without walking
--- the counts.
+-- reads a packet buffer's frame counter without walking the counts (read_packet_header returns it too)
 local function read_packet_frame(data: buffer): number
 	return buffer.readu32(data, version_width)
 end
@@ -339,11 +316,10 @@ local function read_name(data: buffer, offset: number): (number, string, number)
 end
 
 -- reads a section's header at data[section_offset]: the flags, the offset just past the section, the offset
--- of the first id list (grouped: of the first run), the raw wire ids naming the section -- the component, or
--- the relation with the target as the fifth return for single-target pair sections -- the three flag-gated
--- list counts, and (grouped sections only) the run count as the ninth return. callers branch pair-ness on the
--- target being non-nil and grouped-ness on the run count being non-nil; a grouped section's runs parse
--- through read_run_header from the returned offset.
+-- of the first id list (grouped: of the first run), the naming ids -- the component, or the relation with the
+-- target as the fifth return -- the three flag-gated list counts, and (grouped only) the run count as the
+-- ninth return. callers branch pair-ness on the target being non-nil and grouped-ness on the run count being
+-- non-nil.
 local function read_section_header(
 	data: buffer,
 	section_offset: number
@@ -404,10 +380,9 @@ local function read_section_header(
 	return flags, next_offset, offset, first_id, target_id, ids_count, nulled_count, removed_count, nil
 end
 
--- reads one run's header at data[run_offset] within a grouped pair section (wide must match the section's
--- flag_wide): the run flags, the offset of the run's id list, the raw target id, the offset just past the run --
--- only when the run carries inline values; every other run ends where its counted lists do -- and the three
--- flag-gated list counts.
+-- reads one run's header at data[run_offset] (wide must match the section's flag_wide): the run flags, the
+-- offset of the run's id list, the raw target id, the offset just past the run (only with inline values;
+-- every other run ends where its counted lists do), and the three flag-gated list counts.
 local function read_run_header(
 	data: buffer,
 	run_offset: number,
@@ -449,11 +424,9 @@ local function read_run_header(
 	return run_flags, offset, target_id, run_end, ids_count, nulled_count, removed_count
 end
 
--- reads one chunk section's header at data[section_offset] (the chunk layout above): the flags, the offset
--- just past the section (off the always-present length prefix), the offset of the id list, the raw wire ids
--- naming the section -- the component, or the relation with the target as the fifth return for pair sections --
--- and the two flag-gated list counts. chunk counts are always u16 (the budget is capped below 2^16, so
--- nothing widens).
+-- reads one chunk section's header at data[section_offset]: the flags, the offset just past the section, the
+-- offset of the id list, the naming ids (the component, or the relation with the target as the fifth return),
+-- and the two flag-gated list counts. chunk counts are always u16.
 local function read_chunk_section_header(
 	data: buffer,
 	section_offset: number
@@ -481,14 +454,12 @@ local function read_chunk_section_header(
 	return flags, next_offset, offset, first_id, target_id, ids_count, nulled_count
 end
 
--- the encode pass of a serdes registration, shared by the packet finalizers' sizing passes and the chunk
--- finalizer's pre-encode: encodes each value once, appending the encoded buffers to the caller's stash for the
--- write pass to copy -- so there is no size call and no second serialization -- and returns the values' summed
--- wire size (2 + len behind each u16 prefix, or exactly the static size with no prefix) plus the advanced
--- stash count. a length the prefix can't carry, or one disagreeing with a static size, would corrupt the
--- packet, so both error here instead. limit is the chunk finalizer's bound -- the largest value its budget can
--- pack -- so a value past it errors here rather than surfacing as a budget error mid-packing, and a static
--- size past it, which means every value is, refuses before anything encodes; the packet finalizers pass none.
+-- the encode pass of a serdes registration, shared by the sizing passes and the chunk pre-encode: encodes
+-- each value once into the caller's stash for the write pass to copy, returning the summed wire size (2 + len
+-- per prefixed value, or exactly the static size) and the advanced stash count. a length the prefix can't
+-- carry, or one disagreeing with a static size, would corrupt the packet, so both error here. limit (chunk
+-- finalizer only) is the largest value its budget can pack: a value past it errors here rather than
+-- mid-packing, and a static size past it refuses before anything encodes.
 local function encode_buffer_values(
 	component: any,
 	encode: (value: any) -> buffer,
@@ -534,8 +505,7 @@ local function encode_buffer_values(
 end
 
 -- write half of a serdes registration: copies `count` stashed encoded buffers into the section behind their
--- u16 prefixes (none when the sizing pass ran against a static size), returning the advanced offset and stash
--- cursor.
+-- u16 prefixes (none for a static size), returning the advanced offset and stash cursor.
 local function write_buffer_values(
 	data: buffer,
 	offset: number,
@@ -558,10 +528,9 @@ local function write_buffer_values(
 	return offset, cursor
 end
 
--- one target's lists within a pair draft. targets are carried gen-qualified so two same-frame tenants of one
--- dense id land in separate runs server-side; the encoder truncates them to their dense halves on the wire
--- like every other section id. serdes and values_size are the run's slice of the measure plan (see
--- measure_section below), stashed by the sizing pass and consumed by the write pass.
+-- one target's lists within a pair draft. targets are gen-qualified so two same-frame tenants of one dense id
+-- land in separate runs; the encoder truncates them to their dense halves like every other section id. serdes
+-- and values_size are the run's slice of the measure plan, stashed by the sizing pass for the write pass.
 export type SectionRun = {
 	target: number,
 	ids: { number }?,
@@ -572,15 +541,13 @@ export type SectionRun = {
 	values_size: number?,
 }
 
--- the accumulation shape the server's packet passes build (see server.luau, which also owns the pooling of
--- drafts, runs, and their lists) and measure_section / write_section encode into one section of a packet
--- buffer. exactly one of component / relation is set: an unpaired draft carries its lists directly, while a
--- pair draft groups every cell of one relation into per-target runs (run_of keys them by the gen-qualified
--- target the rows carry). the plan fields (size through encoded) are stashed by measure_section and consumed
--- by write_section, so a draft must always be measured before it is written; the pools clear them with the
--- rest of the draft on release. the unreliable pass builds the same shape for finalize_chunks, whose pair
--- drafts carry their single gen-qualified target directly instead of runs (chunk pair sections are always
--- single-target); the packet finalizers never read target.
+-- the accumulation shape the packet passes build (pooled through pools.luau) and measure_section /
+-- write_section encode into one section. exactly one of component / relation is set: an unpaired draft
+-- carries its lists directly, a pair draft groups one relation's cells into per-target runs (run_of keys them
+-- by gen-qualified target). the plan fields (size through encoded) are stashed by measure_section for
+-- write_section, so a draft must be measured before it is written. finalize_chunks takes the same shape, its
+-- pair drafts carrying their single gen-qualified target directly instead of runs; the packet finalizers
+-- never read target.
 export type SectionDraft = {
 	component: number?,
 	relation: number?,
@@ -599,13 +566,10 @@ export type SectionDraft = {
 	encoded: { buffer }?,
 }
 
--- sizing half of the grouped layout (see measure_section below): resolves each run's serdes hooks for its
--- concrete pair and computes the section's total wire size. fixed bytes sum directly, count fields only tally --
--- they all widen together once anything would overflow u16. the plan stashes on the draft and its runs for
--- write_grouped_section: each run's resolved hooks and (inline runs) its values' summed wire size, so the
--- write pass can prefix each run's length without a second resolve or sizing sweep; inline runs also stash
--- their encoded buffers on the draft, appended flat in run order for the write pass to copy, so nothing
--- serializes twice.
+-- sizing half of the grouped layout: resolves each run's serdes hooks for its concrete pair and sizes the
+-- section (count fields only tally, since they all widen together). the plan stashes on the draft and its
+-- runs for write_grouped_section: each run's hooks and inline values_size (so run lengths prefix without a
+-- second sweep), and the encoded buffers appended flat in run order.
 local function measure_grouped_section(draft: SectionDraft, resolve_serdes: ResolveSerdes): number
 	local relation = draft.relation :: number
 	local runs = draft.runs :: { SectionRun }
@@ -686,10 +650,9 @@ local function measure_grouped_section(draft: SectionDraft, resolve_serdes: Reso
 	return size
 end
 
--- write half of the grouped layout (see write_section below): encodes the measured draft at
--- data[section_offset] -- the relation once, then one run per target -- off the plan measure_grouped_section
--- stashed. hookless runs' values concatenate into the returned side array in run order -- a lone hookless
--- run's array escapes by reference, so the caller must compare against the return before pooling any list.
+-- write half of the grouped layout, off the plan measure_grouped_section stashed. hookless runs' values
+-- concatenate into the returned side array in run order; a lone hookless run's array escapes by reference, so
+-- the caller must compare against the return before pooling any list.
 local function write_grouped_section(data: buffer, section_offset: number, draft: SectionDraft): (number, { any }?)
 	local relation = draft.relation :: number
 	local runs = draft.runs :: { SectionRun }
@@ -812,13 +775,10 @@ local function write_grouped_section(data: buffer, section_offset: number, draft
 	return offset, side
 end
 
--- sizing half of the plain layout (see measure_section below): resolves the section's serdes hooks and
--- computes its total wire size -- flags u8 + one uN count per present list, all widening to u32 together when
--- any would overflow u16, with the length prefix (uN, widening with the rest) riding only alongside inline
--- values; every other section's size follows from its counts (see the layout). the plan (the final flags,
--- wide-ness, resolved hooks, and encode stash) lands on the draft for write_plain_section. a pair draft with
--- a single run collapses into this layout, which is smaller than the grouped one until a second target shares
--- the section.
+-- sizing half of the plain layout: resolves the section's serdes hooks and sizes it (flags u8 + one uN count
+-- per present list, all widening together; the length prefix rides only alongside inline values). the plan
+-- lands on the draft for write_plain_section. a pair draft with a single run collapses into this layout,
+-- smaller than the grouped one until a second target shares the section.
 local function measure_plain_section(draft: SectionDraft, resolve_serdes: ResolveSerdes): number
 	local relation = draft.relation
 	local target: number? = nil
@@ -897,10 +857,9 @@ local function measure_plain_section(draft: SectionDraft, resolve_serdes: Resolv
 	return size
 end
 
--- write half of the plain layout (see write_section below): encodes the measured draft at
--- data[section_offset] off the plan measure_plain_section stashed, returning the offset just past the section
--- and (hookless sections) the values array escaping into the packet's side array, index-aligned with the
--- encoded ids.
+-- write half of the plain layout, off the plan measure_plain_section stashed: returns the offset just past
+-- the section and (hookless sections) the values array escaping into the packet's side array, index-aligned
+-- with the encoded ids.
 local function write_plain_section(data: buffer, section_offset: number, draft: SectionDraft): (number, { any }?)
 	local relation = draft.relation
 	local target: number? = nil
@@ -983,14 +942,12 @@ local function write_plain_section(data: buffer, section_offset: number, draft: 
 	return offset, if serdes == nil then values else nil
 end
 
--- the measure/write split: measure_section computes one draft's total wire size -- dispatching a pair draft
--- with several runs to the grouped layout, everything else to the plain one -- and stashes on the draft (and
--- its runs) everything the write pass needs, so nothing is resolved, sized, or encoded twice; write_section
--- then encodes the measured draft at data[offset], returning the offset just past the section and (hookless
--- sections) the values array escaping into the packet's side array. the split lets a caller sum several
--- drafts' sizes into one exactly-sized buffer and lay the sections out back-to-back -- one allocation, and
--- one downstream copy per client, per visibility node rather than per section (see server.luau's
--- finalize_node_sections). either way a section encodes once no matter how many clients share it.
+-- the measure/write split: measure_section sizes one draft (a pair draft with several runs takes the grouped
+-- layout, everything else the plain one) and stashes everything the write pass needs on it, so nothing is
+-- resolved, sized, or encoded twice; write_section then encodes it at data[offset], returning the offset just
+-- past and (hookless sections) the escaping values array. the split lets a caller sum several drafts into one
+-- exactly-sized buffer laid out back-to-back -- one allocation, and one downstream copy per client per
+-- visibility node rather than per section (see server.luau's finalize_node_sections).
 local function measure_section(draft: SectionDraft, resolve_serdes: ResolveSerdes): number
 	local runs = draft.runs
 	if runs ~= nil and #runs > 1 then
@@ -1007,13 +964,12 @@ local function write_section(data: buffer, offset: number, draft: SectionDraft):
 	return write_plain_section(data, offset, draft)
 end
 
--- per-value half of the salvages below: re-encodes one list's values under pcall, enforcing the same contract
--- encode_buffer_values does (a buffer back, a static size matched exactly, the u16 prefix limit respected),
--- and prunes the offenders in place with ids and values compacted in lockstep. limit optionally narrows the
--- prefix limit for dynamically-sized values -- the chunk salvage passes the largest value its budget can pack,
--- so an oversized value prunes here instead of re-throwing the budget error forever on that always-resending
--- channel (static sizes skip it: one oversized static value means all are, and the wholesale strip already
--- covers that). returns the pruned count and the first captured error.
+-- per-value half of the salvages below: re-encodes one list's values under pcall, enforcing
+-- encode_buffer_values's contract, and prunes the offenders in place with ids and values compacted in
+-- lockstep. limit narrows the prefix limit for dynamically-sized values: the chunk salvage passes the largest
+-- value its budget can pack, so an oversized value prunes here instead of re-throwing the budget error
+-- forever on that always-resending channel (static sizes skip it: one oversized static value means all are,
+-- and the wholesale strip covers that). returns the pruned count and the first captured error.
 local function prune_failing_values(
 	component: any,
 	serdes: Serdes,
@@ -1069,10 +1025,9 @@ local function prune_failing_values(
 end
 
 -- the salvage pass behind measure_section_salvaging: every value list the failed measure could have been
--- encoding re-runs through prune_failing_values; hookless lists never encode, so they are skipped. lists are
--- only ever emptied in place -- never nil'd, and runs are never dropped -- so the pooled tables stay on the
--- draft for release_draft to reclaim, and an emptied list encodes as a no-op section (or run) costing a few
--- header bytes on a frame that was otherwise lost entirely. returns the total pruned count and the first
+-- encoding re-runs through prune_failing_values (hookless lists never encode). lists are only emptied in
+-- place -- never nil'd, runs never dropped -- so the pooled tables stay on the draft for release_draft, and
+-- an emptied list encodes as a no-op costing a few header bytes. returns the total pruned count and the first
 -- captured error.
 local function salvage_section_values(draft: SectionDraft, resolve_serdes: ResolveSerdes): (number, any)
 	local relation = draft.relation
@@ -1109,17 +1064,15 @@ local function salvage_section_values(draft: SectionDraft, resolve_serdes: Resol
 	return prune_failing_values(draft.component, serdes, ids, draft.values :: { any })
 end
 
--- guarded counterpart to measure_section for the packet passes: user encode hooks run inside measure (via
--- encode_buffer_values), so a hook that throws -- or returns a non-buffer, or violates its size contract --
--- would otherwise unwind out of generate_packets *after* the resolve passes marked the frame's deltas sent,
--- losing the frame silently for every client (and stranding a joiner mid-full_packet, allocated with partial
--- last marks and no packet). instead: measure under one pcall (the happy path's whole cost), salvage on
--- failure -- re-encode per value and prune exactly the offenders -- and re-measure; a hook nondeterministic
--- enough to pass the salvage and then throw again has every value send stripped wholesale (hookless lists
--- included: only a full strip guarantees the final measure runs no user code even if an encode hook mutated
--- the serdes store mid-frame), after which nulled/removed lists are all that encode and never run hooks, so a
--- throw out of the final measure is an internal bug and propagates. returns the measured size plus, on a
--- salvage, the pruned value count and the error to report -- the caller owns the warn.
+-- guarded counterpart to measure_section for the packet passes: user encode hooks run inside measure, so a
+-- throw would unwind out of generate_packets *after* the resolve passes marked the frame's deltas sent,
+-- losing the frame silently for every client and stranding a joiner mid-full_packet. instead: measure under
+-- one pcall (the happy path's whole cost), salvage on failure -- prune exactly the offenders -- and
+-- re-measure; a hook that still fails has every value send stripped wholesale (hookless lists included: only
+-- a full strip guarantees the final measure runs no user code even if a hook mutated the serdes store
+-- mid-frame), after which only nulled/removed lists encode, so a throw out of the final measure is an
+-- internal bug and propagates. returns the measured size plus, on a salvage, the pruned count and the error
+-- to report; the caller owns the warn.
 local function measure_section_salvaging(draft: SectionDraft, resolve_serdes: ResolveSerdes): (number, number, any)
 	local ok, size = pcall(measure_section, draft, resolve_serdes)
 	if ok then
@@ -1155,11 +1108,9 @@ local function measure_section_salvaging(draft: SectionDraft, resolve_serdes: Re
 	return measure_section(draft, resolve_serdes), pruned, first_error
 end
 
--- measure + write in one step, for callers encoding a section into its own scratch buffer: the draft's
--- parallel arrays encode into an exactly-sized buffer, with a hookless section's values returned as the
--- second value to travel in the packet's side array. no longer called by the packet passes (they sum measured
--- drafts into shared multi-section buffers), but kept on the module's surface as the single-section entry
--- point.
+-- measure + write in one step, encoding a section into its own exactly-sized buffer with a hookless section's
+-- values as the second return. no longer called by the packet passes (they sum measured drafts into shared
+-- multi-section buffers); kept as the module's single-section entry point.
 local function finalize_section(draft: SectionDraft, resolve_serdes: ResolveSerdes): (buffer, { any }?)
 	local size = measure_section(draft, resolve_serdes)
 	local data = buffer.create(size)
@@ -1167,22 +1118,17 @@ local function finalize_section(draft: SectionDraft, resolve_serdes: ResolveSerd
 	return data, side
 end
 
--- encodes one visibility group's unreliable drafts into chunk buffers of at most `budget` bytes each (the
--- chunk layout above), appended to `chunks`. cells pack greedily in draft order: when the next cell would
--- overflow the open chunk, the chunk closes and a fresh section naming the same component opens the next one,
--- so every chunk stands alone. every value encodes up front through the draft's resolved serdes hooks
--- (required: chunking needs byte-exact sizing) into a per-draft stash the packing loop sizes and copies from --
--- encode_buffer_values under a per-draft pcall, bounded by the budget's limit -- so user code runs only in the
--- pre-encode pass and packing never throws out of a half-written section. that pass is also the salvage
--- guard, the chunk counterpart to
--- measure_section_salvaging: a draft whose values can't encode -- a throwing hook, a violated size contract,
--- a value no chunk could fit, or missing hooks entirely -- fails its per-draft pcall before any of it packs,
--- has the offenders pruned via prune_failing_values and the survivors re-encoded, and packs whatever remains
--- (nothing, when the hook is nondeterministic enough to fail the re-encode too). returns the total pruned
--- value count plus the first captured error and the cell id it names -- the caller owns the warn, and the
--- dropped values simply skip this call's chunks (the always-replicate cadence re-sends, and may re-fail, them
--- next call). scratch is the caller's staging buffer of at least `budget` bytes; each completed chunk is
--- copied out of it into an exactly-sized buffer, so pooled draft lists never escape.
+-- encodes one visibility group's unreliable drafts into chunk buffers of at most `budget` bytes (the chunk
+-- layout above), appended to `chunks`. cells pack greedily in draft order: when the next cell would overflow
+-- the open chunk, it closes and a fresh section naming the same component opens the next, so every chunk
+-- stands alone. every value encodes up front (chunking needs byte-exact sizing) into a stash the packing loop
+-- copies from, under a per-draft pcall bounded by the budget's limit, so user code runs only in the
+-- pre-encode pass and packing never throws out of a half-written section; that pass is also the salvage
+-- guard, the chunk counterpart to measure_section_salvaging: a draft whose values can't encode has the
+-- offenders pruned via prune_failing_values and packs whatever remains. returns the total pruned count plus
+-- the first captured error and the cell id it names; the caller owns the warn, and dropped values re-send
+-- (and may re-fail) next call. scratch is the caller's staging buffer of at least `budget` bytes; completed
+-- chunks are copied out into exactly-sized buffers, so pooled draft lists never escape.
 local function finalize_chunks(
 	frame: number,
 	-- keyed by cell id; the keys are ignored here (the server's accumulators key by their branded id types)
@@ -1255,9 +1201,8 @@ local function finalize_chunks(
 				local ok, encode_error =
 					pcall(encode_buffer_values, serdes_key, serdes.encode, static, values :: { any }, encoded, 0, limit)
 				if not ok then
-					-- the per-draft salvage, mirroring measure_section_salvaging: re-encode the values one at
-					-- a time, prune exactly the offenders in place, and re-run the pre-encode over the
-					-- survivors; nothing has packed yet, so there is nothing to unwind
+					-- the per-draft salvage, mirroring measure_section_salvaging: prune exactly the offenders in place and
+					-- re-run the pre-encode over the survivors; nothing has packed yet, so there is nothing to unwind
 					local first_error: any = encode_error
 					local draft_pruned, prune_error =
 						prune_failing_values(serdes_key, serdes, ids :: { number }, values :: { any }, limit)
@@ -1342,10 +1287,9 @@ local function finalize_chunks(
 
 			if take_ids == 0 and take_nulled == 0 then
 				if offset == chunk_header_width then
-					-- an empty chunk that fits nothing: unreachable, since every value is bounded against the same budget
-					-- in the pre-encode pass above (an oversized one is pruned there, never packed) and min_chunk_bytes
-					-- floors the budget at one cell of any section. kept as an invariant so a layout change can't turn
-					-- it into a silent infinite loop, and worded for what would actually be wrong if it ever fired.
+					-- unreachable: every value is bounded against the same budget in the pre-encode pass (an oversized one
+					-- prunes there, never packs) and min_chunk_bytes floors the budget at one cell of any section. kept as
+					-- an invariant so a layout change can't turn this into a silent infinite loop.
 					fail(
 						`an unreliable section does not fit an empty chunk! ({id_to_string(serdes_key)}, budget {budget})`
 					)
@@ -1438,11 +1382,9 @@ local function finalize_chunks(
 	return pruned, salvage_error, salvage_id
 end
 
--- stamps one client's flat packet buffer from the shared scratch sections (the packet layout above).
--- sections_size must be the summed byte length of section_buffers, so the buffer allocates exactly once.
--- names carries the shared-name announcements as a (gen-qualified id -> name) map, with an empty-string name
--- encoding a retraction; values carries the hookless sections' value arrays in section order (see the Packet
--- type in types.luau).
+-- stamps one client's packet buffer from the shared section buffers (the packet layout above); sections_size
+-- must be their summed length, so the buffer allocates exactly once. names maps gen-qualified id -> name with
+-- an empty string encoding a retraction; values carries the hookless sections' value arrays in section order.
 local function assemble_packet(
 	frame: number,
 	unreplicated: { number }?,
@@ -1547,11 +1489,10 @@ local function assemble_packet(
 	}
 end
 
--- the record views decode_section / decode_packet parse into, for the verification suite and diagnostics --
--- never the reconcile path, which stream-applies without materializing records. every entity and component id
--- is a raw wire id, never mapped through a client's mapping table: dense for everything a section carries (and
--- the packet's unreplicated list), gen-qualified only in the replicated list and the names view; component is
--- the packed pair id for pair sections. list fields are nil when their list is absent from the wire.
+-- record views for the verification suite and diagnostics; the reconcile path never materializes them. every
+-- id is a raw wire id, never mapped through a client's table: dense for everything a section carries (and the
+-- unreplicated list), gen-qualified in the replicated list and names view; component is the packed pair id
+-- for pair sections. list fields are nil when absent from the wire.
 export type DecodedSection = {
 	component: number,
 	relation: number?,
@@ -1562,9 +1503,8 @@ export type DecodedSection = {
 	removed: { number }?,
 }
 
--- one component's view merged across a packet's sections (the same component may span several sections of one
--- packet when its cells resolve to different visibility masks), each section's lists appended in packet
--- order.
+-- one component's view merged across a packet's sections (the same component may span several when its cells
+-- resolve to different visibility masks), each section's lists appended in packet order.
 export type DecodedComponent = {
 	relation: number?,
 	target: number?,
@@ -1585,9 +1525,9 @@ export type DecodedPacket = {
 	components: { [number]: DecodedComponent },
 }
 
--- decodes `count` serdes-encoded values at data[offset], returning them and the offset just past; shared by
--- the record-view decoders below. each value decodes from a fresh value-sized buffer, its length read off the
--- u16 prefix unless the registration declares a static size (see the Serdes type in types.luau).
+-- decodes `count` serdes-encoded values at data[offset], returning them and the offset just past. each value
+-- decodes from a fresh value-sized buffer, its length read off the u16 prefix unless the registration
+-- declares a static size.
 local function decode_values(data: buffer, offset: number, serdes: Serdes, count: number): ({ any }, number)
 	local decoded: { any } = table.create(count)
 	local decode = serdes.decode
@@ -1608,12 +1548,10 @@ local function decode_values(data: buffer, offset: number, serdes: Serdes, count
 	return decoded, offset
 end
 
--- decodes one section at data[section_offset] into DecodedSection records -- a list, because a grouped pair
--- section decodes into one record per run -- returning them, the offset just past the section, and the
--- advanced side-array cursor. a hookless single-list section's values field is the very table the packet's
--- side array carries (shared by reference across clients whose masks matched at build time), so it must never
--- be mutated; a grouped section's hookless runs get fresh slices of their shared entry instead. decoding
--- inline values without resolvable serdes hooks errors -- their size is unknowable without the hooks.
+-- decodes one section into DecodedSection records (one per run for a grouped section), returning them, the
+-- offset just past the section, and the advanced side-array cursor. a hookless single-list section's values
+-- field is the packet's side-array table itself (shared across clients), so it must never be mutated; grouped
+-- hookless runs get fresh slices. inline values without resolvable serdes hooks error.
 local function decode_section(
 	data: buffer,
 	section_offset: number,
@@ -1725,11 +1663,9 @@ end
 
 local merged_fields = { "ids", "values", "nulled", "removed" }
 
--- parses a packet's flat wire buffer into the DecodedPacket record view: the packet frame, the entity
--- create/delete lists, the shared-name announcements (retractions decode as empty-string entries), every
--- decoded section in packet order, and a per-component view merged by appending each section's lists in
--- packet order. the raw data/values fields ride along so the record still reconciles when handed to a
--- client's reconcile_packet.
+-- parses a packet into the DecodedPacket record view, with a per-component view merged by appending each
+-- section's lists in packet order; retractions decode as empty-string names. data / values ride along so the
+-- record still reconciles when handed to reconcile_packet.
 local function decode_packet(packet: types.Packet, resolve_serdes: ResolveSerdes?): DecodedPacket
 	local data = packet.data
 	local packet_values = packet.values
@@ -1808,10 +1744,9 @@ export type DecodedChunk = {
 	sections: { DecodedSection },
 }
 
--- parses one unreliable chunk into a record view for the verification suite and diagnostics: the frame
--- counter and every section in chunk order, with raw (dense) wire ids like decode_section's records;
--- component is the packed pair id for pair sections, and removed is always nil (removals never ride chunks).
--- chunk values are always serdes-encoded, so unresolvable hooks error like decode_section's inline case.
+-- parses one unreliable chunk into a record view: the frame counter and every section in chunk order, with
+-- raw (dense) wire ids; removed is always nil (removals never ride chunks). chunk values are always
+-- serdes-encoded, so unresolvable hooks error.
 local function decode_chunk(chunk: buffer, resolve_serdes: ResolveSerdes?): DecodedChunk
 	check_chunk_version(chunk)
 	local frame = read_chunk_frame(chunk)

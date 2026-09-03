@@ -3,12 +3,10 @@
 --!optimize 2
 
 -- the client half of duplecs: server/client entity mapping, reconciliation overrides, and packet
--- reconciliation. constructed per world by the first duplecs.client call (see init.luau); later calls return
--- the same memoized instance.
+-- reconciliation. one memoized instance per world (see the accessor at the bottom).
 
--- note: in warn/error strings, `$` prefixes verified-live entity ids and `?` unverifiable ones (dead, or
--- server-namespace ids this world can't check) -- see diagnostics.luau, which owns the convention and the
--- [duplecs] prefix every message carries.
+-- note: in warn/error strings, `$` prefixes verified-live entity ids and `?` unverifiable ones -- see
+-- diagnostics.luau, which owns the convention and the [duplecs] prefix every message carries.
 
 local jecs = require("../roblox_packages/jecs")
 local pair = jecs.pair
@@ -59,9 +57,8 @@ export type RemovedOverride = (Entity) -> ()
 local function create_client(world: World, shared_record: get_shared.Record)
 	-- DIAGNOSTICS
 
-	-- the instance's warn reporter (see diagnostics.luau): the local below shadows the global warn so every
-	-- warning in this half rides the shared prefix and the injectable hook (set_warn_hook in the instance
-	-- table).
+	-- shadows the global warn so every warning here carries the [duplecs] prefix and rides the injectable
+	-- set_warn_hook (see diagnostics.luau)
 	local reporter = diagnostics.create_reporter()
 	local warn = reporter.warn
 
@@ -72,10 +69,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- GENERAL FUNCTIONS
 
-	-- retyped views of two jecs id-math originals, following names.luau's dense: they take branded ids and
-	-- plain numbers alike (every id is a number at runtime) and return the plain-number domain their call
-	-- sites compare in, so the call sites don't cast. neither sits on the per-cell reconcile loops, so they
-	-- call the jecs originals rather than mirroring the id math the way server.luau's hot paths do.
+	-- retyped views of two jecs id-math originals: they take branded ids and plain numbers alike and return the
+	-- plain-number domain their call sites compare in. neither sits on the per-cell reconcile loops, so they
+	-- call the originals rather than mirroring the id math the way server.luau's hot paths do.
 	local dense = (jecs.ECS_ID :: any) :: (entity_gen: unknown) -> number
 	local ECS_PAIR_SECOND = (jecs.ECS_PAIR_SECOND :: any) :: (id: unknown) -> number
 
@@ -86,29 +82,24 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- ENTITY MAPPING
 
 	-- both maps key by *dense* ids -- client_entity_map by the dense half of the server id (all a section wire
-	-- id carries), server_entity_map by the dense half of its own client entity -- while both maps' *values*
-	-- keep full gen-qualified ids: the creation and names lists are where a client learns the server
-	-- generation, which get_server_entity must expose for client->server requests. dense keys are deliberate:
-	-- churn respawns recycled dense ids under bumped generations, so gen-qualified keys would be brand new on
-	-- every insert, and a luau table churning fresh keys rehashes O(live) per insert whenever its live count
-	-- sits at (or one below) a power of two -- recycled dense keys keep the key set stable instead (nil then
-	-- re-set of the same key revives its slot in place, never rehashing at steady state). server-dense keys
-	-- stay unambiguous because the server never holds two live entities on one dense id and reconcile applies
-	-- deletes before creates, so a recycled id's old mapping always ends before its new tenant arrives.
-	-- client-dense keys stay unambiguous because an entry can never outlive its tenant: every mapped entity
-	-- carries Imported, and every mapping-ending path clears the entry (the unreplicated list via
-	-- delete_client_entity, and the Imported removed hook behind deletions, clears, and manual removes). the
-	-- one thing dense keys give up is stale-reference rejection by key identity, so reads split by caller:
-	-- internal reads index the table directly with entities known live (archetype walks, contains-guarded
-	-- lookups, or the removed hook's mid-teardown entity, whose dense slot cannot have been recycled yet),
-	-- while the public get_server_entity guards with the generation-aware world:contains so a caller's stale
-	-- reference resolves to nil rather than to the dense slot's next tenant's mapping.
+	-- id carries), server_entity_map by the dense half of its own client entity -- while the values keep full
+	-- gen-qualified ids: the creation and names lists are where a client learns the server generation, which
+	-- get_server_entity must expose. dense keys are deliberate: churn respawns recycled dense ids under bumped
+	-- generations, and a luau table churning fresh keys rehashes O(live) per insert at power-of-two live counts,
+	-- while recycled dense keys revive their slot in place. server-dense keys stay unambiguous because the
+	-- server never holds two live entities on one dense id and reconcile applies deletes before creates;
+	-- client-dense keys because every mapping-ending path clears the entry (the unreplicated list via
+	-- delete_client_entity, the Imported removed hook behind everything else). what dense keys give up is
+	-- stale-reference rejection by key identity, so reads split by caller: internal reads index directly with
+	-- entities known live (archetype walks, contains-guarded lookups, or the removed hook's mid-teardown entity,
+	-- whose dense slot cannot have recycled yet), while the public get_server_entity guards with the
+	-- generation-aware world:contains.
 	local client_entity_map = {} :: { [number]: Entity }
 	local server_entity_map = {} :: { [number]: number }
 
-	-- dense server ids whose mapping was established by a shared-name announcement (see map_shared_name): a name
-	-- retraction may only end these -- a creation-established mapping ends through the unreplicated list, and a
-	-- manual one belongs to the caller. cleared whenever the mapping ends or a creation entry adopts it.
+	-- dense server ids whose mapping a shared-name announcement established: a name retraction may only end
+	-- these (a creation-established mapping ends through the unreplicated list, a manual one belongs to the
+	-- caller). cleared when the mapping ends or a creation adopts it.
 	local name_mapped = {} :: { [number]: true }
 
 	-- dense server ids already reported for arriving unmapped (see warn_unmapped): one warning per id per
@@ -128,9 +119,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		world:add(client_entity, Imported)
 	end
 
-	-- the liveness guard is what makes a caller's stale reference safe under dense keys (see the maps above):
-	-- world:contains is generation-aware, so a dead reference resolves to nil here even when its dense slot
-	-- already holds a next tenant's mapping
+	-- world:contains is generation-aware, so a caller's dead reference resolves to nil even when its dense slot
+	-- already holds a next tenant's mapping (see the maps above)
 	local function get_server_entity(client_entity: Entity): number?
 		if world:contains(client_entity) ~= true then
 			return nil
@@ -138,14 +128,12 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return server_entity_map[dense(client_entity)]
 	end
 
-	-- warns when a reliable section references an unmapped component, relation, or pair target. unresolvable
-	-- ids skip by design, but the server only references ids the client was given the means to map -- pair
-	-- cells never ship to a client that lacks the target, and definitions are the caller's mapping
-	-- responsibility -- so an unmapped id reaching reconcile means the contract was missed: the matching client
-	-- entity wasn't named (or mapped via set_client_entity) before the server first referenced the id. the
-	-- resulting holes are permanent (deltas are exactly-once; a mapping formed later only receives what changes
-	-- afterward), so silence would hide the bug indefinitely. the unreliable path stays silent instead: chunks
-	-- legitimately outrun the reliable packet that maps their ids (see reconcile_chunk).
+	-- unresolvable ids skip by design, but the server only references ids the client was given the means to
+	-- map -- pair cells never ship to a client lacking the target, and definitions are the caller's mapping
+	-- responsibility -- so an unmapped id here means the matching client entity wasn't named or mapped before
+	-- the server first referenced it. the holes are permanent (deltas are exactly-once), so silence would hide
+	-- the bug indefinitely. the unreliable path stays silent: chunks legitimately outrun the reliable packet
+	-- that maps their ids (see reconcile_chunk).
 	local function warn_unmapped(dense_id: number, role: string)
 		if unmapped_warned[dense_id] ~= nil then
 			return
@@ -160,17 +148,15 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- (whose removal dispatch it shares).
 	local sweep_imported_cells: (client_target: Entity) -> ()
 
-	-- a creation for an already-mapped server id adopts the mapping silently: pre-mapping an id the server is
-	-- about to create is the prediction flow set_client_entity exists for, so the prepared client entity simply
-	-- starts receiving the entity's data. the creation is authoritative for the generation (a manual mapping may
-	-- have been made with a stale one), and the adopted mapping now ends through the entity's deletion, never a
-	-- name retraction. one exception: a *name-established* mapping holding a different generation is a stale
-	-- older tenant of the dense id, never a prediction -- the named target died and its id recycled into a
-	-- Replicated tenant within one interval, so adopting would hand the client's own named entity to the new
-	-- tenant (its cells would apply onto it, and its eventual deletion would delete it outright) -- so the stale
-	-- mapping is torn down (and its cells swept) and a fresh client entity minted instead. a name-established
-	-- mapping with a *matching* generation keeps adopting: that is the named-target-turned-Replicated flow. a
-	-- mapping left pointing at a dead client entity is replaced like it never existed.
+	-- a creation for an already-mapped server id adopts the mapping silently -- pre-mapping an id the server is
+	-- about to create is the prediction flow set_client_entity exists for. the creation is authoritative for the
+	-- generation, and the adopted mapping now ends through the entity's deletion, never a name retraction.
+	-- exception: a *name-established* mapping holding a different generation is a stale older tenant of the
+	-- dense id (the named target died and its id recycled into a Replicated tenant within one interval);
+	-- adopting would hand the client's own named entity to the new tenant, so the stale mapping is torn down
+	-- (cells swept) and a fresh entity minted. a matching generation keeps adopting -- the
+	-- named-target-turned-Replicated flow. a mapping pointing at a dead client entity is replaced like it never
+	-- existed.
 	local function create_client_entity(server_entity_gen: number)
 		local dense_id = dense(server_entity_gen)
 		local existing_entity = client_entity_map[dense_id]
@@ -189,10 +175,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		set_client_entity(server_entity_gen, client_entity)
 	end
 
-	-- public lookups resolve through the dense half (all a wire id carries), but the caller's full generation
-	-- must match the mapping's: a stale generation names an older or newer tenant of the dense slot, not the
-	-- entity the caller asked for, so it resolves to nil rather than a false positive (see spec.md). the inverse
-	-- get_server_entity always returns the full gen-qualified id, so a round-tripped id matches exactly.
+	-- resolves through the dense half, but the caller's generation must match the mapping's: a stale generation
+	-- names another tenant of the dense slot, so it resolves to nil rather than a false positive.
+	-- get_server_entity returns the full gen-qualified id, so a round-tripped id matches exactly.
 	local function get_client_entity(server_entity: number): Entity?
 		local client_entity = client_entity_map[dense(server_entity)]
 		if client_entity ~= nil and server_entity_map[dense(client_entity)] == server_entity then
@@ -221,13 +206,13 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- prevents cascading (OnDeleteTarget, Delete) for imported entities since the entity might still exist on
-	-- the server and have Replicated dependents. note: pairs referencing this entity that exist only locally are
-	-- *not* renewed if the entity gets Replicated again.
+	-- prevents cascading (OnDeleteTarget, Delete) into imported entities, which might still exist on the server
+	-- with Replicated dependents. pairs referencing this entity that exist only locally are *not* renewed if the
+	-- entity gets Replicated again.
 	local function safe_delete(client_entity: Entity)
-		-- walk the local (OnDeleteTarget, Delete) closure without deleting anything yet: detach imported dependents
-		-- (removing the currently-iterated pair is iteration-safe) and queue local ones. the visited set keeps
-		-- cyclical relations from re-queueing an entity.
+		-- walks the local (OnDeleteTarget, Delete) closure without deleting yet: detaches imported dependents
+		-- (removing the iterated pair is iteration-safe) and queues local ones; visited keeps cyclical relations
+		-- from re-queueing.
 		local queue = { client_entity }
 		local visited = { [client_entity] = true } :: { [Entity]: true }
 		local count = 1
@@ -284,22 +269,21 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if id ~= Imported then
 			return
 		end
-		-- covers deletions that bypass delete_client_entity (e.g. cascades). note: the client should avoid adding
-		-- (OnDeleteTarget, Delete) to imported entities; the resulting server/client mismatch is *not*
-		-- auto-corrected. the raw read (not get_server_entity) is deliberate: this can fire inside world:delete's
-		-- teardown, and the getter's liveness guard must not decide anything mid-death (the pinned jecs keeps the
-		-- dying entity alive-indexed until its own removed hooks have run, but that ordering isn't contractual).
-		-- the read stays unambiguous because the dense slot cannot recycle before the deletion completes.
+		-- covers deletions that bypass delete_client_entity (cascades). the client should avoid adding
+		-- (OnDeleteTarget, Delete) to imported entities; the resulting mismatch is *not* auto-corrected. the raw
+		-- read (not get_server_entity) is deliberate: this can fire inside world:delete's teardown, where the
+		-- liveness guard must not decide anything (the pinned jecs keeps the dying entity alive-indexed until its
+		-- removed hooks have run, but that isn't contractual); the dense slot cannot recycle before the deletion
+		-- completes, so the read is unambiguous.
 		local server_entity = server_entity_map[dense(client_entity)]
 		if server_entity then
 			remove_references(client_entity, server_entity)
 		end
 	end)
 
-	-- construction catch-up: the shared component set (see shared.luau) can predate this instance, so entities
-	-- may already carry Imported -- always a misuse, since mappings are minted by this instance's own paths and
-	-- none existed before construction. replay the guard over pre-collected holders (its remove would
-	-- invalidate a live world:each walk), surfacing the same error a live add would have raised.
+	-- construction catch-up: the shared set can predate this instance, so entities may already carry Imported --
+	-- always a misuse, since no mapping existed before construction. the guard replays over pre-collected
+	-- holders (its remove would invalidate a live world:each walk).
 	local imported_holders = {} :: { Entity }
 	for client_entity in world:each(Imported) do
 		table.insert(imported_holders, client_entity)
@@ -317,10 +301,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- NAME INDEX
 
-	-- client entities by jecs.Name, kept live by the hooks below (seeded by a catch-up walk at construction) so
-	-- announced shared names resolve without scanning. entity_names mirrors the current name per entity so a
-	-- rename clears its old index entry. names used for shared definitions must be unique in this world; on a
-	-- collision the latest indexed entity wins.
+	-- client entities by jecs.Name, kept live by the hooks below (seeded at construction) so announced names
+	-- resolve without scanning; entity_names lets a rename clear its old entry. shared names must be unique in
+	-- this world; on a collision the latest indexed entity wins.
 	local entities_by_name = {} :: { [string]: Entity }
 	local entity_names = {} :: { [Entity]: string }
 
@@ -369,19 +352,15 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		index_name(client_entity, world:get(client_entity, jecs.Name))
 	end
 
-	-- maps one announced shared name: ids the server names on the wire (networked definitions and named pair
-	-- targets) bind to the client entity carrying the same jecs.Name, sparing the startup set_client_entity
-	-- calls. a server id already mapped with the announced generation is left alone (a manual mapping wins), but
-	-- a mapping holding a *different* generation is for an older tenant of the dense id -- the announcement is
-	-- authoritative for the current one, so the stale mapping ends first and its cells are swept before the new
-	-- tenant's sections apply (this is also what resolves a same-frame die-and-recycle, where the old tenant's
-	-- retraction collapses into the new tenant's announcement -- the server drops the old tenant's tainted
-	-- removals, so the sweep is the only thing removing its cells). a name with no live client entity is skipped
-	-- silently, not warned: announcements ride to every client regardless of privacy (names are schema), so a
-	-- client legitimately lacks entities for definitions whose data never reaches it (server-only components
-	-- among them) -- data arriving for a still-unmapped id is what warn_unmapped reports. a client entity
-	-- already mapped to a different server id warns -- two shared definitions resolving to one client entity is
-	-- a naming collision worth surfacing.
+	-- maps one announced shared name to the client entity carrying the same jecs.Name. a server id already
+	-- mapped with the announced generation is left alone (a manual mapping wins), but one holding a *different*
+	-- generation is an older tenant of the dense id: the announcement is authoritative, so the stale mapping
+	-- ends and its cells are swept before the new tenant's sections apply -- this is also what resolves a
+	-- same-frame die-and-recycle, where the server drops the old tenant's tainted removals and the sweep is the
+	-- only thing removing its cells. a name with no live client entity is skipped silently: announcements ride
+	-- to every client regardless of privacy, so a client legitimately lacks entities for definitions whose data
+	-- never reaches it; data arriving for a still-unmapped id is what warn_unmapped reports. a client entity
+	-- already mapped to a different server id warns -- a naming collision worth surfacing.
 	local function map_shared_name(server_entity_gen: number, name: string)
 		local dense_id = dense(server_entity_gen)
 		local existing_entity = client_entity_map[dense_id]
@@ -410,18 +389,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		name_mapped[dense_id] = true
 	end
 
-	-- ends the mapping a retracted announcement established (see the names layout in wire.luau): the server
-	-- withdrew the id's name -- its named target died, lost its name, or stopped being replication-relevant --
-	-- so the mapping must not survive to misbind the dense id's next tenant. only name-established mappings end
-	-- here, and only while they still hold the retracted generation: a creation in the same packet has already
-	-- adopted the mapping out of name provenance (a named target that became Replicated keeps its mapping
-	-- wherever the entity is visible), and a newer tenant's mapping is never for the retracted announcement.
-	-- ending the mapping also sweeps the entity's cells -- retractions apply after the sections, so a plain
-	-- death's explicit removals have already applied and the sweep finds nothing, but when the dense id recycled
-	-- into an unreplicable (or unnamed tracked) tenant within one interval no announcement overwrote the
-	-- retraction and the server dropped the old tenant's tainted removals, so this sweep is the only cleanup
-	-- those cells get -- and it also clears whatever an unnamed tracked tenant's sections misapplied through
-	-- this still-live mapping moments earlier.
+	-- ends the mapping a retracted announcement established, so it cannot misbind the dense id's next tenant.
+	-- only name-established mappings still holding the retracted generation end here: a creation in the same
+	-- packet has already adopted the mapping out of name provenance, and a newer tenant's mapping is never for
+	-- the retracted announcement. ending it also sweeps the entity's cells: retractions apply after the
+	-- sections, so a plain death's explicit removals have already applied and the sweep finds nothing, but when
+	-- the dense id recycled into an unreplicable (or unnamed tracked) tenant within one interval the server
+	-- dropped the old tenant's tainted removals, so this sweep is their only cleanup -- and it also clears
+	-- whatever an unnamed tracked tenant's sections misapplied through the still-live mapping moments earlier.
 	local function unmap_shared_name(server_entity_gen: number)
 		local dense_id = dense(server_entity_gen)
 		if name_mapped[dense_id] == nil then
@@ -438,9 +413,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- SERDES
 
-	-- the per-world serdes store (see shared.luau / serdes.luau): registrations validate at their own call
-	-- site, or -- pre-registered ones, which the store replays at its construction -- from the world's first
-	-- duplecs contact, so this half needs no serdes catch-up of its own
+	-- the per-world serdes store (see serdes.luau): registrations validate at their own call site or from the
+	-- world's first duplecs contact, so this half needs no serdes catch-up
 	local Serdes = shared_record.components.Serdes
 	local resolve_serdes = shared_record.resolve_serdes
 
@@ -479,36 +453,31 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- MAPPING-TEARDOWN SWEEP
 
 	-- removes every cell on an imported subject that references client_target through otherwise-imported
-	-- halves -- pairs targeting it whose relation is imported, pairs using it as the relation whose target is
-	-- imported, and unpaired cells using it as the component -- dispatching each removal exactly like
-	-- apply_lists' removed entries (cell-level override, relation-level fallback, else world:remove). this is
-	-- the out-of-band cleanup for cells referencing a name-mapped entity the server withdrew: explicit
-	-- removals are the only thing cleaning them (the entity is client-owned and never deleted by
-	-- reconciliation), and the server drops the removals of a dense id that retired one tenant and re-bound
-	-- another within one interval -- they would misresolve to the new tenant on the wire (see
-	-- resolve_visibility_cells in server.luau) -- so the client owns them at exactly the moments a mapping
-	-- ends without its client entity dying: a retraction unmap, a superseding announcement's teardown, and a
-	-- creation's stale-name-mapping teardown. cells riding purely local ids and local subjects are untouched;
-	-- the semantic edge -- client-created cells whose other halves are imported are swept too -- is documented
-	-- in docs/spec.md. deliberately *not* hooked on the Imported removal itself: that fires
-	-- mid-archetype-transition, and a genuine deletion's pairs are removed by jecs with the dying entity.
-	-- removals are collected before any is applied, since applying moves subjects between archetypes under
-	-- the walk.
+	-- halves -- pairs targeting it with an imported relation, pairs using it as the relation with an imported
+	-- target, and unpaired cells using it as the component -- dispatching each removal like apply_lists' removed
+	-- entries. this is the out-of-band cleanup for cells referencing a name-mapped entity the server withdrew:
+	-- the entity is client-owned and never deleted by reconciliation, and the server drops the removals of a
+	-- dense id that retired one tenant and re-bound another within one interval (they would misresolve to the
+	-- new tenant on the wire -- see resolve_visibility_cells in server.luau), so the client owns them wherever a
+	-- mapping ends without its entity dying: a retraction unmap, a superseding announcement, and a creation's
+	-- stale-name teardown. client-created cells whose other halves are imported are swept too (documented in
+	-- docs/spec.md). deliberately *not* hooked on the Imported removal: that fires mid-archetype-transition, and
+	-- a genuine deletion's pairs are removed by jecs with the dying entity. removals are collected before any is
+	-- applied, since applying moves subjects between archetypes under the walk.
 	function sweep_imported_cells(client_target: Entity)
 		local target_dense = dense(client_target)
 		local subjects: { Entity } = {}
 		local cell_ids: { Id } = {}
 		local count = 0
 
-		-- the three walks below drive off the ids' component records directly (an uncached
-		-- world:query():archetypes() call rebuilds exactly the record's archetype list, and world:each pays a
-		-- closure plus a call per subject); world.archetypes is re-read per sweep since world:cleanup rebuilds it.
+		-- the walks drive off the ids' component records directly (an uncached world:query():archetypes() rebuilds
+		-- exactly that list, and world:each pays a closure plus a call per subject); world.archetypes is re-read
+		-- per sweep since world:cleanup rebuilds it.
 		local world_archetypes = world.archetypes
 
-		-- pairs targeting the entity, the relation recovered from archetype.types. pairs sharing a *target* are
-		-- not contiguous in types (pair ids pack relation-major, and types is sorted by id), so unlike the
-		-- relation-wildcard walk below this scans each archetype's types, with the record's count as an early
-		-- exit once every targeting pair has been seen.
+		-- pairs targeting the entity. pairs sharing a *target* are not contiguous in types (pair ids pack
+		-- relation-major, and types is sorted by id), so this scans each archetype's types, with the record's count
+		-- as an early exit.
 		local idr_target = component_index[pair(jecs.Wildcard, client_target)]
 		if idr_target ~= nil then
 			local target_counts = idr_target.counts
@@ -541,10 +510,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		-- pairs using the entity as the relation: same-relation pairs sit contiguously in types, so the record's
-		-- records/counts give each archetype's exact slice (see the server's each_target). the entity's own
-		-- mapping ended just before this sweep, so the target check must allow the entity itself alongside
-		-- imported targets -- which also collects a self-targeting pair exactly once, the walk above having
-		-- skipped it for its no-longer-imported relation.
+		-- records/counts give each archetype's exact slice (see the server's each_target). the entity's own mapping
+		-- ended just before this sweep, so the target check must allow the entity itself -- which also collects a
+		-- self-targeting pair exactly once, the walk above having skipped it for its no-longer-imported relation.
 		local idr_relation = component_index[pair(client_target, jecs.Wildcard)]
 		if idr_relation ~= nil then
 			local relation_counts = idr_relation.counts
@@ -604,17 +572,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- RECONCILE
 
 	-- the fused parse-and-apply loop for one list of serdes-encoded values at data[offset] -- `count` ids with
-	-- their values following the id list -- shared by both reconcile entry points. each value decodes from a
-	-- fresh value-sized buffer, its length read off the u16 prefix unless the registration declares a static
-	-- size, and applies through changed_override when one is registered, else world:set. entities that don't
-	-- resolve locally hop the value by its length without decoding it, as do entities the guard excludes:
-	-- guarded is the unreliable path's rule that a value applies only where the entity currently has the
-	-- component (see apply_chunk_lists), never set alongside an override, which owns application. decode runs
-	-- under pcall: the framing gives every value's length before it decodes, so a throwing hook skips exactly
-	-- its own value and the stream stays aligned for the rest of the packet (or chunk), which a mid-reconcile
-	-- unwind would lose unrecoverably (deltas are exactly-once and applied entries aren't safely
-	-- re-appliable). returns the offset just past the values, the skipped count, and the first captured error --
-	-- the caller owns the warning.
+	-- their values following the id list. each value decodes from a fresh value-sized buffer, its length read
+	-- off the u16 prefix unless the registration declares a static size. unmapped entities hop the value without
+	-- decoding, as do entities guarded excludes: the unreliable path's rule that a value applies only where the
+	-- entity currently has the component (see apply_chunk_lists), never set alongside an override, which owns
+	-- application. decode runs under pcall: the framing gives every value's length before it decodes, so a
+	-- throwing hook skips exactly its own value and the stream stays aligned, where a mid-reconcile unwind would
+	-- lose the rest of the packet unrecoverably (deltas are exactly-once). returns the offset past the values,
+	-- the skipped count, and the first error; the caller owns the warning.
 	local function apply_values(
 		data: buffer,
 		offset: number,
@@ -659,10 +624,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return value_offset, skipped, first_error
 	end
 
-	-- the nulled-list counterpart: `count` ids at data[offset] whose cells are present but hold no value.
-	-- changed_override receives them with no value; otherwise a tag is added and a data component set to nil
-	-- (world:add is a no-op when the component is already present and would leave a stale value behind).
-	-- guarded is the unreliable path's presence rule, as in apply_values. returns the offset just past the list.
+	-- the nulled-list counterpart: `count` ids whose cells are present but hold no value. with no override a tag
+	-- is added and a data component set to nil (world:add is a no-op on a present component and would leave a
+	-- stale value). guarded as in apply_values.
 	local function apply_nulled(
 		data: buffer,
 		offset: number,
@@ -690,10 +654,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	end
 
 	-- applies one section's -- or one grouped run's -- lists at data[offset]: ids with inline or side-array
-	-- values, then nulled, then removed. shared so both layouts stream through identical code; side_base is the
-	-- caller's cursor into the side array (always 0 for a plain section, which owns its array whole), and
-	-- relation_changed / relation_removed are the relation-level override fallbacks, fixed for a whole section
-	-- so the caller resolves them once rather than per run. returns the offset just past the lists.
+	-- values, then nulled, then removed. side_base is the caller's cursor into the side array (0 for a plain
+	-- section), and relation_changed / relation_removed the relation-level override fallbacks, resolved once per
+	-- section rather than per run. returns the offset past the lists.
 	local function apply_lists(
 		data: buffer,
 		offset: number,
@@ -772,12 +735,11 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return offset
 	end
 
-	-- stream-parses one section at data[section_offset] (the headers through wire.read_section_header /
-	-- read_run_header, the id lists inline), applying cells as it reads, and returns the offset just past the
-	-- section plus the advanced packet-values cursor. sections whose component or pair halves don't resolve
-	-- locally are skipped -- whole via the length prefix, or run by run for a grouped section's unmapped targets --
-	-- with a once-per-id warning (warn_unmapped), but skipped hookless lists still consume their side-array
-	-- entries, keeping the cursor aligned for whatever follows.
+	-- stream-parses one section at data[section_offset], applying cells as it reads, and returns the offset past
+	-- the section plus the advanced packet-values cursor. sections whose component or pair halves don't resolve
+	-- locally are skipped -- whole via the length prefix, or run by run for a grouped section's unmapped
+	-- targets -- with a once-per-id warning, but skipped hookless lists still consume their side-array entries
+	-- to keep the cursor aligned.
 	local function reconcile_section(
 		data: buffer,
 		section_offset: number,
@@ -903,16 +865,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return next_offset, values_index
 	end
 
-	-- applies one unreliable chunk section's lists at data[offset]: ids with their serdes-encoded values, then
-	-- nulled. the unreliable stream only *updates* cells -- membership is authoritative on the reliable path --
-	-- so with no override registered a value applies only where the entity currently has the component (the
-	-- guard apply_values and apply_nulled take): a chunk arriving after the reliable removal of a cell (drops
-	-- and reordering make that inevitable) must not resurrect it with a stale value the server would never
-	-- correct, since the cell is no longer streamed. a registered override is invoked unguarded instead -- it
-	-- owns application, and cannot resurrect anything. a throwing decode is contained like apply_lists', under
-	-- this path's own warning: a poisoned value would otherwise error every chunk carrying it, taking the whole
-	-- unreliable channel down until the value changes -- and chunks are self-healing frame to frame, so the
-	-- skipped cell is only stale, never lost.
+	-- applies one chunk section's lists at data[offset]: ids with serdes-encoded values, then nulled. the
+	-- unreliable stream only *updates* cells -- membership is authoritative on the reliable path -- so with no
+	-- override a value applies only where the entity currently has the component: a chunk arriving after a
+	-- cell's reliable removal (inevitable under drops and reordering) must not resurrect it with a value the
+	-- server would never correct, the cell no longer being streamed. an override is invoked unguarded; it owns
+	-- application. a throwing decode is contained under this path's own warning: a poisoned value would
+	-- otherwise error every chunk carrying it, and chunks self-heal frame to frame, so the skipped cell is only
+	-- stale.
 	local function apply_chunk_lists(
 		data: buffer,
 		offset: number,
@@ -954,11 +914,10 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return offset
 	end
 
-	-- stream-parses one chunk section at data[section_offset], applying cells as it reads, and returns the
-	-- offset just past the section. a section whose component or pair halves don't resolve locally skips whole
-	-- via its length prefix (chunks carry no side arrays, so there is no cursor to keep aligned) -- silently,
-	-- unlike the reliable path's warn_unmapped: a chunk outrunning the reliable packet that maps its ids is
-	-- routine, not a contract violation, and the reliable path reports any id that genuinely never maps.
+	-- stream-parses one chunk section, applying cells as it reads, and returns the offset past it. unresolvable
+	-- components or pair halves skip the section whole via its length prefix (chunks carry no side arrays) --
+	-- silently, unlike warn_unmapped: a chunk outrunning the reliable packet that maps its ids is routine, and
+	-- the reliable path reports any id that never maps.
 	local function reconcile_chunk_section(data: buffer, section_offset: number): number
 		local _, next_offset, offset, first_id, target_id, ids_count, nulled_count =
 			read_chunk_section_header(data, section_offset)
@@ -987,12 +946,10 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- the first chunk applies.
 	local latest_chunk_frame: number? = nil
 
-	-- applies one received unreliable chunk (see the chunk layout in wire.luau). chunks are self-contained --
-	-- every value re-sends every frame -- so this is drop- and reorder-tolerant by construction: a chunk older
-	-- than the newest reconciled is dropped whole (wrap-aware, so reordered delivery never snaps values backward --
-	-- the next frame's chunks resend everything), chunks of one frame apply in any order (their cells are
-	-- disjoint), and ids that don't resolve locally yet -- e.g. a chunk outrunning the reliable packet that
-	-- creates its entities -- skip harmlessly until a later frame finds them mapped.
+	-- applies one unreliable chunk (see wire.luau). chunks are self-contained -- every value re-sends every
+	-- frame -- so this is drop- and reorder-tolerant: a chunk older than the newest reconciled drops whole
+	-- (wrap-aware, so reordered delivery never snaps values backward), chunks of one frame apply in any order
+	-- (their cells are disjoint), and ids that don't resolve yet skip until a later frame finds them mapped.
 	local function reconcile_chunk(chunk: buffer)
 		-- refuse a reliable packet (or a chunk from a different wire format) before reading any other field
 		check_chunk_version(chunk)
@@ -1019,35 +976,30 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the packet frame every packet of one generate_packets call shares (see wire.luau); lets a caller group,
-	-- dedupe, or order the packets of a single stream. validates the wire format version first (like
-	-- reconcile_packet), so a caller grouping packets across channels rejects a mismatched one here rather than
-	-- carrying it as far as reconcile. frames wrap (u32) and compare wrap-aware like chunk frames, and the two
-	-- counters are independent -- a packet frame is never comparable to a chunk frame.
+	-- the packet frame every packet of one generate_packets call shares (see wire.luau), for grouping, deduping,
+	-- or ordering the packets of one stream. validates the wire version first, so a mismatched packet is
+	-- rejected here rather than carried as far as reconcile. frames wrap (u32) and compare wrap-aware like chunk
+	-- frames; the two counters are independent, never comparable.
 	local function get_packet_frame(packet: Packet): number
 		check_version(packet.data)
 		return read_packet_frame(packet.data)
 	end
 
-	-- the chunk-side counterpart to get_packet_frame: the chunk frame counter every chunk of one
-	-- generate_unreliable_chunks call shares (see the chunk layout in wire.luau), read without reconciling the
-	-- chunk. validates the chunk version first (like reconcile_chunk), so a reliable packet -- or a
-	-- chunk from an incompatible build -- is refused here rather than misread. exists so a caller capturing
-	-- values through changed overrides (an interpolation or snapshot buffer) can timestamp what it captures:
-	-- reconcile is synchronous, so read the frame, park it in an upvalue, and reconcile -- a stale chunk drops
-	-- whole before any override fires, so the parked frame never stamps stale values. frames wrap (u32), so
-	-- compare wrap-aware: b is newer than a exactly when (b - a) % 2^32 is in [1, 2^31).
+	-- the chunk counterpart, read without reconciling; validates the chunk version first, so a reliable packet
+	-- is refused rather than misread. exists so a caller capturing values through changed overrides (an
+	-- interpolation or snapshot buffer) can timestamp them: reconcile is synchronous, so read the frame, park
+	-- it, and reconcile -- a stale chunk drops whole before any override fires, so the parked frame never stamps
+	-- stale values. compare wrap-aware: b is newer than a exactly when (b - a) % 2^32 is in [1, 2^31).
 	local function get_chunk_frame(chunk: buffer): number
 		check_chunk_version(chunk)
 		return read_chunk_frame(chunk)
 	end
 
-	-- applies a received packet (the header through wire.read_packet_header): entity deletes before creates to
-	-- support id recycling, then the shared name announcements (so freshly-announced definitions resolve for the
-	-- sections that follow), then every section until the end of the buffer, and only then any name retractions --
-	-- a retracting packet's sections may still reference the id (the explicit pair removals a named target's
-	-- death stages), so its mapping must outlive them. the rare second walk of the names list keeps the
-	-- reconcile allocation-free.
+	-- applies a received packet: entity deletes before creates (id recycling), then name announcements (so
+	-- freshly-announced definitions resolve for the sections that follow), then every section to the end of the
+	-- buffer, and only then name retractions -- a retracting packet's sections may still reference the id (the
+	-- explicit pair removals a named target's death stages), so its mapping must outlive them. the rare second
+	-- walk of the names list keeps reconcile allocation-free.
 	local function reconcile_packet(packet: Packet)
 		local data = packet.data
 		-- refuse a packet encoded with a different wire format before reading any other field (see check_version /
@@ -1124,11 +1076,9 @@ end
 
 export type ClientInstance = typeof(create_client(nil :: any, nil :: any))
 
--- the memoized accessor (duplecs.client), mirroring the server half's: the first call on a world constructs
--- the instance and stores it on the world's shared record (see shared.luau), every later call returns that
--- same instance, and the typeof above hands callers the full instance type past the record's unknown-typed
--- slot. a constructor error simply propagates with nothing memoized: a programming bug to stop and fix, not
--- a state to recover from.
+-- the memoized accessor (duplecs.client): the first call on a world constructs the instance and stores it on
+-- the world's shared record; the typeof above hands callers the full instance type past the record's
+-- unknown-typed slot. a constructor error propagates with nothing memoized.
 return function(world: World): ClientInstance
 	local shared_record = get_shared.get_record(world)
 	local instance = shared_record.client

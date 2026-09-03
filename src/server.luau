@@ -25,11 +25,9 @@ local diagnostics = require("./diagnostics")
 local fail = diagnostics.fail
 local id_to_string = diagnostics.id_to_string
 
--- private frozen-table sentinel marking a cell that is present on the entity but holds no value (a tag, or a
--- value of nil), distinct from an absent entry in a ChangedValues table. compared only by table identity,
--- never against the string "_nulled", so a component whose legitimate value happens to be that string can't
--- be misrouted into a packet's nulled list. the sentinel itself never crosses the wire (nulled cells travel
--- in their own list), so only these internal comparisons ever observe it.
+-- sentinel for a staged cell present on the entity but holding no value (a tag, or nil), distinct from an
+-- absent ChangedValues entry. compared by table identity only, and never crosses the wire (nulled cells
+-- travel in their own list).
 local _nulled = table.freeze({ _nulled = true }) :: _Nulled
 
 -- stand-in for a component record's archetype map when the component has no record yet (nothing was ever
@@ -42,9 +40,8 @@ local write_section = wire.write_section
 local assemble_packet = wire.assemble_packet
 local finalize_chunks = wire.finalize_chunks
 
--- mask runs pack (shard, word) as word + shard * 2^32 -- exact in f64 up to ~2^21 shards. a cell's
--- cross-shard visibility keys as a path of runs through a per-frame trie (see generate_packets), so equal
--- visibility always lands on the same node and one numeric run stays a plain number-keyed lookup.
+-- mask runs pack (shard, word) as word + shard * 2^32 (exact in f64 up to ~2^21 shards); a cell's cross-shard
+-- visibility is a path of runs through the per-frame mask trie, so equal visibility lands on one node.
 local shard_key_span = 2 ^ 32
 
 -- generate_packets calls between sweeps of the persistent packet-group store, and the staleness bar for
@@ -52,9 +49,8 @@ local shard_key_span = 2 ^ 32
 local group_sweep_interval = 512
 
 -- the default byte budget of one unreliable chunk: Roblox's unreliable remote limit is 1000 bytes for the
--- whole event payload, so the default leaves headroom for the buffer argument's own envelope. verified
--- empirically in Studio (2026-08-11): an incompressible buffer arrives up to exactly 996 bytes, so the
--- envelope costs 4 and 980 keeps 16 spare. pass chunk_bytes to generate_unreliable_chunks to tune it for
+-- whole event payload. measured in Studio (2026-08-11), an incompressible buffer arrives up to exactly 996
+-- bytes, so the envelope costs 4 and 980 keeps 16 spare. pass chunk_bytes to generate_unreliable_chunks for
 -- other transports.
 local default_chunk_bytes = 980
 
@@ -66,8 +62,7 @@ local max_chunk_bytes = wire.max_chunk_bytes
 
 -- JECS ID MATH MIRRORS (so the compiler inlines)
 
--- the parameters take jecs's branded id types (and plain numbers) directly -- every id is a number at
--- runtime -- so the call sites don't cast per call; the one number assertion lives inside each mirror.
+-- parameters are typed unknown so call sites pass branded ids and plain numbers alike without casts.
 
 local ECS_ENTITY_MASK = 2 ^ 24
 local ECS_PAIR_OFFSET = 2 ^ 48
@@ -103,37 +98,28 @@ type Packet = types.Packet
 
 type ChangedValues = { [Entity]: _Nulled | unknown }
 
--- one node of the mask trie: children keyed by run (word + shard * 2^32), appended in ascending shard order
--- with zero words skipped, so a cell's cross-shard visibility resolves to exactly one node. contents are
--- per-frame; the node tables themselves recycle through a free list (see generate_packets).
+-- one mask-trie node: children keyed by run, appended in ascending shard order with zero words skipped, so
+-- equal cross-shard visibility resolves to exactly one node. contents are per-frame; the tables recycle
+-- through a free list.
 type MaskTrieNode = { [number]: MaskTrieNode }
 
--- one accumulated-visibility node: the set of clients a cell's sections go to, in the two forms the packet
--- passes key by. with several shards occupied it is a mask-trie node; with one -- the common case -- the trie
--- is skipped and the shard's raw mask word stands in for it (0 meaning "nothing accumulated yet"). every
--- per-node store below is keyed by it, and the expansion passes decode it back into client indices.
+-- the set of clients a cell's sections go to: a mask-trie node with several shards occupied, the shard's raw
+-- mask word with one (0 meaning nothing accumulated yet). the expansion passes decode it back into client
+-- indices.
 type VisibilityNode = MaskTrieNode | number
 
--- per-group bucket of cells dirtied this frame; parallel arrays indexed 1..count, with each cell's send /
--- removed masks accumulated across shards as mask-trie nodes (0 until the first nonzero word; with a single
--- occupied shard the trie is skipped and the raw mask word itself is the key -- see generate_packets).
--- unpaired components each own a group; pair cells share one group per relation, with targets carrying each
--- row's gen-qualified target half, so many distinct pair(relation, target) ids cost one persistent group
--- between them. row_of correlates a cell's row between shards and is only maintained when several shards are
--- occupied -- pair groups nest it per pair id in pair_rows instead, since one relation's rows span several
--- targets (even on one entity); with one shard a cell may instead occupy two rows (a removal row and a
--- value-send row), which is harmless since their nodes never overlap. groups persist across frames, so a
--- component or relation always reuses its own arrays: row demand is only predictable per group, and a shared
--- pool would stretch every array the busiest group lands on to its length. the bucket pass consumes the rows,
--- then resets count and clears values / row_of / pair_rows so stale rows never pin user component data (rows
--- past a future count hold only numbers or pooled trie nodes, so they stay). frame marks the group's last
--- touch, driving the per-frame relation re-resolve in get_pair_group and the eviction sweep in
--- generate_packets. is_tag gates the live value read: for a pair group it holds the relation's tag-ness -- a
--- data relation types every pair as data, while a tag relation's pairs follow their target, re-checked per
--- pair id in the resolve passes.
+-- per-group bucket of the cells dirtied this frame: parallel arrays indexed 1..count, with send / removed
+-- masks accumulated across shards as VisibilityNodes. unpaired components own a group each; pair cells share
+-- one group per relation, targets carrying each row's gen-qualified target. row_of correlates a cell's row
+-- between shards and is only maintained with several shards occupied (pair groups nest it per pair id in
+-- pair_rows, since one relation's rows span several targets); with one shard a cell may occupy a removal row
+-- and a value-send row, harmless since their nodes never overlap. groups persist across frames so each
+-- component reuses its own arrays (row demand is only predictable per group), and the bucket pass resets
+-- count and clears values / row_of / pair_rows so stale rows never pin user data. for a pair group is_tag
+-- holds the relation's tag-ness: a data relation types every pair as data, while a tag relation's pairs
+-- follow their target, re-checked per pair id in the resolve passes.
 type PacketGroup = {
-	-- the group store's key: the component id for unpaired groups, the relation's dense half for pair groups --
-	-- never a wire id (the drafts name only the component or relation)
+	-- the component id, or the relation's dense half for pair groups; never a wire id
 	key: number,
 	frame: number,
 	count: number,
@@ -148,11 +134,9 @@ type PacketGroup = {
 	pair_rows: { [Id]: { [Entity]: number } }?,
 }
 
--- accumulation shape shared by full_packet and the bucket pass, encoded into one section of the packet buffer
--- by wire.measure_section / write_section (which own the types): unpaired drafts carry their lists directly,
--- pair drafts group cells into per-target runs. drafts, runs, and their lists recycle through the pools
--- (pools.luau) once encoded, with one escape: whatever list write_section returns as the packet's side array
--- left by reference and is never pooled.
+-- one section's accumulated cells (see wire.luau): unpaired drafts carry their lists directly, pair drafts
+-- group cells into per-target runs. drafts and lists recycle through pools.luau once encoded, except the
+-- hookless value list write_section hands back as the packet's side array, which escapes and is never pooled.
 type SectionDraft = wire.SectionDraft
 
 -- bit-packed number where each bit represents the visibility to the client allocated to that bit.
@@ -173,9 +157,8 @@ type AllowMaskCache = { [Entity]: { [Component]: ShardMasks } }
 local function create_server(world: World, shared_record: get_shared.Record)
 	-- DIAGNOSTICS
 
-	-- the instance's warn reporter (see diagnostics.luau): the local below shadows the global warn so every
-	-- warning in this half rides the shared prefix and the injectable hook (set_warn_hook in the instance
-	-- table).
+	-- shadows the global warn so every warning here carries the [duplecs] prefix and rides the injectable
+	-- set_warn_hook (see diagnostics.luau)
 	local reporter = diagnostics.create_reporter()
 	local warn = reporter.warn
 
@@ -191,24 +174,22 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local Private = components.Private
 	local InheritsPrivacy = components.InheritsPrivacy
 
-	-- the tracking tags' names for diagnostics, keyed by tag: the guards below name whichever tag was added
-	-- (or owns the tracking) in their messages, spelled short like call sites type them -- the tags' own
-	-- jecs.Name carries the "duplecs." prefix (see shared.luau).
+	-- the tags' short names for diagnostics (their jecs.Name carries the duplecs. prefix)
 	local tracking_tag_names = {
 		[Networked] = "Networked",
 		[NetworkedOnce] = "NetworkedOnce",
 		[NetworkedUnreliable] = "NetworkedUnreliable",
 	}
 
-	-- synthetic cell id: entity existence flows through the per-cell visibility stores keyed by this id, never
-	-- added to any entity as a real component. only the packet resolve pass treats it specially, routing its
-	-- diff into the per-client replicated / unreplicated lists instead of a component group.
+	-- synthetic cell id: entity existence flows through the visibility stores under it, never added to any
+	-- entity; the resolve pass routes its diff into the per-client create / delete lists instead of a component
+	-- group.
 	local Existence = world:entity() :: Component<nil>
 
 	-- GENERAL FUNCTIONS
 
-	-- jecs never replaces these two containers on a live world (world:cleanup rebuilds world.archetypes, so
-	-- that one is always re-read per call), so the packet and restage paths share one fetch of each
+	-- never replaced on a live world, unlike world.archetypes (rebuilt by world:cleanup, so always re-read per
+	-- call)
 	local entity_index = world.entity_index
 	local component_index = world.component_index
 
@@ -221,13 +202,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return nil
 	end
 
-	-- note: jecs 0.11.0 still has no builtin target iterator; replace this if a later version adds one. this
-	-- reads the same internals world:target resolves per call -- same-relation pairs sit contiguously in
-	-- archetype.types (pair ids pack as 2^48 + relation * 2^24 + target and types is sorted, so one relation's
-	-- pairs form one numeric range), with the relation's wildcard record holding each archetype's slice start
-	-- (records) and length (counts) -- so the shared lookups run once per entity rather than once per target.
-	-- the slice is snapshotted up front where world:target reads live state per index; no caller moves the
-	-- entity mid-iteration. like world:target, a dead target resolves to nil and ends the caller's loop.
+	-- iterates an entity's targets under relation through the internals world:target resolves per call (see
+	-- jecs.md): same-relation pairs are contiguous in archetype.types, and the relation's wildcard record holds
+	-- each archetype's slice start (records) and length (counts). the slice is snapshotted up front, so no
+	-- caller may move the entity mid-iteration; a dead target resolves to nil and ends the loop. replace with
+	-- jecs's own iterator if a later version adds one.
 	local function each_target(entity: Entity, relation: Id): () -> Entity?
 		local record = entity_index.sparse_array[dense(entity)]
 		local idr = component_index[pair(relation, jecs.Wildcard)]
@@ -254,138 +233,100 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- VISIBILITY STATE
 
-	-- entities with Replicated, keyed by dense id. dense rather than gen-qualified deliberately: entity churn
-	-- inserts one fresh gen-qualified key per spawn while deaths leave tombstones, and luau rebuilds such a
-	-- table on nearly every insert whenever its live count sits at (or one below) a power of two -- the rebuilt
-	-- node array has no slack, so the next fresh key rebuilds again, costing a full O(live) rehash per spawn
-	-- (measured ~8.5us at 256 live entities, dominating spawn-heavy frames). dense ids recycle, so a death's
-	-- tombstone is revived in place by the slot's next tenant and the table never rehashes at steady state.
-	-- safe because every reader passes a live entity (the mirror leads the world mid-hook exactly like the
-	-- gen-keyed form did). note: cleared while the removed hook runs, so it reads false slightly earlier than
-	-- world:has would.
+	-- entities with Replicated, keyed by dense id: gen-qualified keys churn one fresh key per spawn and rehash
+	-- the table on nearly every insert at power-of-two live counts (~8.5us at 256 live), while dense ids recycle
+	-- in place. safe because every reader passes a live entity. cleared while the removed hook runs, so it reads
+	-- false slightly earlier than world:has would.
 	local replicated_entities = {} :: { [number]: true }
 
-	-- entities with a jecs.Name, mirrored by the name hooks initialize connects (seeded at construction) so
-	-- pair-target replicability stays a table lookup. keyed by dense id like replicated_entities above (named
-	-- entities churn the same way). note: cleared while the removed hook runs, so it reads false slightly
-	-- earlier than world:has would -- exactly when the restage must see the target as unnamed.
+	-- entities with a jecs.Name, mirrored by the name hooks (seeded at construction) so pair-target
+	-- replicability stays a lookup; dense-keyed and cleared mid-hook like replicated_entities -- exactly when
+	-- the restage must see the target as unnamed.
 	local named_entities = {} :: { [number]: true }
 
-	-- tracked components, mapped to whichever of Networked, NetworkedOnce, and NetworkedUnreliable owns the
-	-- tracking (the three are exclusive). networking a component also networks pairs using it as the relation.
-	-- the owner is also how a tracking tag's removed hook recognizes a removal as its own: every guard in
-	-- guard_networked_added removes the tag it refused, so any removal may be that undo instead, and only the
-	-- owner's genuine removal may stop the tracking (see on_tracking_tag_removed).
+	-- tracked components -> the one of Networked / NetworkedOnce / NetworkedUnreliable owning the tracking (the
+	-- three are exclusive); networking a component also networks pairs using it as the relation. the owner is
+	-- also how a tag's removed hook tells a genuine removal from a guard's undo (see on_tracking_tag_removed).
 	local tracked_by = {} :: { [Component]: Component }
 
 	-- target-specific mode designations, keyed [definition][dense target] -> the designating tag:
-	-- pair(Networked*, Target) on a definition makes pairs of the definition-as-relation aimed at Target
-	-- replicate under the designated tag's mode, overriding the definition's unpaired tag -- or standing in
-	-- for one entirely, in which case only designated targets' pairs replicate and the bare component and
-	-- undesignated pairs don't (see on_designation_added). dense target keys match what packed pair ids
-	-- carry; a designation pair's halves are alive when it lands, and a target's death removes the pair (and
-	-- with it the entry) before its dense id can recycle, so an entry never names a stale tenant.
+	-- pair(Networked*, Target) on a definition replicates its pairs aimed at Target under that tag's mode,
+	-- overriding the unpaired tag -- or standing in for one, in which case only designated targets' pairs
+	-- replicate (see on_designation_added). a target's death removes its pairs before its dense id can recycle,
+	-- so an entry never names a stale tenant.
 	local designations = {} :: { [Component]: { [number]: Component } }
 
-	-- designations already warned about an unreplicable target, keyed by the gameplay pair id their relation
-	-- and target halves pack into: the unreplicable-designated-target warning fires once per designation, at
-	-- the first moment a gameplay pair actually aims at the unreplicable target, and the designation's
+	-- designations already warned about an unreplicable target, keyed by the gameplay pair id; the designation's
 	-- removal re-arms it (see warn_unreplicable_designation).
 	local designation_warned = {} :: { [Id]: true }
 
-	-- gen-qualified ids of the tracked components, keyed by dense id and maintained alongside tracked_by by
-	-- start_tracking_component / stop_tracking_component: packed pair ids only carry their relation's dense
-	-- half, so the pair resolve paths would otherwise pay jecs.pair_first per staged change. dense ids are
-	-- unique among live entities and a pair's relation is always alive (jecs removes the pairs when it dies), so
-	-- a hit is always the pair's live relation. stopping a relation's tracking moves its entry to
-	-- retired_relation_gens until the next generate_packets (which clears it alongside retired_target_gens): the
-	-- removals staged at stop time resolve after the relation may already be dead -- world:delete on a tracked
-	-- relation runs the whole stop mid-death -- and the live resolve would name a dead relation as 0 (or as the
-	-- dense id's next tenant), so clients would skip the section and keep the pairs.
+	-- gen-qualified ids of the tracked components by dense id, so the pair resolve paths (packed pair ids carry
+	-- only the relation's dense half) skip jecs.pair_first per staged change; a pair's relation is always alive,
+	-- so a hit is the live relation. stopping a relation's tracking moves its entry to retired_relation_gens
+	-- until the next generate_packets clears it: the removals staged at stop time resolve after the relation may
+	-- be dead (world:delete on a tracked relation runs the stop mid-death), and a live resolve would name it as
+	-- 0 or the dense id's next tenant, so clients would skip the section and keep the pairs.
 	local tracked_relation_gens = {} :: { [number]: Component }
 	local retired_relation_gens = {} :: { [number]: Component }
 
-	-- tag-ness of the tracked relations, keyed by dense id and maintained alongside tracked_relation_gens:
-	-- get_pair_group re-derives its relation's tag-ness every frame the relation's pairs dirty, and a
-	-- definition's tag-ness is fixed before use (jecs itself snapshots it per pair record at first
-	-- instantiation), so the cached read spares a world walk per relation per frame. relations without an entry
-	-- (retired or never tracked) fall back to the live jecs.is_tag read.
+	-- tag-ness of the tracked relations by dense id, so get_pair_group's per-frame re-derivation is a lookup
+	-- rather than a world walk (a definition's tag-ness is fixed before use); retired or untracked relations
+	-- fall back to jecs.is_tag.
 	local tracked_relation_tags = {} :: { [number]: boolean }
 
-	-- reverse index of live tracked-relation pair cells by dense target id: [dense target][pair id] = subject
-	-- count. maintained by the per-component hooks (and the on_networked_added/removed catch-up walks), so it
-	-- covers every pair whose relation is tracked regardless of the target's current replicability -- restaging
-	-- on a target's visibility shift is exactly the moment that replicability changes. keyed dense because the
-	-- removed hooks can fire with the target already dead (pair ids only pack dense halves); a dead target's
-	-- cells are all removed by jecs before its dense id can recycle, so a bucket never carries stale entries
-	-- into a new generation.
+	-- reverse index of live tracked-relation pair cells, [dense target][pair id] = subject count, maintained by
+	-- the per-component hooks and the tracking walks regardless of the target's replicability (restaging on a
+	-- target's visibility shift is exactly when that changes). dense-keyed because removed hooks can fire with
+	-- the target already dead; a dead target's cells are all removed before its dense id can recycle.
 	local tracked_pairs_by_target = {} :: { [number]: { [Id]: number } }
 
-	-- gen-qualified ids of the targets indexed above, keyed by the same dense id and captured while the target
-	-- is alive (jecs guarantees a pair's halves are alive when its id record is created). double duty: the
-	-- resolve paths read it in place of jecs.pair_second for every staged pair -- every pair that reaches them
-	-- is indexed, so a missing entry means the target was dead or the pair unindexed, ineligible either way --
-	-- and removals resolving after the target's death recover the full id the wire (and the client's mapping)
-	-- needs, which packed pair ids alone have no live way back to. during a target's death cascade a hit can
-	-- briefly name the dying target, but its replicated / named mirrors clear before their hooks restage, so
-	-- eligibility still resolves false. deindexing a target's last pair moves its entry to retired_target_gens,
-	-- which the resolve passes read for gone targets and generate_packets clears once those passes finish.
+	-- gen-qualified ids of the indexed targets, captured while alive (a pair's halves are alive when its record
+	-- is created). the resolve paths read it in place of jecs.pair_second -- every pair reaching them is
+	-- indexed, so a miss is a dead half or unindexed pair, ineligible either way -- and removals resolving after
+	-- a target's death recover the full id the wire needs from it. during a death cascade a hit can briefly name
+	-- the dying target, but its mirrors clear before the hooks restage, so eligibility still resolves false.
+	-- deindexing a target's last pair moves its entry to retired_target_gens, read for gone targets and cleared
+	-- by generate_packets.
 	local tracked_target_gens = {} :: { [number]: Entity }
 	local retired_target_gens = {} :: { [number]: Entity }
 
-	-- latest privacy filter of every Private cell, keyed [entity][key]: key is the paired component, or
-	-- Existence for an un-paired Private, which gates the entire entity above the per-component filters. a
-	-- filter is always a table -- on_private_set normalizes a nil value into empty_whitelist below -- and an
-	-- empty one blocks everyone (masks absent = open to all allocated clients, present (even with no words) =
-	-- gated to exactly those bits). blacklists normalize into the same shape at sanitization -- their words are
-	-- allow words too (the allocated clients they don't name) -- so every downstream reader keeps allow
-	-- semantics. values are frozen by the hooks, so caching by reference is safe; edit membership via
-	-- edit_privacy or replace wholesale with world:set. privacy_filters keeps the client-set tables for editing;
-	-- allow_masks mirrors them as per-shard allow words (never frozen: allocate_client writes grants and sweeps
-	-- into them in place). a blacklist naming only untracked clients restricts nothing, so it is never cached:
-	-- on_private_set removes the value outright, exactly like edit_privacy emptying a blacklist does.
-	-- remove_client prunes the departing client's key from every filter (see prune_privacy_filters), so the
-	-- filters only ever name allocated and pending clients.
+	-- latest privacy filter of every Private cell, keyed [entity][key], key being the paired component or
+	-- Existence for an unpaired Private (which gates the whole entity). a filter is always a table
+	-- (on_private_set normalizes nil to empty_whitelist), and an empty one blocks everyone: allow words absent =
+	-- open to all allocated clients, present (even with no words) = gated to exactly those bits. blacklists
+	-- sanitize into allow words too (the allocated clients they don't name), so every reader keeps allow
+	-- semantics; a blacklist naming only untracked clients restricts nothing and is never cached (on_private_set
+	-- removes the value, like edit_privacy emptying one). filters are frozen by the hooks and edited
+	-- copy-on-write, so caching by reference is safe; allow_masks mirrors them per shard and is mutated in place
+	-- (grants, sweeps).
 	--
-	-- empty_whitelist is the normalized value a valueless Private is rewritten to, shared across every cell that
-	-- needs one: a cached filter is only ever read, cloned (the copy-on-write edits), or replaced wholesale, so
-	-- aliasing one frozen empty table between entities is safe -- the per-cell allow words beside it are the
-	-- mutated half, and sanitize_privacy mints those fresh per call.
-	--
-	-- the cached table and the component's own value are always one table: sanitization pruning and departure
-	-- pruning both write their pruned clone back over the value (see write_filter_value), so world:get always
-	-- returns the effective filter.
+	-- two invariants: the cached table and the component's value are always one table (pruning writes the pruned
+	-- clone back via write_filter_value, so world:get returns the effective filter), and filters only ever name
+	-- allocated and pending clients (remove_client prunes departures). empty_whitelist is shared across cells:
+	-- cached filters are only read, cloned, or replaced, never mutated.
 	local empty_whitelist = table.freeze({}) :: Privacy
 	local privacy_filters = {} :: PrivacyFilterCache
 	local allow_masks = {} :: AllowMaskCache
 
-	-- privacy delegation state (see PRIVACY DELEGATION for the derivations). delegation_parents mirrors the live
-	-- pair(InheritsPrivacy, group) pairs (entity -> its groups), maintained by the InheritsPrivacy hooks -- like
-	-- the replicated/named mirrors it reads correctly while a removal hook runs, when world:target would still
-	-- see the old pair. the inner map keys each group by its dense id, carrying the gen-qualified group as the
-	-- value: the removed hook must resolve which edge died from the packed pair id alone (its target half is
-	-- dense, and the group may already be dead mid-cascade), and dense ids can't alias among one entity's edges --
-	-- pair halves are alive when added, and a group's death removes its edges (the Delete policy deletes the
-	-- delegators outright) before its dense id can recycle. effective_masks is the derived word store only
-	-- delegating entities occupy: effective(entity) = own(entity) intersect effective(every parent), with an
-	-- entry absent when nothing the entity inherits restricts (absent = open to every allocated client, exactly
-	-- like allow_masks). own words stay in allow_masks untouched -- the grant loop, the freed-slot sweeps, and
-	-- compaction rely on each cached word mapping 1:1 to one filter's membership table -- and the hot readers
-	-- take effective over own via entity_gate_masks.
+	-- privacy delegation state (see PRIVACY DELEGATION). delegation_parents mirrors the live
+	-- pair(InheritsPrivacy, group) pairs, entity -> its groups, keyed by the group's dense id with the
+	-- gen-qualified group as value: the removed hook must resolve which edge died from the packed pair id alone
+	-- (the group may already be dead mid-cascade), and a group's death removes its edges before its dense id can
+	-- recycle. like the other mirrors it reads correctly inside a removal hook, when world:target still sees the
+	-- old pair. effective_masks holds derived words for delegating entities only -- own intersect every parent's
+	-- effective, absent when nothing inherited restricts -- while own words stay untouched in allow_masks, whose
+	-- 1:1 mapping to filter membership the grant loop, sweeps, and compaction rely on; entity_gate_masks takes
+	-- effective over own.
 	local delegation_parents = {} :: { [Entity]: { [number]: Entity } }
-	-- reverse of delegation_parents (group -> its delegating entities), keyed by the full group entity: the
-	-- descendant fan-out iterates this live child set directly instead of a world:each(pair(InheritsPrivacy,
-	-- group)) query per edited group, maintained in lockstep at every delegation_parents write.
+	-- the reverse (group -> its delegators), maintained in lockstep, so the fan-out never queries the world
 	local delegation_children = {} :: { [Entity]: { [Entity]: true } }
 	local effective_masks = {} :: { [Entity]: ShardMasks }
 
-	-- client slots: each client gets a (shard, bit) pair so every stored mask stays a single 32-bit word and all
-	-- mask math stays native bit32; shards are numbered from 1 so shard-keyed tables keep their entries in the
-	-- array part (a [0] key always lands in the hash part), and shard s holds the clients with global indices
-	-- (s-1)*32 .. (s-1)*32+31. tracked_clients maps client -> global index ((shard - 1) * 32 + bit index);
-	-- clients_by_index is the inverse for the packet scatter. pending_clients holds joiners awaiting a slot and
-	-- full packet, both granted at the tail of generate_packets. client_count counts allocated slots and feeds
-	-- the compaction deadzone.
+	-- client slots: each client gets a (shard, bit) pair so every stored mask is one 32-bit word and mask math
+	-- stays native bit32; shards number from 1 so shard-keyed tables stay in the array part, and shard s holds
+	-- global indices (s-1)*32 .. (s-1)*32+31. tracked_clients maps client -> global index, clients_by_index is
+	-- the inverse for the packet scatter, pending_clients holds joiners awaiting a slot and full packet at the
+	-- tail of generate_packets, and client_count feeds the compaction deadzone.
 	local tracked_clients = {} :: { [Client]: number }
 	local clients_by_index = {} :: { [number]: Client }
 	local pending_clients = {} :: { [Client]: true }
@@ -405,24 +346,20 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return bit32.lshift(1, bit32.band(client_index, 31))
 	end
 
-	-- per-shard allocation words: allocated_masks[shard] is the union of the shard's live slot bits. an entry
-	-- exists for every shard ever opened and is never removed; shard_count bounds the shard loops and shrinks
-	-- past empty top shards. freed_masks accumulates bits freed by remove_client whose stale marks may still
-	-- linger in the allow words; allocate_client sweeps a slot clean only when reusing one. compact_shards
-	-- reclaims the top shard outright when the population shrinks far enough, scrubbing its every slot bit
-	-- (freed word included).
+	-- per-shard allocation words, one entry per shard ever opened and never removed (shard_count bounds the
+	-- shard loops and shrinks past empty top shards). freed_masks accumulates bits freed by remove_client whose
+	-- stale marks may linger in the allow words, swept only when a slot is reused; compact_shards reclaims the
+	-- top shard outright when the population shrinks far enough.
 	local allocated_masks = {} :: { [number]: VisibilityMask }
 	local freed_masks = {} :: { [number]: VisibilityMask }
 	local shard_count = 0
 
-	-- per-cell state: the mask stores are paged per shard -- keyed [shard][component][entity], each word
-	-- covering that shard's 32 clients -- while staged values stay client-agnostic, keyed [component][entity]
-	-- (values are staged once per change no matter how many shards can see the cell). next_visibilities: current
-	-- masks of cells whose visibility changed this frame (presence is the dirty flag); last_visibilities: masks
-	-- last sent, diffed against at packet generation; changed_values: staged values of changed cells visible
-	-- to someone. rule: next ?? last must *always* reflect the current visibility. entity existence is itself a
-	-- cell keyed by Existence (a present 0 is a pending delete): a bit gained is a create, a bit cleared is a
-	-- delete.
+	-- per-cell state. the mask stores are paged per shard, keyed [shard][component][entity] with each word
+	-- covering the shard's 32 clients; staged values are client-agnostic, keyed [component][entity].
+	-- next_visibilities: current masks of cells whose visibility changed this frame (presence is the dirty
+	-- flag); last_visibilities: masks last sent; changed_values: staged values of changed cells visible to
+	-- someone. rule: next ?? last must *always* reflect the current visibility. existence is a cell keyed by
+	-- Existence: a bit gained is a create, a bit cleared a delete, a present 0 a pending delete.
 	local next_visibilities = {} :: { [number]: ShardVisibilities }
 	local last_visibilities = {} :: { [number]: ShardVisibilities }
 	local changed_values = {} :: { [Id]: ChangedValues }
@@ -448,10 +385,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return tracked_by[relation]
 	end
 
-	-- the eligibility half of resolve_pair_mode -- whether *some* mode governs the pair -- ordered so
-	-- plain-tracked relations, the common case on the staging and restage paths, answer from one tracked_by hit
-	-- with no designation probe (which mode wins only matters to the mode-sensitive readers: the mixed changed
-	-- hook and the unreliable walk).
+	-- the eligibility half of resolve_pair_mode, ordered so plain-tracked relations (the common case on the
+	-- staging paths) answer from one tracked_by hit without a designation probe.
 	local function is_pair_mode_tracked(relation: Component, dense_target: number): boolean
 		if tracked_by[relation] ~= nil then
 			return true
@@ -463,10 +398,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return false
 	end
 
-	-- resolves whether the component is replication-eligible, the privacy key gating it per entity, and (for
-	-- pair ids) the gen-qualified target half. pair halves resolve through the dense-keyed gen caches instead of
-	-- jecs.pair_first/pair_second: every pair that reaches here is indexed, so a missing entry is a dead half or
-	-- an untracked relation -- ineligible either way.
+	-- resolves eligibility, the privacy key gating the cell per entity, and (for pairs) the gen-qualified
+	-- target. pair halves resolve through the dense-keyed gen caches: every pair reaching here is indexed, so a
+	-- miss is a dead half or an untracked relation, ineligible either way.
 	local function resolve_component_eligibility(component: Id): (boolean, Id, Entity?)
 		if IS_PAIR(component) then
 			local dense_target = ECS_PAIR_SECOND(component)
@@ -490,10 +424,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return true, component, nil
 	end
 
-	-- reads the target gen cache, so a pair must be indexed before it is checked (the added hooks and the
-	-- tracking catch-up walks index first). pair-ness is a precondition, not a check: every caller passes a pair
-	-- id (the hooks branch on id == component first, and the catch-up walks construct theirs), and an unpaired
-	-- id's low bits would misread as a target.
+	-- reads the target gen cache, so a pair must be indexed before it is checked. pair-ness is a precondition,
+	-- not a check: an unpaired id's low bits would misread as a target.
 	local function is_pair_replicable(pair_id: Id)
 		local target = tracked_target_gens[ECS_PAIR_SECOND(pair_id)]
 		if target == nil then
@@ -515,9 +447,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return if entity_masks then entity_masks[Existence] else nil
 	end
 
-	-- the shard-invariant half of an entity's existence visibility: whether it replicates at all, and the
-	-- entity-level allow words gating it (nil when unrestricted). entity_vis_word fans the result out across
-	-- shards, so staging fetches these tables once rather than per shard.
+	-- the shard-invariant half of an entity's existence visibility, fetched once per staging rather than per
+	-- shard: whether it replicates, and the entity-level gate (nil when unrestricted).
 	local function entity_vis_masks(entity: Entity): (boolean, ShardMasks?)
 		if replicated_entities[dense(entity)] == nil then
 			return false, nil
@@ -534,12 +465,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return allocated_masks[shard]
 	end
 
-	-- the shard-invariant half of a cell's narrowing below the entity level: the per-component allow words and,
-	-- for pair cells, the target's entity-level gate (delegation-aware, like the subject's own gate) -- a pair
-	-- never replicates to a client who lacks the target locally. a Named (unreplicated) target is globally
-	-- visible, and a replicated target with no entity-level gate is open to every allocated client; neither
-	-- narrows below the entity word, so target_masks stays nil for both. the client-agnostic resolve
-	-- (resolve_component_eligibility) has already run.
+	-- the shard-invariant narrowing below the entity level: the per-component allow words and, for pairs, the
+	-- target's entity-level gate -- a pair never replicates to a client lacking the target locally. a named
+	-- (unreplicated) target is globally visible and an ungated replicated one open to every allocated client, so
+	-- target_masks stays nil for both.
 	local function cell_vis_masks(entity: Entity, privacy_key: Id, target: Entity?): (ShardMasks?, ShardMasks?)
 		local entity_masks = allow_masks[entity]
 		local cell_masks = if entity_masks then entity_masks[privacy_key] else nil
@@ -599,10 +528,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return if last then last[entity] or 0 else 0
 	end
 
-	-- visibility changes write the current mask only on a mismatch with last, clearing a stale entry when they
-	-- match again (e.g. a whitelist toggled and reverted in one frame). value changes record only when the cell
-	-- was visible to someone last pass -- newly-visible slots read the live value during the resolve pass
-	-- instead.
+	-- writes the current mask only on a mismatch with last, clearing a stale entry when they match again (a
+	-- whitelist toggled and reverted in one frame).
 	local function set_visibility(shard: number, component: Id, entity: Entity, cur: VisibilityMask)
 		if cur == last_visibility_of(shard, component, entity) then
 			local shard_next_visibilities = next_visibilities[shard]
@@ -618,11 +545,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the word-math tail of visibility staging, fanning prefetched masks out across occupied shards: the loop
-	-- body is only masks[shard] indexing and word math. shards with no occupants are skipped -- their mask trees
-	-- are dropped when they empty, so there is nothing to stage against. callers resolve however much of the
-	-- entity/cell state their loop shape lets them hoist; eligible false stages 0 everywhere (a removal-shaped
-	-- restage).
+	-- the word-math tail of visibility staging, fanning prefetched masks out across occupied shards (unoccupied
+	-- shards' trees are dropped, so there is nothing to stage against). eligible false stages 0 everywhere, a
+	-- removal-shaped restage.
 	local function stage_visibility_masks(
 		component: Id,
 		entity: Entity,
@@ -662,10 +587,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		stage_visibility_masks(component, entity, eligible, entity_masks, cell_masks, target_masks)
 	end
 
-	-- the "visible to someone" gate scans shards' last words with an early exit; a cell invisible everywhere
-	-- pays the full scan, but the store only holds occupied shards' trees, so the common case exits on the first
-	-- hit. a present entry is always a nonzero word: the resolve merges and the freed-slot sweep all prune
-	-- entries that zero.
+	-- value changes record only when the cell was visible to someone last pass; newly-visible slots read the
+	-- live value during the resolve pass instead. the scan exits on the first hit, and a present last entry is
+	-- always nonzero (the resolve merges and the freed-slot sweep prune entries that zero).
 	local function stage_value(component: Id, entity: Entity, value: any)
 		for _, shard_last_visibilities in last_visibilities do
 			local last = shard_last_visibilities[component]
@@ -710,9 +634,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return bit32.band(mask, slot_bit_of(client_index)) ~= 0
 	end
 
-	-- whether the entity's existence currently replicates to the client: the same current-mask test as
-	-- is_component_visible, keyed by Existence. component visibility is always a subset of existence visibility,
-	-- so a false here implies is_component_visible is false for every component.
+	-- existence visibility, the same current-mask test keyed by Existence; component visibility is a subset of
+	-- it, so false here implies false for every component.
 	local function is_entity_visible(entity: Entity, client: Client)
 		return is_component_visible(entity, Existence, client)
 	end
@@ -729,19 +652,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return bit32.band(mask, slot_bit_of(client_index)) ~= 0
 	end
 
-	-- the last-sent counterpart to is_entity_visible, keyed by Existence. as with the current-mask pair,
-	-- component visibility is a subset of existence visibility, so a false here implies was_component_visible is
-	-- false for every component on the entity.
+	-- the last-sent counterpart of is_entity_visible.
 	local function was_entity_visible(entity: Entity, client: Client)
 		return was_component_visible(entity, Existence, client)
 	end
 
-	-- enumerator core of the two client walks below: yields each client whose bit is set in the entity's
-	-- existence words, shard by shard -- the slot -> client reverse walk of the point queries above. use_staged
-	-- picks the current mask (next ?? last, is_entity_visible's read) over the last-sent one
-	-- (was_entity_visible's). each shard's word resolves as the walk reaches it, banded with the allocated word --
-	-- freed slots' stale marks linger in the persistent masks until reuse, and a swept bit must not enumerate a
-	-- departed client -- so a set bit always resolves through clients_by_index.
+	-- yields each client whose bit is set in the entity's existence words, shard by shard; use_staged picks the
+	-- current mask (next ?? last) over the last-sent one. words are banded with the allocated word because freed
+	-- slots' stale marks linger until reuse, so a set bit always resolves through clients_by_index.
 	local function clients_seeing_iterator(entity: Entity, use_staged: boolean): () -> Client?
 		local shard = 0
 		local base_index = 0
@@ -774,43 +692,34 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- iterator over the clients the entity's existence currently replicates to -- exactly the clients
-	-- is_entity_visible answers true for, without probing every tracked client -- for sight-gated side channels
-	-- (an event for exactly the clients who can see the source) and for debugging privacy setups. order is slot
-	-- order, an internal detail callers must not lean on. pending joiners never enumerate (no slot until their
-	-- join resolves at the next generate_packets), and the words are read live as the walk advances, so finish
-	-- iterating before staging visibility changes.
+	-- the clients the entity's existence currently replicates to, for sight-gated side channels and debugging.
+	-- slot order, which callers must not lean on; pending joiners never enumerate; words are read live as the
+	-- walk advances, so finish iterating before staging visibility changes.
 	local function get_clients_seeing(entity: Entity): () -> Client?
 		return clients_seeing_iterator(entity, true)
 	end
 
-	-- the last-sent counterpart to get_clients_seeing, reading only the last-sent words like was_entity_visible:
-	-- the clients that actually hold the entity right now, before the next generate_packets flushes the staged
-	-- delta.
+	-- the last-sent counterpart of get_clients_seeing: the clients that actually hold the entity before the next
+	-- generate_packets.
 	local function get_clients_last_seeing(entity: Entity): () -> Client?
 		return clients_seeing_iterator(entity, false)
 	end
 
 	-- SHARED NAMES
 
-	-- the instance's shared-name store (see names.luau, which owns the announced set, the staging behind it,
-	-- and the wire-shape refusals announcing warns on): named ids the client maps automatically -- tracked
-	-- component definitions and named (unreplicated) pair targets -- announced as (id, name) entries in packet
-	-- headers, so a client world defining the same names resolves them without set_client_entity. this half
-	-- decides which ids are relevant (refresh_announcement below, which the tracking, Replicated, and jecs.Name
-	-- hooks call in to) and drains the store at packet time. it takes the reporter's warn, so its refusals ride
-	-- this instance's warn hook like every other warning here.
+	-- the instance's shared-name store (see names.luau): named ids clients map automatically -- tracked
+	-- definitions and named (unreplicated) pair targets -- announced as (id, name) entries in packet headers.
+	-- this half decides relevance (refresh_announcement) and drains the store at packet time; it takes the
+	-- reporter's warn so its refusals ride this instance's hook.
 	local shared_names = create_names(world, warn)
 
-	-- brings the store in line with the entity's current announcement relevance: a named, unreplicated id that
-	-- is a tracked definition (through a plain tag or target designations) or the target of a tracked pair is
-	-- announced, and anything else has whatever announcement it holds withdrawn. every hook that moves one of
-	-- those inputs calls this after updating its mirror, so relevance is derived in one place rather than
-	-- re-spelled per hook -- both store operations are idempotent, so calling it from every site is safe. it
-	-- reads the mirrors rather than the world: inside a removed hook the world still holds the component being
-	-- removed while the mirrors already reflect its absence, which is exactly when a withdrawal must see it
-	-- gone. the retract is gated on the announced tenant being this entity so a stale caller (a dead id
-	-- resolved through a dense-keyed store) can never withdraw a newer tenant's announcement.
+	-- brings the store in line with the entity's current relevance: a named, unreplicated id that is a tracked
+	-- definition (plain tag or designations) or the target of a tracked pair is announced, anything else has its
+	-- announcement withdrawn. every hook moving one of those inputs calls this after updating its mirror; both
+	-- store operations are idempotent. it reads the mirrors rather than the world because inside a removed hook
+	-- the world still holds the component while the mirrors already reflect its absence. the retract is gated on
+	-- the announced tenant being this entity, so a stale caller (a dead id resolved through a dense-keyed store)
+	-- never withdraws a newer tenant's announcement.
 	local function refresh_announcement(entity: Entity)
 		local dense_id = dense(entity)
 		if
@@ -826,11 +735,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- CHANGE TRACKING
 
-	-- networked_unreliable is the set of components tracked via NetworkedUnreliable, whose reliable tracking is
-	-- exactly NetworkedOnce's (membership, initial values, and removals ride the reliable path; no changed hook)
-	-- and whose values additionally stream through generate_unreliable_chunks -- which is what the set exists
-	-- for: iterating exactly them once per frame, rather than filtering tracked_by by owner. networked_cleanup
-	-- holds every tracked component's hook disconnectors, whichever tag owns the tracking.
+	-- networked_unreliable holds the components with an unreliable mode, so generate_unreliable_chunks iterates
+	-- exactly them (their reliable tracking is NetworkedOnce's: membership, initial values, removals, no changed
+	-- hook). networked_cleanup holds every tracked component's hook disconnectors.
 	local networked_unreliable = {} :: { [Component]: true }
 	local networked_cleanup = {} :: {
 		[Component]: {
@@ -841,13 +748,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		},
 	}
 
-	-- the lazy footgun warning for target-specific modes: a designated target that is neither Replicated nor
-	-- named can never ship its pairs -- silently, since an unreplicable target is ordinary gameplay state
-	-- everywhere else -- but a designated one is a schema-level marker whose silence is almost always a missing
-	-- name, so the first gameplay pair actually aimed at one warns, once per designation (its removal re-arms
-	-- the warning). fires from pair indexing and from a designation landing over already-indexed pairs, the
-	-- two moments a designation first meets a real pair; the bucket check keeps a designation with no pairs of
-	-- its own relation silent even while other relations' pairs share the target.
+	-- a designated target that is neither Replicated nor named can never ship its pairs -- silently, since that
+	-- is ordinary state elsewhere -- but a designation is a schema-level marker whose silence is almost always a
+	-- missing name, so the first gameplay pair aimed at one warns, once per designation. fires from pair
+	-- indexing and from a designation landing over indexed pairs; the bucket check keeps a designation with no
+	-- pairs of its own relation silent.
 	local function warn_unreplicable_designation(pair_id: Id)
 		local relation = tracked_relation_gens[ECS_PAIR_FIRST(pair_id)]
 		if relation == nil then
@@ -931,17 +836,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- reconciles the mode-dependent tracking state after a definition's mode set changes (a plain tag or
-	-- designation added or removed): whether the definition streams through the unreliable channel at all, and
-	-- whether the changed hook is connected. the changed hook connects while any mode -- plain or designated --
-	-- is Networked, in one of two shapes: the plain shape -- a plain Networked tag with no designations, the
-	-- common case -- keeps the pre-designation body with no mode lookups per set (benched: the per-cell resolve
-	-- costs ~20ns on bare sets and ~40ns on pair sets, real money on the hottest event path), while the mixed
-	-- shape resolves the governing mode per cell, so sets on a mixed definition's non-Networked cells pay the
-	-- hook invocation and mode lookup (the documented cost of mixing modes on one definition). a definition
-	-- with no Networked mode anywhere keeps the no-changed-hook guarantee. the changed disconnector lives in
-	-- networked_cleanup's changed slot with mixed marking its shape, so reconnection happens exactly when the
-	-- needed shape differs.
+	-- reconciles the mode-dependent state after a definition's mode set changes: unreliable membership, and
+	-- whether the changed hook is connected. the hook connects while any mode is Networked, in one of two
+	-- shapes: the plain shape (a plain Networked tag, no designations) keeps its body free of mode lookups (the
+	-- per-cell resolve costs ~20ns on bare sets and ~40ns on pair sets, real money on the hottest event path),
+	-- while the mixed shape resolves the governing mode per cell, the documented cost of mixing modes on one
+	-- definition. mixed marks the connected shape, so reconnection happens exactly when the needed shape
+	-- differs.
 	local function reconcile_tracking_modes(component: Component)
 		local plain = tracked_by[component]
 		local has_networked = plain == Networked
@@ -1002,14 +903,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the tracking setup the three tracking tags and their target designations share: record the owning tag
-	-- (plain tags only -- a designation is recorded by its own handler before this runs), announce the
-	-- component's name, stage the initial visibility of existing cells, connect the per-component hooks, and
-	-- reconcile the mode-dependent state (the changed hook and unreliable membership -- see
-	-- reconcile_tracking_modes, which is also why no callback or its lookups runs per set unless some mode is
-	-- Networked). a definition already tracked through designations skips straight to staging its newly-eligible
-	-- cells: its hooks, mirrors, announcement, and pair index are already live, and re-indexing its pairs would
-	-- double their reverse-index counts.
+	-- the tracking setup shared by the three tags and their designations: record the owner (plain tags only),
+	-- announce, stage existing cells' initial visibility, connect the per-component hooks, and reconcile the
+	-- modes. a definition already tracked through designations skips to staging its newly-eligible cells: its
+	-- hooks, mirrors, and pair index are live, and re-indexing its pairs would double their counts.
 	local function start_tracking_component(component: Component, tag: Component?)
 		if tag ~= nil then
 			-- record the owner first so the staging below resolves visibility correctly
@@ -1059,9 +956,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		networked_cleanup[component] = {
 			added = hooks.added(world, component, function(entity: Entity, id: Id, value: any)
-				-- pairs index regardless of the target's current replicability; restaging on a target's visibility shift
-				-- must find them. staging an ineligible cell (an undesignated pair, or the bare cell of a
-				-- designation-only definition) resolves to no-ops, so no mode check is needed here.
+				-- pairs index regardless of the target's replicability, so a target's visibility shift can find them;
+				-- staging an ineligible cell is a no-op, so no mode check here
 				if id ~= component then
 					index_tracked_pair(id)
 				end
@@ -1073,11 +969,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			removed = hooks.removed(world, component, function(entity: Entity, id: Id)
 				if id ~= component then
 					deindex_tracked_pair(id)
-					-- the removal must stage whenever the target is dead or replicable; the gen caches can't answer that
-					-- here (the deindex above may have just retired the gen, and a dying target's entry lingers while its
-					-- mirrors clear), so this keeps the live pair_second death check. a client that never imported the
-					-- target (a name-mapped one) has nothing else removing the cells locally, and the target's prior
-					-- replicability is unknowable here -- staging a pair that was never visible is a no-op
+					-- the gen caches can't say whether the target is dead or replicable here (the deindex may have just
+					-- retired the gen, and a dying target's entry lingers while its mirrors clear), so keep the live death
+					-- check; staging a never-visible pair is a no-op
 					local target: Entity = jecs.pair_second(world, id) :: any
 					if (target :: any) == 0 or is_pair_target_replicable(target) then
 						stage_removed(id, entity)
@@ -1128,15 +1022,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		refresh_announcement(component)
 	end
 
-	-- stages one designated target's existing gameplay pairs after a designation change: visibility for every
-	-- subject (newly-eligible pairs ship their values through the newly-visible live read; pairs whose mask is
-	-- unchanged stage no-ops), plus -- when the change moved the pairs *out of* unreliable mode -- their
-	-- current values, so the reliable stream re-establishes a fresh baseline instead of leaving each client at
-	-- whatever its last received chunk held (the unreliable channel keeps no reliable baseline to fall back
-	-- on, so without the restage a dropped final chunk would stay stale until the cell's next server-side
-	-- change -- under NetworkedOnce, forever). a tag relation's only value-carrying pairs are those with
-	-- data-component targets, so its tag pairs -- which never streamed -- veto the value restage here rather
-	-- than at every call site.
+	-- stages one designated target's existing pairs after a designation change: visibility for every subject,
+	-- plus -- when the change moved the pairs *out of* unreliable mode -- their current values, so the reliable
+	-- stream re-establishes a baseline instead of leaving each client at its last received chunk (under
+	-- NetworkedOnce a dropped final chunk would otherwise stay stale forever). a tag relation's tag pairs never
+	-- streamed, so they veto the value restage here.
 	local function stage_designated_pairs(pair_id: Id, restage_values: boolean)
 		if restage_values and tracked_relation_tags[ECS_PAIR_FIRST(pair_id)] then
 			local target_gen = tracked_target_gens[ECS_PAIR_SECOND(pair_id)]
@@ -1160,15 +1050,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- a tracking tag added as a pair -- pair(tag, Target) on a definition -- designates a target-specific
-	-- mode: pairs of the definition-as-relation aimed at Target replicate under the designated tag's mode,
-	-- overriding the definition's unpaired tag for exactly those pairs -- or, with no unpaired tag present,
-	-- gating them entirely: only designated targets' pairs replicate then, and the bare component and
-	-- undesignated pairs don't. the guards mirror the unpaired adds': a wildcard target designates nothing
-	-- concrete (an unpaired tag already networks every pair), one target cannot be designated by two different
-	-- modes, and a replicated entity cannot become a (partially) tracked definition. each firing guard removes
-	-- the just-added pair -- which the removed hook recognizes as an undo by the designation entry being absent
-	-- or owned by a different tag -- and errors.
+	-- a tracking tag added as pair(tag, Target) on a definition designates a target-specific mode: the
+	-- definition's pairs aimed at Target replicate under that mode, overriding the unpaired tag -- or, with none
+	-- present, gating them entirely. guards: a wildcard target designates nothing concrete, one target cannot
+	-- carry two modes, and a replicated entity cannot become a tracked definition; each firing guard removes the
+	-- just-added pair (which the removed hook recognizes as an undo by the entry being absent or owned by
+	-- another tag) and errors.
 	local function on_designation_added(component: Component, id: Id, tag: Component)
 		local tag_name = tracking_tag_names[tag]
 		local dense_target = ECS_PAIR_SECOND(id)
@@ -1204,16 +1091,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		designated[dense_target] = tag
 
 		if networked_cleanup[component] == nil then
-			-- the definition's first tracking: the full setup indexes and stages its existing pairs (the designated
-			-- ones resolve eligible, and the index walk fires the unreplicable-target warning), connects the hooks,
-			-- and reconciles the modes itself
+			-- the definition's first tracking: the full setup indexes and stages its existing pairs, connects the
+			-- hooks, and reconciles the modes
 			start_tracking_component(component, nil)
 			return
 		end
 
-		-- already tracked: stage the target's existing pairs -- newly eligible without a plain tag (their values
-		-- ship through the newly-visible read), mask-unchanged no-ops under one -- restaging their current values
-		-- when the designation moved them out of unreliable mode (see stage_designated_pairs)
+		-- already tracked: stage the target's existing pairs, restaging their values when the designation moved
+		-- them out of unreliable mode
 		local gameplay_pair = pair(component, dense_target :: any)
 		stage_designated_pairs(
 			gameplay_pair,
@@ -1223,9 +1108,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		reconcile_tracking_modes(component)
 	end
 
-	-- a designation pair's removal: a genuine removal narrows (or fully stops) the definition's tracking, while
-	-- a guard's undo -- recognized by the designation entry being absent or owned by a different tag -- passes
-	-- through untouched, exactly like on_tracking_tag_removed's owner check below.
+	-- a genuine removal narrows or stops the definition's tracking; a guard's undo (the entry absent or owned by
+	-- a different tag) passes through, like on_tracking_tag_removed's owner check.
 	local function on_designation_removed(component: Component, id: Id, tag: Component)
 		local designated = designations[component]
 		if designated == nil then
@@ -1270,13 +1154,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		reconcile_tracking_modes(component)
 	end
 
-	-- the guards the Networked, NetworkedOnce, and NetworkedUnreliable unpaired add hooks share: reject a
-	-- component already carrying one of the other two exclusive tags, and reject a Replicated component (paired
-	-- adds route to on_designation_added, which guards its own shapes). each firing guard removes the
-	-- just-added tag -- undoing the add so the matching removed hook recognizes it (see
-	-- on_tracking_tag_removed) -- and errors. tag names the added tag for the exclusivity check to skip, with
-	-- tracking_tag_names spelling it for the messages. returns normally only when the add is clean; the
-	-- caller then applies any tag-specific guards of its own before tracking.
+	-- the guards shared by the three tags' unpaired adds: reject a component carrying another of the exclusive
+	-- tags, and reject a Replicated component. each firing guard removes the just-added tag -- undoing the add
+	-- so the removed hook recognizes it (see on_tracking_tag_removed) -- and errors.
 	local function guard_networked_added(component: Component, tag: Component)
 		local tag_name = tracking_tag_names[tag]
 		if
@@ -1294,16 +1174,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the undo counterpart of those guards, shared by all three tags' removed hooks: a removal arrives
-	-- identically whether the tag was genuinely removed or whether a guard above stripped an add it refused, and
-	-- only the former may stop the tracking. tracked_by tells them apart -- a guard's undo is never the recorded
-	-- owner, whether because another tag owns the tracking (the exclusivity guard) or because nothing does (the
-	-- Replicated and tag guards fire before tracking starts). letting an undo through would stop tracking the
-	-- component still has, or, for a never-tracked component, run stop_tracking_component for an id it never
-	-- tracked: the removal walks only stage no-ops there (cells the id keys were never visible, so their masks
-	-- are already 0), but the gen retirement writes tracked_relation_gens[dense] (nil here) over
-	-- retired_relation_gens[dense], erasing a retirement an earlier real stop on the same dense id staged this
-	-- frame.
+	-- the undo counterpart of those guards: a removal arrives identically whether the tag was genuinely removed
+	-- or a guard stripped a refused add, and only the former may stop the tracking. tracked_by tells them apart:
+	-- an undo is never the recorded owner. letting an undo through would stop tracking the component still has
+	-- or, for a never-tracked component, overwrite retired_relation_gens[dense] with nil, erasing a retirement
+	-- an earlier real stop on the same dense id staged this frame.
 	local function on_tracking_tag_removed(component: Component, id: Id, tag: Component)
 		-- a pair using the tag as its relation is a target designation, with its own genuine-vs-undo telling
 		if id ~= tag then
@@ -1336,11 +1211,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		stop_tracking_component(component)
 	end
 
-	-- NetworkedOnce is Networked without continuous change-tracking, for components (and pairs using them as the
-	-- relation) whose value the client can simulate on its own (e.g. timers): initial values, removals, and full
-	-- snapshots replicate, later value changes don't. use force_replicate to push unexpected changes. exclusive
-	-- with the other two tracking tags -- adding one while another is present removes the newly added tag and
-	-- errors. a paired add is a target designation (see on_designation_added), as for all three tags.
+	-- NetworkedOnce: initial values, removals, and full snapshots replicate, later value changes don't
+	-- (force_replicate pushes one), for values the client can simulate on its own. exclusive with the other
+	-- tracking tags; a paired add is a target designation.
 	local function on_networked_once_added(component: Component, id: Id)
 		if id ~= NetworkedOnce then
 			on_designation_added(component, id, NetworkedOnce)
@@ -1369,16 +1242,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		on_tracking_tag_removed(component, id, Networked)
 	end
 
-	-- NetworkedUnreliable is the always-replicate mode, for values that change every frame (positions,
-	-- velocities): its reliable tracking is exactly NetworkedOnce's -- membership adds with their initial value,
-	-- removals, visibility shifts, and full packets all ride the reliable path, with no changed hook connected,
-	-- so per-set cost is zero (unless another mode on the definition is Networked -- see
-	-- reconcile_tracking_modes) -- while current values are re-read and re-sent every
-	-- generate_unreliable_chunks call, intended for an unreliable transport where a dropped chunk costs one
-	-- frame of staleness. on a tag definition only its pairs with data-component targets stream -- the one cell
-	-- shape of a tag that carries values (target-typed, with serdes hooks deriving from the target's
-	-- registration) -- while its valueless tag cells ride the reliable path alone (see
-	-- generate_unreliable_chunks). exclusive with the other Networked tags, like they are with each other.
+	-- NetworkedUnreliable: reliable tracking exactly like NetworkedOnce's (no changed hook, so per-set cost is
+	-- zero unless another mode on the definition is Networked), while current values are re-read and re-sent
+	-- every generate_unreliable_chunks call, for an unreliable transport where a dropped chunk costs one frame
+	-- of staleness. on a tag definition only its pairs with data-component targets stream (see
+	-- generate_unreliable_chunks).
 	local function on_networked_unreliable_added(component: Component, id: Id)
 		if id ~= NetworkedUnreliable then
 			on_designation_added(component, id, NetworkedUnreliable)
@@ -1402,15 +1270,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- HANDLE REPLICATED ADD/REMOVE
 
-	-- the restaged entity's per-shard entity words, prefetched once by restage_entity for the per-cell loops
-	-- below to stage against. entries past the current shard_count are stale and never read (every shard loop
-	-- stops at shard_count). restages never nest -- each hook or fan-out restage completes before the next
-	-- begins -- so one scratch array serves them all.
+	-- the restaged entity's per-shard entity words, prefetched once per restage; entries past shard_count are
+	-- stale and never read. restages never nest, so one scratch array serves them all.
 	local restage_entity_words = {} :: { VisibilityMask }
 
-	-- stages one of the restaged entity's cells against the prefetched words: only the cell-level narrowing and
-	-- the set_visibility writes run per cell, the entity-level fetches and word math having run once per
-	-- restage.
+	-- stages one of the restaged entity's cells against the prefetched words, so only the cell-level narrowing
+	-- runs per cell.
 	local function stage_restaged_cell(
 		component: Id,
 		entity: Entity,
@@ -1429,9 +1294,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- restage every networked cell the entity owns (unpaired components and pairs it is the subject of), for
-	-- when its overall visibility shifts. the resolve mirrors resolve_component_eligibility / cell_vis_masks
-	-- with the entity-invariant fetches hoisted out of the cell loop.
+	-- restages every networked cell the entity owns (unpaired components and pairs it is the subject of),
+	-- mirroring resolve_component_eligibility / cell_vis_masks with the entity-invariant fetches hoisted.
 	local function restage_own_cells(entity: Entity)
 		local entity_masks = allow_masks[entity]
 		for _, component in get_components(entity) do
@@ -1459,13 +1323,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- restage networked pairs targeting this entity, for when its visibility as a target shifts. the reverse
-	-- index holds exactly the live tracked-relation pairs, so this walks only the pairs that actually target the
-	-- entity rather than probing every tracked relation. the pair-level resolve and the target's gate are per
-	-- pair id, not per subject, so they hoist out of the subject loop; the subjects are other entities, so their
-	-- own words can't ride restage_entity_words and stage per subject instead. subjects walk each pair id's
-	-- component record directly (the world:each scheme without its per-call closure or per-subject call);
-	-- staging never moves a subject between archetypes, so the walk is iteration-safe.
+	-- restages networked pairs targeting this entity, for when its visibility as a target shifts. the reverse
+	-- index holds exactly the live tracked-relation pairs; the pair-level resolve and the target's gate hoist
+	-- out of the subject loop, while the subjects (other entities) stage their own words per subject. subjects
+	-- walk each pair id's component record directly; staging never moves a subject between archetypes, so the
+	-- walk is iteration-safe.
 	local function restage_pairs_targeting(entity: Entity)
 		local bucket = tracked_pairs_by_target[dense(entity)]
 		if bucket == nil then
@@ -1522,9 +1384,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			fail(`Replicated is not meant to be paired! ({id_to_string(entity, world)})`)
 		end
 
-		-- any of the three tracking tags refuses Replicated (see guard_networked_added and on_designation_added
-		-- for the mirror direction), so the message names whichever one owns the tracking -- the plain tag, or
-		-- any designation's tag for a definition tracked only through designations.
+		-- any tracking tag refuses Replicated (see guard_networked_added and on_designation_added for the mirror
+		-- direction); the message names whichever tag owns the tracking -- a designation's tag for designation-only
+		-- definitions
 		local tracking_tag = tracked_by[entity]
 		if tracking_tag == nil then
 			local designated = designations[entity]
@@ -1541,10 +1403,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		replicated_entities[dense(entity)] = true
 
 		-- a replicated entity maps through its creation entry, never by name: withdraw any announcement. the staged
-		-- retraction is what unmaps the clients the entity is *not* visible to -- its eventual deletion never
-		-- reaches them, and a lingering name mapping would misbind the dense id's next tenant -- while a client
-		-- receiving the creation adopts the mapping out of name provenance first, so the same retraction leaves
-		-- them untouched.
+		-- retraction unmaps the clients the entity is *not* visible to (its deletion never reaches them, and a
+		-- lingering mapping would misbind the dense id's next tenant), while clients receiving the creation adopt
+		-- the mapping from name provenance first, so it leaves them untouched.
 		refresh_announcement(entity)
 
 		-- current cell values reach newly-visible clients via the live read at snapshot time; the entity also just
@@ -1569,10 +1430,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- NAME TRACKING
 
-	-- jecs.Name drives two behaviors: a named entity is a replicable pair target (the named_entities mirror is
-	-- what is_pair_target_replicable reads), and relevant named ids announce themselves for automatic client
-	-- mapping. these hooks keep both live for names set, changed, or removed after initialize's construction
-	-- walk seeds the mirror.
+	-- jecs.Name makes an entity a replicable pair target (the named_entities mirror) and announces relevant ids
+	-- for automatic client mapping; these hooks keep both live after initialize seeds the mirror.
 
 	local function on_name_added(entity: Entity, id: Id)
 		if id ~= jecs.Name then
@@ -1606,20 +1465,16 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- PRIVACY DELEGATION
 
-	-- pair(InheritsPrivacy, group) delegates an entity's entity-level visibility to the group's ordinary
-	-- entity-level filter, so one filter edit on the group narrows every delegating entity. an entity may
-	-- delegate to several groups at once -- orthogonal gates (a team's fog of war and a region's interest set)
-	-- intersect without duplicating either membership -- so delegation forms a DAG. scoped to the entity-level
-	-- gate only -- a (component, group) key can't be encoded in a single pair target, so per-component filters
-	-- stay local -- and a delegating entity's own filter intersects every inherited gate: everything narrows,
-	-- matching the entity -> cell subset invariant, and blacklists already normalize to allow words so
-	-- mixed-polarity delegation composes.
+	-- pair(InheritsPrivacy, group) delegates an entity's entity-level visibility to the group's entity-level
+	-- filter, so one edit on the group narrows every delegator. an entity may delegate to several groups
+	-- (orthogonal gates intersect), so delegation forms a DAG. scoped to the entity-level gate only -- a
+	-- (component, group) key can't be encoded in a single pair target -- and a delegator's own filter intersects
+	-- every inherited gate: everything narrows, matching the entity -> cell subset invariant.
 
-	-- re-derives a delegator's effective entity-level words as own intersect every parent's effective words,
-	-- storing the result (absent when every input is absent -- nothing the entity inherits restricts -- with
-	-- the entity leaving the store entirely when its last edge is removed) and returning whether the stored
-	-- words changed. always a fresh top-down derivation, never an in-place AND of new words into the stored
-	-- table: intersection can't restore bits a widening edit (a filter or edge removal) must grant back.
+	-- re-derives a delegator's effective words as own intersect every parent's effective words, storing them
+	-- (absent when every input is absent, leaving the store when the last edge goes) and returning whether they
+	-- changed. always a fresh top-down derivation, never an in-place AND: intersection can't restore bits a
+	-- widening edit must grant back.
 	local function recompute_effective(entity: Entity): boolean
 		local old = effective_masks[entity]
 		local parents = delegation_parents[entity]
@@ -1632,9 +1487,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local entity_masks = allow_masks[entity]
 		local own = if entity_masks then entity_masks[Existence] else nil
 
-		-- fold the restricting inputs together; nil until the first one, then a fresh table -- copied, never
-		-- aliased: own words are edited in place by the grant loop and the sweeps, parents' effective words by
-		-- later recomputes, and a filter edit replaces its table wholesale
+		-- copied, never aliased: own words are edited in place by the grant loop and sweeps, parents' effective
+		-- words by later recomputes
 		local derived: ShardMasks? = nil
 		if own ~= nil then
 			derived = table.clone(own)
@@ -1681,15 +1535,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return false
 	end
 
-	-- fans an effective-word change on node out over its delegating descendants: each child re-derives against
-	-- all of its parents (node's fresh words among them), and an unchanged child prunes its whole branch -- a
-	-- descendant needs refreshing only if some parent's words changed, and any such parent, being un-pruned,
-	-- fans out to it itself. this early exit is what keeps a group edit cheaper than editing every member: the
-	-- restage cell walk is the dominant cost, and it only runs where words actually changed. diamonds (a
-	-- descendant reachable through several children) re-derive once per arrival -- an early arrival may read a
-	-- sibling branch's words stale, but the last arrival reads everything fresh and stores the final words, and
-	-- any intermediate restage is idempotent -- so the walk converges without global ordering, at the cost of
-	-- transient duplicate work proportional to the diamond's width.
+	-- fans an effective-word change out over the delegating descendants: each child re-derives against all its
+	-- parents, and an unchanged child prunes its branch -- a descendant needs refreshing only if some parent's
+	-- words changed, and that parent, being un-pruned, fans out to it itself. this is what keeps a group edit
+	-- cheaper than editing every member. diamonds re-derive once per arrival: an early arrival may read a
+	-- sibling branch stale, but the last arrival reads everything fresh, and intermediate restages are
+	-- idempotent, so the walk converges at the cost of duplicate work proportional to the diamond's width.
 	local function refresh_descendants(node: Entity)
 		local children = delegation_children[node]
 		if children == nil then
@@ -1703,10 +1554,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- re-derives one delegator's effective words during a store-wide refresh (a joiner's slot grant), resolving
-	-- every parent first so the intersection reads fresh words; refreshed marks the delegators already
-	-- re-derived this pass. pre-order marking bounds the walk on any graph, and the guards keep delegation
-	-- acyclic, so parents always finish deriving before their delegators read them.
+	-- re-derives one delegator during a store-wide refresh (a joiner's slot grant), resolving every parent
+	-- first; refreshed bounds the walk, and the cycle guards keep delegation acyclic, so parents always finish
+	-- before their delegators read them.
 	local function refresh_delegator(entity: Entity, parents: { [number]: Entity }, refreshed: { [Entity]: true })
 		if refreshed[entity] ~= nil then
 			return
@@ -1721,8 +1571,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		recompute_effective(entity)
 	end
 
-	-- delegation_children maintenance, mirroring index_tracked_pair's bucket-set shape; keyed by the full group
-	-- entity so the fan-out and the parents mirror agree on identity.
+	-- delegation_children maintenance, keyed by the full group entity so the fan-out and the parents mirror
+	-- agree on identity
 	local function index_delegation_child(group: Entity, child: Entity)
 		local bucket = delegation_children[group]
 		if bucket == nil then
@@ -1743,9 +1593,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- whether sought is reachable from node through parent edges, read from the mirror rather than world:target
-	-- so the walk stays consistent with what the hooks have processed: the reachability test backing the cycle
-	-- guard. the visited set keeps diamonds from re-walking shared ancestry.
+	-- whether sought is reachable from node through parent edges (the cycle guard's test), read from the mirror
+	-- so the walk stays consistent with what the hooks have processed; visited keeps diamonds from re-walking
+	-- shared ancestry.
 	local function delegation_reaches(node: Entity, sought: Entity, visited: { [Entity]: true }): boolean
 		if node == sought then
 			return true
@@ -1829,35 +1679,28 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- PRIVACY CACHING
 
-	-- writes a sanitized filter over (entity, id)'s value slot directly in its archetype column -- never through
-	-- world:set, whose hooks would restage cells and notify user Private listeners over a rewrite that changes
-	-- no client's standing (pruned clients hold none). keeping the column in lockstep with the caches is what
-	-- makes world:get always return the effective filter, and what keeps stale filter values from pinning
-	-- departed client objects until their next edit. the record is re-read per call, so archetype moves between
-	-- writes (a blacklist removal mid-prune) never leave it stale; every caller runs after the component landed
-	-- (added hooks fire post-move), so the column slot always exists. reads archetype shape (columns_map) like
-	-- full_packet's walk, which DontFragment pairs won't occupy: if jecs ships DontFragment and Private adopts
-	-- it, pair(Private, component) values leave the archetype columns and this write needs whatever sparse-pair
-	-- storage api jecs exposes instead.
+	-- writes a sanitized filter over (entity, id)'s archetype column slot directly -- never through world:set,
+	-- whose hooks would restage cells and notify user listeners over a rewrite that changes no client's
+	-- standing. keeping the column in lockstep with the caches is what makes world:get return the effective
+	-- filter and keeps stale values from pinning departed client objects. the record is re-read per call so
+	-- archetype moves between writes never leave it stale, and every caller runs after the component landed, so
+	-- the slot exists. reads archetype shape like full_packet's walk: if Private ever adopts DontFragment, this
+	-- write needs jecs's sparse-pair storage api instead.
 	local function write_filter_value(entity: Entity, id: Id, filter: Privacy)
 		local record = entity_index.sparse_array[dense(entity)]
 		record.archetype.columns_map[id][record.row] = filter
 	end
 
-	-- resolves a privacy filter into the table + per-shard words the caches store, erroring on mixed polarities.
-	-- whitelist words mark the named allocated clients; blacklist words normalize into allow words too -- each
-	-- occupied shard's allocated word minus the named clients -- so every downstream reader keeps allow
-	-- semantics (allocate_client keeps both kinds fresh as later joiners take slots). pending clients stay in
-	-- the table bitless (allocate_client grants or withholds their bit later); untracked clients are pruned so
-	-- later edits don't clone them back in, with the set hook writing the pruned table back over the
-	-- component's value (write_filter_value) so the value and the cache stay one table. a blacklist that prunes
-	-- to empty blocks nobody: both returns are nil so the caller removes the value outright instead of caching
-	-- an empty table (empty always means a block-everyone whitelist).
+	-- resolves a filter into the table + per-shard words the caches store, erroring on mixed polarities.
+	-- whitelist words mark the named allocated clients; blacklist words normalize into allow words (each shard's
+	-- allocated word minus the named clients), with allocate_client keeping both fresh as joiners take slots.
+	-- pending clients stay in the table bitless; untracked clients are pruned so later edits don't clone them
+	-- back in. a blacklist that prunes to empty restricts nobody: both returns are nil so the caller removes the
+	-- value instead of caching an empty table (which always means a block-everyone whitelist).
 	local function sanitize_privacy(privacy: Privacy): (Privacy?, ShardMasks?)
-		-- shape checks first, so a malformed value is diagnosed rather than misread: a non-table would fault out
-		-- of next() below with a bare luau message, and a truthy non-boolean would sail through the polarity
-		-- check and *admit* the client it names -- the one direction a filter must never fail in. both raise
-		-- through the revert guard around this call, like the mixed-polarity error they join.
+		-- shape checks first: a non-table would fault out of next() with a bare luau message, and a truthy
+		-- non-boolean would pass the polarity check and *admit* the client it names -- the one direction a filter
+		-- must never fail in.
 		if type(privacy) ~= "table" then
 			fail(`privacy filters must be tables keyed by client! (got a {type(privacy)})`)
 		end
@@ -1929,11 +1772,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- caches the filter under (entity, key) and returns the sanitized table it cached: a table other than the
-	-- one passed means sanitization pruned, and the caller writes it back over the component's value. returns
-	-- nil without caching when a blacklist sanitized to nothing (naming only untracked clients) -- it restricts
-	-- nobody, and an empty table must keep meaning a block-everyone whitelist, so the caller removes the value
-	-- outright (whose removed hook then clears whatever this value replaced)
+	-- caches the filter under (entity, key) and returns the table cached: one other than the passed table means
+	-- sanitization pruned, and the caller writes it back over the value. returns nil without caching when a
+	-- blacklist sanitized to nothing, so the caller removes the value outright (its removed hook clears whatever
+	-- this replaced).
 	local function set_cached_privacy(entity: Entity, key: Component, privacy: Privacy): Privacy?
 		local sanitized, masks = sanitize_privacy(privacy)
 		if sanitized == nil then
@@ -1959,9 +1801,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- PRIVACY HOOKS
 
-	-- a privacy filter on (entity, key) governs the unpaired cell and every pair using key as the relation on
-	-- entity; restage them so the diff picks up who gained or lost access. pairs removed earlier this frame need
-	-- no restage: their staged 0 already removes them from every prior viewer.
+	-- a filter on (entity, key) governs the unpaired cell and every pair using key as the relation on entity.
+	-- pairs removed earlier this frame need no restage: their staged 0 already removes them.
 	local function restage_privacy_cells(entity: Entity, key: Component)
 		if world:has(entity, key) then
 			stage_visibility(key, entity)
@@ -1973,9 +1814,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the entity-level filter on entity changed: re-derive its own effective words first when it delegates, then
-	-- restage the whole entity and fan out over its delegating descendants. shared by the set and removed hooks'
-	-- entity-level arms below.
+	-- the entity-level filter changed: re-derive the entity's own effective words when it delegates, restage the
+	-- whole entity, and fan out over its descendants.
 	local function refresh_entity_gate(entity: Entity)
 		if delegation_parents[entity] ~= nil then
 			recompute_effective(entity)
@@ -1984,14 +1824,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		refresh_descendants(entity)
 	end
 
-	-- set_cached_privacy behind a revert guard: sanitize_privacy's mixed-polarity error fires from inside the
-	-- set hook, after the offending value already landed on the entity, so erroring alone would leave the world
-	-- holding a filter the caches aren't honoring until the next set/remove. revert first -- like the Networked
-	-- guards undo their add before erroring -- back to the previous cached filter when one exists (the
-	-- sanitized shape, pruned of departed clients), or removing the value outright when a fresh add has nothing
-	-- to revert to; then rethrow. the revert re-fires on_private_set with a filter that sanitizes cleanly
-	-- (cached filters are single-polarity tables by construction), so the nested run never re-enters this error
-	-- path.
+	-- set_cached_privacy behind a revert guard: sanitize_privacy's errors fire from inside the set hook, after
+	-- the offending value landed, so erroring alone would leave the world holding a filter the caches aren't
+	-- honoring. revert first -- to the previous cached filter, or removing the value when a fresh add has
+	-- nothing to revert to -- then rethrow. the revert re-fires on_private_set with a filter that sanitizes
+	-- cleanly, so the nested run never re-enters this path.
 	local function set_cached_privacy_reverting(entity: Entity, key: Component, id: Id, privacy: Privacy): Privacy?
 		local ok, result = pcall(set_cached_privacy, entity, key, privacy)
 		if ok then
@@ -2007,15 +1844,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		error(result, 0)
 	end
 
-	-- a sanitization that pruned earns a warning on top of the rewrite: every pruned client is one the caller
-	-- believed the filter governed, and the failure is silent and polarity-dependent -- a pruned whitelist goes
-	-- on blocking clients it meant to admit, while a blacklist pruned empty (sanitized == nil) is removed
-	-- outright, admitting its named clients the moment they do join. both are spellings of the same ordering
-	-- bug: clients must be registered through add_client before a filter names them (a pending client already
-	-- counts as tracked), and before construction no client can be tracked at all, so the catch-up warns here
-	-- for every populated pre-construction filter (see catch_up). the prune itself stays the standing contract
-	-- (filters name only tracked clients -- see prune_privacy_filters); only user sets warn, since
-	-- remove_client's departure prune never runs through sanitization.
+	-- a sanitization that pruned warns on top of the rewrite: the failure is otherwise silent and
+	-- polarity-dependent -- a pruned whitelist goes on blocking clients it meant to admit, while a blacklist
+	-- pruned empty is removed outright, admitting its named clients the moment they join. both are the same
+	-- ordering bug: clients must be registered through add_client before a filter names them, and before
+	-- construction no client can be, so the catch-up warns for every populated pre-construction filter. only
+	-- user sets warn; remove_client's departure prune never runs through sanitization.
 	local function warn_pruned_clients(entity: Entity, filter: Privacy, sanitized: Privacy?)
 		if sanitized == nil then
 			warn(
@@ -2041,27 +1875,20 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		)
 	end
 
-	-- handles both the added and changed hooks (a world:set fires whichever applies, and the work is identical
-	-- either way): cache under the paired component (or Existence for an un-paired Private), then restage the
-	-- governed cells; the packet diff turns each mask change into per-client sends and removals, so no
-	-- old-vs-new diffing here. an entity-level filter gates everything, so it restages entity-wide and fans out
-	-- over the entity's delegating descendants (with the entity's own effective words re-derived first, when it
-	-- delegates itself). a filter sanitization pruned (naming departed or never-tracked clients) is written
-	-- back over the component's value, so the value and the cache stay one table, and warned about
-	-- (warn_pruned_clients above); a blacklist that sanitized to nothing is never cached: the value is removed
-	-- outright, mirroring edit_privacy's emptying edits, with the removed hook clearing and restaging whatever
-	-- filter the value replaced -- warned about the same way. mutating here is fine: added hooks fire after the
-	-- archetype move and changed hooks involve none -- only removed hooks fire mid-transition (see jecs.md).
+	-- handles both the added and changed hooks (identical work): cache under the paired component (or Existence
+	-- for an unpaired Private), then restage the governed cells -- the packet diff turns each mask change into
+	-- sends and removals, so no old-vs-new diffing here. an entity-level filter restages entity-wide and fans
+	-- out over delegating descendants. a sanitization that pruned is written back over the value (so value and
+	-- cache stay one table) and warned about; a blacklist that sanitized to nothing is removed outright, its
+	-- removed hook clearing whatever it replaced. mutating here is fine: added hooks fire after the archetype
+	-- move and changed hooks involve none.
 	--
-	-- a nil value is normalized before any of that: a filter is a table, and absence already means unrestricted,
-	-- so there is no third state for a present nil to name -- world:add(entity, Private) and world:set(entity,
-	-- Private, nil) both land here, and both meant "block everyone" only by accident of an empty cache entry,
-	-- which the empty table says outright. rewriting the value to empty_whitelist (rather than stripping it)
-	-- keeps that meaning: a filter system must fail closed, so the one interpretation never worth guessing at is
-	-- the one that would silently reveal what the caller was trying to hide. it warns rather than erroring
-	-- because the resulting state is exactly what the call meant -- the warning is about the spelling, and about
-	-- the sibling form it can't catch, since jecs's add returns early on an entity that already carries a filter
-	-- and fires no hook at all there (see jecs.md), silently leaving that filter in place.
+	-- a nil value is normalized first: absence already means unrestricted, so a present nil has no third state
+	-- to name -- world:add(entity, Private) and world:set(entity, Private, nil) both land here meaning "block
+	-- everyone" only by accident of an empty cache entry. rewriting to empty_whitelist keeps that meaning,
+	-- failing closed. it warns rather than errors because the resulting state is what the call meant: the
+	-- warning is about the spelling, and about the sibling form it can't catch -- jecs's add returns early on an
+	-- entity already carrying a filter and fires no hook (see jecs.md).
 	local function on_private_set(entity: Entity, id: Id, privacy: Privacy?)
 		local filter: Privacy
 		if privacy == nil then
@@ -2072,16 +1899,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				)})`
 			)
 			write_filter_value(entity, id, empty_whitelist)
-			-- then carry on and cache it: the write fires no hooks, so this pass is the only chance -- a value
-			-- that landed with no cache behind it would read as no filter at all, failing open in the one place
-			-- that must not.
+			-- the write fires no hooks, so cache it here: a value with no cache behind it would read as no filter,
+			-- failing open
 			filter = empty_whitelist
 		else
 			filter = privacy
 		end
-		-- a non-table never reaches table.isfrozen: it would fault out of the hook with a bare luau message,
-		-- leaving the offending value on the entity with nothing cached behind it. sanitize_privacy's shape check
-		-- names it properly instead, through the revert guard below.
+		-- a non-table must not reach table.isfrozen (a bare luau fault, leaving the value with nothing cached);
+		-- sanitize_privacy's shape check names it through the revert guard
 		if type(filter) == "table" and table.isfrozen(filter) ~= true then
 			table.freeze(filter)
 		end
@@ -2126,20 +1951,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- PRIVACY EDITING
 
-	-- the polarity of a cached filter: cached blacklists are never empty (one emptied by pruning or editing
-	-- drops out of the caches entirely), so one sampled value is the polarity -- an empty table samples nil and
-	-- reads as what it is, a block-everyone whitelist.
+	-- cached blacklists are never empty (an emptied one drops out of the caches), so one sampled value is the
+	-- polarity; an empty table samples nil and reads as the block-everyone whitelist it is.
 	local function privacy_is_blacklist(privacy: Privacy): boolean
 		local _, sample = next(privacy)
 		return sample == false
 	end
 
-	-- copy-on-write edit: clone -> mutate -> freeze, so world:set fires the changed hook with a fresh immutable
-	-- value. membership means the opposite thing per polarity -- a whitelist admits its members, a blacklist
-	-- admits everyone else -- so a client's admission is their membership XORed with the polarity, and a state
-	-- change always flips membership: a named client un-names, an unnamed one gains the polarity's member value
-	-- (so allowing a blacklisted client un-names them rather than writing true, and polarity can never flip
-	-- through edits). returns nil when the client is already in the requested state.
+	-- copy-on-write: clone -> mutate -> freeze, so world:set fires the changed hook with a fresh immutable
+	-- value. a client's admission is their membership XORed with the polarity, so a state change always flips
+	-- membership: a named client un-names, an unnamed one gains the polarity's member value -- polarity can
+	-- never flip through edits. returns nil when already in the requested state.
 	local function toggle_privacy_member(
 		privacy: Privacy,
 		is_blacklist: boolean,
@@ -2160,15 +1982,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return edited
 	end
 
-	-- edits one client's standing in the privacy filter on (entity, key), backed by id (the unpaired or paired
-	-- Private). on a whitelist, allowed adds or drops membership (a whitelist emptied this way keeps blocking
-	-- everyone); on a blacklist, disallowing names the client and allowing un-names them, with the last name's
-	-- removal dropping the Private value outright -- a blacklist blocking nobody restricts nothing, and an empty
-	-- table must keep meaning a block-everyone whitelist. disallowing with no filter configured starts a
-	-- blacklist (no filter admits everyone, so the starting point is unambiguous); allowing requires an existing
-	-- whitelist (set an empty one to start from blocking everyone). the two public entry points below bind
-	-- key/id for the entity-level and per-component filters respectively. these rules exist to maintain a
-	-- filter's polarity after incremental edits.
+	-- edits one client's standing in the filter on (entity, key), backed by id. on a whitelist, allowed adds or
+	-- drops membership (an emptied whitelist keeps blocking everyone); on a blacklist, disallowing names the
+	-- client and allowing un-names them, the last name's removal dropping the value outright (a blacklist
+	-- blocking nobody restricts nothing, and an empty table must keep meaning a block-everyone whitelist).
+	-- disallowing with no filter starts a blacklist (no filter admits everyone, so the start is unambiguous);
+	-- allowing requires an existing whitelist. these rules keep a filter's polarity stable under incremental
+	-- edits.
 	local function edit_privacy(entity: Entity, key: Component, id: Id, client: Client, allowed: boolean)
 		local component_filters = privacy_filters[entity]
 		local privacy = if component_filters then component_filters[key] else nil
@@ -2209,9 +2029,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- SERDES
 
-	-- the per-world serdes store (see shared.luau / serdes.luau): registrations validate at their own call
-	-- site, or -- pre-registered ones, which the store replays at its construction -- from the world's first
-	-- duplecs contact, so this half needs no serdes catch-up of its own
+	-- the per-world serdes store (see shared.luau / serdes.luau) validates registrations itself, pre-registered
+	-- ones included, so this half needs no serdes catch-up
 	local Serdes = components.Serdes
 
 	-- CLIENT SLOTS
@@ -2226,17 +2045,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		pending_clients[client] = true
 	end
 
-	-- prunes the departing client's key from every privacy filter, cache and component value alike: whether a
-	-- stale name survived a filter would otherwise depend on whether an edit happened in between (edits clone
-	-- from the pruned cache), so a rejoin under the same value would be re-admitted or not by that accident --
-	-- pruning at departure makes rejoins deterministic (a rejoiner always starts unlisted) -- and an unedited
-	-- value would pin the departed client object (typically a Player) indefinitely. copy-on-write like the
-	-- edits, since cached values are frozen and callers may snapshot them by reference; the pruned table lands
-	-- in the cache and, via write_filter_value, over the component's value, keeping the two one table. one
-	-- exception: a blacklist pruned empty restricts nobody, so its Private value is removed outright (an empty
-	-- table must keep meaning a block-everyone whitelist), mirroring edit_privacy's emptying edits; a whitelist
-	-- pruned empty stays and keeps blocking everyone. no restage and no hooks: the departing client's bit is
-	-- out of every allocated word, and no other client's admission changes.
+	-- prunes the departing client from every filter, cache and component value alike: otherwise whether a stale
+	-- name survived would depend on whether an edit happened in between (edits clone from the pruned cache), so
+	-- a rejoin under the same value would be re-admitted or not by accident -- pruning at departure makes
+	-- rejoins deterministic (a rejoiner always starts unlisted) -- and an unedited value would pin the departed
+	-- client object indefinitely. copy-on-write, since cached values are frozen and callers may hold them by
+	-- reference; a blacklist pruned empty is removed outright, mirroring edit_privacy, while a whitelist pruned
+	-- empty stays and keeps blocking everyone. no restage: the departing bit is out of every allocated word, and
+	-- no other client's admission changes.
 	local function prune_privacy_filters(client: Client)
 		for entity, component_filters in privacy_filters do
 			for key, filter in component_filters do
@@ -2281,9 +2097,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		allocated_masks[shard] = allocated
 		freed_masks[shard] = bit32.bor(freed_masks[shard], bit)
 		if allocated == 0 then
-			-- the shard organically emptied: drop its mask trees wholesale (nothing reads them with no occupants, and
-			-- a rejoiner rebuilds via its full packet). the allow words keep their stale bits -- the freed-slot sweep
-			-- clears those per bit on reuse.
+			-- the shard emptied: drop its mask trees (nothing reads them without occupants; a rejoiner rebuilds via
+			-- its full packet). the allow words keep their stale bits for the freed-slot sweep.
 			next_visibilities[shard] = nil
 			last_visibilities[shard] = nil
 			while shard_count > 0 and allocated_masks[shard_count] == 0 do
@@ -2295,22 +2110,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		prune_privacy_filters(client)
 	end
 
-	-- whether the client is currently registered with this instance: true from add_client until remove_client,
-	-- pending joiners included -- a pending client is already registered (privacy filters may already name
-	-- them), even though their slot, and with it every visibility query, only arrives at the tail of the next
-	-- generate_packets.
+	-- true from add_client until remove_client, pending joiners included: a pending client is registered
+	-- (filters may already name them) even though their slot only arrives at the next generate_packets.
 	local function is_client_tracked(client: Client): boolean
 		return tracked_clients[client] ~= nil or pending_clients[client] == true
 	end
 
-	-- declares that the client world behind an allocated slot is fresh -- it has never reconciled a packet from
-	-- this server -- so the next generate_packets returns a full packet for the client in place of their delta.
-	-- the slot itself is untouched -- its privacy filters, visibility masks, and delta baseline all persist --
-	-- so this exists for handing an already-allocated slot to a new connection: a game keeping slots allocated
-	-- across disconnects to preserve their privacy state resyncs whoever takes the slot over. freshness is the
-	-- declared precondition, not a resync knob: a full packet carries no removals, so a world that has already
-	-- reconciled state would keep whatever the full doesn't name. marking a pending joiner is a no-op (their
-	-- join already produces a full packet); marking an untracked client warns.
+	-- declares the client world behind an allocated slot fresh -- it has never reconciled a packet from this
+	-- server -- so the next generate_packets returns a full packet in place of the delta. the slot itself
+	-- (filters, masks, delta baseline) is untouched: this hands an already-allocated slot to a new connection.
+	-- freshness is the precondition, not a resync knob: a full carries no removals, so a world that has
+	-- reconciled state would keep whatever the full doesn't name. a pending joiner is a no-op, an untracked
+	-- client warns.
 	local function mark_client_fresh(client: Client)
 		if pending_clients[client] then
 			return
@@ -2322,9 +2133,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		fresh_clients[client] = true
 	end
 
-	-- debug introspection: the 1-based shard of an allocated client (nil while pending or untracked). shard
-	-- placement is otherwise invisible -- sections are shared across shards -- so tests verifying the compaction
-	-- schedule read it directly.
+	-- debug introspection: the 1-based shard of an allocated client (nil while pending or untracked), for tests
+	-- verifying the compaction schedule.
 	local function client_shard(client: Client): number?
 		local client_index = tracked_clients[client]
 		if client_index == nil then
@@ -2335,25 +2145,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- ALLOCATION & PACKET GENERATION
 
-	-- both packet passes -- the reliable delta/full pipeline and the unreliable always-replicate one -- live in
-	-- this nested scope for create_server's local budget: luau caps a function at 200 locals, create_server sat
-	-- near the cap, and nested functions have their own budget, so the ~60 helpers and stores below no longer
-	-- count against the outer one. runs exactly once, at construction, so every closure and persistent store
-	-- here is minted once like before, and upvalue access costs what it did as create_server locals (closures
-	-- capture each upvalue directly however many scopes up it lives). only the two entry points escape,
-	-- returned at the tail.
+	-- both packet passes live in this nested scope for create_server's local budget: luau caps a function at 200
+	-- locals, create_server sat near the cap, and nested functions have their own budget. runs once at
+	-- construction, so every closure and store here is minted once and upvalue access costs what it did as
+	-- create_server locals; only the two entry points escape.
 	local function create_packet_generation()
-		-- the per-world serdes resolver (see shared.luau / serdes.luau), rebound here so the salvage guards
-		-- below reach it without leaving the scope
+		-- the per-world serdes resolver (see shared.luau / serdes.luau)
 		local resolve_serdes = shared_record.resolve_serdes
 
-		-- the packet passes' measure, behind the salvage guard (see wire.measure_section_salvaging): a user encode
-		-- hook that throws mid-measure no longer unwinds out of generate_packets after the resolve passes marked the
-		-- frame's deltas sent -- the offending values are pruned from the draft, and everything else (the surviving
-		-- values, and the nulled/removed lists, which never encode) ships as measured. warn-and-continue: the frame
-		-- is salvaged, so erroring would throw away the salvage. the pruned values simply never reach clients --
-		-- their cells replicate again on their next staged change (which encodes fresh, and may fail again until the
-		-- hook or the value is fixed).
+		-- the packet passes' measure behind the salvage guard (see wire.measure_section_salvaging): a user encode
+		-- hook that throws mid-measure no longer unwinds out of generate_packets after the resolve passes marked
+		-- the frame's deltas sent -- the offending values are pruned and everything else ships. warn-and-continue;
+		-- the pruned cells replicate again on their next staged change.
 		local function measure_section_guarded(draft: SectionDraft): number
 			local size, pruned, salvage_error = measure_section_salvaging(draft, resolve_serdes)
 			if salvage_error ~= nil then
@@ -2365,9 +2168,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return size
 		end
 
-		-- the packet frame counter, cycling 0..2^32-1: every packet of one generate_packets call carries it, so a
-		-- caller splitting a call's packets across channels can group, dedupe, or order them (wrap-aware) on the
-		-- client. independent of the chunk frame counter below.
+		-- the packet frame counter, cycling 0..2^32-1: every packet of one call carries it so a caller splitting
+		-- packets across channels can group or order them (wrap-aware). independent of the chunk frame counter.
 		local packet_frame = -1
 
 		local function next_packet_frame(): number
@@ -2375,10 +2177,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return packet_frame
 		end
 
-		-- the recycling pools (see pools.luau). the scratch tables back the packet passes' per-frame lists: the
-		-- section drafts' lists, the per-node and per-client accumulators' inner tables, the entity create/delete
-		-- lists, and full_packet's collectors -- the flat packet buffer copies or encodes all of their contents, so
-		-- none escape a generate_packets call.
+		-- the recycling pools (see pools.luau) behind the packet passes' per-frame lists; the flat packet buffer
+		-- copies or encodes all of their contents, so none escape a call.
 		local pools = create_pools()
 		local fetch_scratch = pools.fetch_scratch
 		local release_scratch = pools.release_scratch
@@ -2402,10 +2202,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- clears freed slots' stale marks from one shard's persistent stores: its last tree, the allow words, and
-		-- the derived effective words (bit clears distribute over intersection, so the same per-word sweep keeps
-		-- them consistent with their inputs). bits may carry several set bits (compaction batches reused target
-		-- slots per shard; allocate_client sweeps one). entries that zero are pruned, like everywhere else, so a
-		-- present last word is always nonzero.
+		-- the effective words (bit clears distribute over intersection). bits may carry several set bits
+		-- (compaction batches per shard). entries that zero are pruned, so a present last word is always nonzero.
 		local function sweep_freed_slots(shard: number, bits: VisibilityMask)
 			local clear = bit32.bnot(bits)
 			local shard_last_visibilities = last_visibilities[shard]
@@ -2464,9 +2262,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				sweep_freed_slots(shard, bit)
 			end
 
-			-- grant the bit to filters that admit this client: whitelists that named them while pending (their bit
-			-- didn't exist yet), and blacklists that don't name them -- this is what keeps blacklists' snapshot-derived
-			-- allow words fresh as the population grows. allow_masks mirrors privacy_filters' keys, so the masks table
+			-- grant the bit to filters admitting this client: whitelists that named them while pending (their bit
+			-- didn't exist yet), and blacklists that don't name them -- this keeps blacklists' snapshot-derived allow
+			-- words fresh as the population grows. allow_masks mirrors privacy_filters' keys, so the masks table
 			-- always exists.
 			for entity, component_filters in privacy_filters do
 				local entity_masks = allow_masks[entity]
@@ -2483,9 +2281,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 			end
 
-			-- delegation-aware pass: effective words derive from the own words the grant loop just refreshed, so
-			-- re-derive every delegator's, parents first. joins are rare and this is pure word math over the delegator
-			-- set; no restage -- the joiner's visibility ships via their full packet, and no other client's bits moved.
+			-- effective words derive from the own words just refreshed, so re-derive every delegator's, parents first.
+			-- no restage: the joiner's visibility ships via their full packet, and no other client's bits moved.
 			if next(delegation_parents) ~= nil then
 				local refreshed = {} :: { [Entity]: true }
 				for entity, parents in delegation_parents do
@@ -2494,25 +2291,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- builds a full packet for a freshly-allocated client and marks their bit in their shard's last_* masks so
-		-- subsequent deltas diff correctly. allocate_client must have run first. walks the replicated set archetype
-		-- by archetype rather than per tracked component: cells only replicate on replicated subjects, so the
-		-- archetypes of Replicated's component record cover every cell (walked directly -- an uncached
-		-- world:query(Replicated):archetypes() rebuilds exactly that record's archetype list per call), and
-		-- everything shape-derived -- eligibility, privacy keys, pair halves (read off archetype.types like
-		-- restage_own_cells, never world:target), and value columns -- resolves once per archetype, leaving
-		-- per-entity work of only the entity's own gate, one filter word per cell, and a column read per value. only
-		-- this client's bit matters, so every mask check collapses to one band against the bit (allocated needs no
-		-- re-check: the client's own bit is allocated by definition).
+		-- builds a full packet for a freshly-allocated client (allocate_client must have run) and marks their bit
+		-- in their shard's last masks so subsequent deltas diff correctly. walks the Replicated record's archetypes
+		-- rather than per tracked component: cells only replicate on replicated subjects, so those archetypes cover
+		-- every cell, and everything shape-derived (eligibility, privacy keys, pair halves read off
+		-- archetype.types, value columns) resolves once per archetype, leaving per-entity work of the entity's
+		-- gate, one filter word per cell, and a column read per value. only this client's bit matters, so every
+		-- mask check is one band against the bit.
 		local function full_packet(client: Client, this_packet_frame: number): Packet
 			local client_index = tracked_clients[client] :: number
 			local shard = shard_of(client_index)
 			local bit = slot_bit_of(client_index)
 			local sections: { SectionDraft } = fetch_scratch()
 			local section_of: { [Id]: SectionDraft } = fetch_scratch()
-			-- pair drafts collect per relation (their cells landing in per-target runs), in their own map: both maps
-			-- key gen-qualified ids here, so one definition serving as an unpaired component and as a relation shares
-			-- a key between the two roles at any generation, and the two must draft separate sections
+			-- pair drafts collect per relation in their own map: one definition serving as both an unpaired component
+			-- and a relation shares a key between the roles, and the two must draft separate sections
 			local pair_section_of: { [Entity]: SectionDraft } = fetch_scratch()
 
 			local shard_last_visibilities = last_visibilities[shard]
@@ -2525,9 +2318,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local replicated: { number } = fetch_scratch()
 			local replicated_count = 0
 
-			-- appends one visible cell to its section draft. relation and target ride in from the archetype resolve
-			-- below, already gen-qualified, so pair cells never pay a pair_first/pair_second here; value is the cell's
-			-- column read (nil for tags and nulled values).
+			-- appends one visible cell to its section draft; relation and target ride in gen-qualified from the
+			-- archetype resolve, so pair cells never pay pair_first/pair_second here.
 			local function emit(component: Id, entity: Entity, relation: Entity?, target: Entity?, value: any)
 				local last_component = shard_last_visibilities[component]
 				if last_component == nil then
@@ -2576,11 +2368,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 			end
 
-			-- the walked archetype's networked cells, parallel over 1..cell_count: the cell id as staged and keyed in
-			-- the last tree (the component, or the packed pair id straight from archetype.types), the privacy key
-			-- gating it per entity (the component itself, or the gen-qualified relation -- doubling as emit's relation
-			-- argument), the value column (jecs backs tags with a shared empty column, so tag reads are plain nils),
-			-- and -- pair cells only -- the gen-qualified target.
+			-- the walked archetype's networked cells, parallel over 1..cell_count: the cell id as keyed in the last
+			-- tree, the privacy key gating it per entity (the component, or the gen-qualified relation, doubling as
+			-- emit's relation argument), the value column (tags read plain nils off jecs's shared empty column), and
+			-- for pairs the gen-qualified target.
 			local cell_ids: { number } = fetch_scratch()
 			local cell_keys: { number } = fetch_scratch()
 			local cell_columns: { { any } } = fetch_scratch()
@@ -2599,10 +2390,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 				local columns_map = archetype.columns_map
 
-				-- resolve the archetype's networked cells once: the tracking and pair-half checks are per component, not
-				-- per entity, and a pair target's gate blocking this client blocks the cell for every subject in the
-				-- archetype, so it drops here. the pair resolve mirrors restage_own_cells (an unindexed half is
-				-- ineligible).
+				-- resolve the archetype's networked cells once: tracking and pair-half checks are per component, and a
+				-- pair target's gate blocking this client blocks the cell for every subject. mirrors restage_own_cells.
 				local cell_count = 0
 				for _, component in archetype.types do
 					local privacy_key: number
@@ -2733,15 +2522,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- reclaims the highest occupied shard once the live client count falls more than 8 below the slot capacity
-		-- beneath it, so per-frame cost tracks the current population rather than the historical peak (staging,
-		-- resolve, and finalize all run per occupied shard). lowest-first allocation packs joiners low, so only the
-		-- stragglers of a population shrink pin a high shard; the deadzone guarantees at least stragglers + 9 free
-		-- bits below, so placement never fails, and re-opening the reclaimed shard takes ~9 net joins, so a
-		-- population hovering at a shard boundary never churns. at most one shard is reclaimed per call; a large
-		-- drop reclaims over successive calls. a move is a pure server-side bit transfer, invisible to clients:
-		-- packets are keyed by client object and deltas diff against whatever last words carry the bit. must run at
-		-- the tail of generate_packets -- next_visibilities and changed_values are empty there, leaving the last
-		-- trees, the allow words, and the slot bookkeeping as the only stores carrying slot bits.
+		-- beneath it, so per-frame cost tracks the current population rather than the historical peak. lowest-first
+		-- allocation packs joiners low, so only the stragglers of a shrink pin a high shard; the deadzone
+		-- guarantees room below, and re-opening takes ~9 net joins, so a population hovering at a boundary never
+		-- churns. at most one shard per call. a move is a pure server-side bit transfer, invisible to clients
+		-- (packets are keyed by client object). must run at the tail of generate_packets, when next_visibilities
+		-- and changed_values are empty and the last trees, allow words, and slot bookkeeping are the only stores
+		-- carrying slot bits.
 		local function compact_shards()
 			local reclaimed = shard_count
 			if client_count >= (reclaimed - 1) * 32 - 8 then
@@ -2850,9 +2637,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- the mask trie: a cell's accumulated visibility is the node its run path reaches, so equal cross-shard
-		-- visibility converges on one node. its contents are per-frame and trie nodes never escape the pass, so the
-		-- expansion pass clears each node it leaves into a free list that append_mask_run drains before allocating,
-		-- and the root persists empty between calls.
+		-- visibility converges on one node. contents are per-frame: the expansion pass clears each node it leaves
+		-- into a free list, and the root persists empty between calls.
 		local mask_trie = {} :: MaskTrieNode
 		local trie_node_pool = {} :: { MaskTrieNode }
 		local trie_node_pool_count = 0
@@ -2874,13 +2660,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return child
 		end
 
-		-- cross-shard packet groups, persistent across calls (see the PacketGroup type): every dirty cell lands in
-		-- its group once, its nodes accumulating per-shard runs as the shard loop advances. unpaired components
-		-- key groups by their id; pair cells share one group per relation, keyed by the relation's dense half (all a
-		-- packed pair id carries) in its own store -- a generation-0 component id can collide with a relation's
-		-- dense id, and the two must stay distinct groups. dirty_groups lists the groups touched this frame so the
-		-- bucket pass never walks the historical set; group_frame stamps first touches, and last_group_sweep
-		-- schedules the eviction sweep that keeps both stores bounded by the recently-live id set.
+		-- cross-shard packet groups, persistent across calls (see PacketGroup). unpaired components key by id; pair
+		-- cells share one group per relation, keyed by the relation's dense half in its own store -- a generation-0
+		-- component id can collide with a relation's dense id, and the two must stay distinct groups. dirty_groups
+		-- lists the groups touched this frame so the bucket pass never walks the historical set; group_frame stamps
+		-- touches and last_group_sweep schedules the eviction sweep that keeps both stores bounded.
 		local groups = {} :: { [Id]: PacketGroup }
 		local pair_groups = {} :: { [number]: PacketGroup }
 		local dirty_groups = {} :: { PacketGroup }
@@ -2888,40 +2672,31 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local group_frame = 0
 		local last_group_sweep = 0
 
-		-- per-frame accumulators of the packet passes, grouped into one record shared by the pass functions below
-		-- as an upvalue rather than parameters: the nine accumulators cost one local between them (grouped back
-		-- when they counted against create_server's 200-local ceiling, before this scope split out), and each pass
-		-- aliases the fields it touches into locals at its head -- nested functions have their own 200-local
-		-- budget, and the aliases are the upvalue reads the passes already paid. the maps themselves persist:
-		-- release_frame_state hands their inner tables back to the scratch pool once the frame's packets are
-		-- assembled, and reset_frame_state clears whatever an errored frame stranded (the salvage guard contains
-		-- user encode throws, but an internal error can still unwind mid-frame) so every call still starts fresh.
-		-- both stay directly below the declaration so an accumulator can't be added without its reset and release
-		-- in view -- the record literal is the declaration list.
+		-- per-frame accumulators of the packet passes, grouped into one record (from when they counted against
+		-- create_server's local ceiling) and aliased into locals at each pass's head. the maps persist:
+		-- release_frame_state hands their inner tables back to the pool once the packets are assembled, and
+		-- reset_frame_state clears whatever an errored frame stranded (the salvage guard contains user encode
+		-- throws, but an internal error can still unwind mid-frame). both stay directly below so an accumulator
+		-- can't be added without its reset and release in view.
 		local frame_state = {
 			-- entity create/delete lists keyed by global client index
 			replicated_by = {} :: { [number]: { number } },
 			unreplicated_by = {} :: { [number]: { number } },
 
-			-- sections attach per accumulated-visibility node via node_section_drafts, keyed [node][group] -- the
-			-- group object itself, so an unpaired component and a relation can never collide however their ids
-			-- overlap; unpaired groups draft an unpaired section, pair groups a relation section whose per-target
-			-- runs the bucket pass fills. with a single occupied shard every cell has exactly one run, so the trie
-			-- is skipped entirely and the drafts key by the raw mask word instead. masks are intersected with each
-			-- shard's allocated word at resolve time so a departed client's stale bit lingering in last_visibilities
-			-- never creates or widens a section.
+			-- sections attach per accumulated-visibility node, keyed [node][group] -- the group object, so an unpaired
+			-- component and a relation can never collide. with a single occupied shard the trie is skipped and the raw
+			-- mask word keys instead. masks are intersected with each shard's allocated word at resolve time, so a
+			-- departed client's stale bit never creates or widens a section.
 			node_section_drafts = {} :: { [VisibilityNode]: { [PacketGroup]: SectionDraft } },
 
-			-- finalize_node_sections' outputs, per node: the node's sections encoded back-to-back into one shared
-			-- buffer, its byte size, and (only when the node has any) the hookless sections' value arrays in write
-			-- order -- one array per hookless section, so the outer length counts sections and never values.
+			-- finalize_node_sections' outputs per node: the sections encoded back-to-back into one shared buffer, its
+			-- size, and the hookless sections' value arrays in write order (one array per hookless section).
 			node_buffers = {} :: { [VisibilityNode]: buffer },
 			node_sizes = {} :: { [VisibilityNode]: number },
 			node_section_values = {} :: { [VisibilityNode]: { { any } } },
 
-			-- per-client accumulators for the expansion pass: the section buffers to stamp, their running byte size,
-			-- and the hookless sections' value arrays in section order (the packet's side array, same
-			-- one-array-per-section shape as node_section_values), all keyed by global client index.
+			-- per-client accumulators for the expansion pass, keyed by global client index: the buffers to stamp,
+			-- their running size, and the hookless value arrays in section order (the packet's side array).
 			client_buffers = {} :: { [number]: { buffer } },
 			client_sizes = {} :: { [number]: number },
 			client_section_values = {} :: { [number]: { { any } } },
@@ -2951,12 +2726,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			multi_shard = shard_count > 1
 		end
 
-		-- runs after assemble_client_packets: every section buffer has been stamped into the clients' flat packets
-		-- and the create/delete lists written inline, so only the hookless value arrays inside client_section_values
-		-- (escaped into the packets' side arrays) outlive the frame. releasing a map's values before clearing the
-		-- map is safe here -- nothing fetches until the maps are cleared -- and running before the joiner full
-		-- packets lets those draw on the freed tables. node_section_drafts is already empty: finalize_node_sections
-		-- consumed it.
+		-- runs after assemble_client_packets: every buffer has been stamped and the lists written inline, so only
+		-- the hookless value arrays in client_section_values (the packets' side arrays) outlive the frame. runs
+		-- before the joiner full packets so those draw on the freed tables; node_section_drafts is already empty,
+		-- finalize consumed it.
 		local function release_frame_state()
 			-- node_buffers holds plain buffers whose bytes were already stamped into the clients' packets, so they just
 			-- drop to the GC
@@ -3018,12 +2791,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return group
 		end
 
-		-- the shared group of every pair cell using component's relation. packed pair ids reuse dense halves across
-		-- generations, so the gen-qualified relation (and the relation tag-ness gating the resolve passes' value
-		-- reads) re-resolves on the group's first touch each frame -- through the relation gen cache, with an
-		-- untracked relation (a stop_tracking_component or a relation death resolving its staged removals) recovered
-		-- from the retired store, and the live resolve as a last resort for cells no retirement covers; the targets
-		-- resolve per pair id in the resolve passes, since one group now spans every target of the relation.
+		-- the shared group of every pair cell using component's relation. dense halves recycle across generations,
+		-- so the gen-qualified relation and its tag-ness re-resolve on the group's first touch each frame --
+		-- through the gen cache, with an untracked relation (a stop, or a relation death resolving its staged
+		-- removals) recovered from the retired store and the live resolve as a last resort; targets resolve per
+		-- pair id in the resolve passes.
 		local function get_pair_group(component: Id): PacketGroup
 			local relation_dense = ECS_PAIR_FIRST(component)
 			local group = pair_groups[relation_dense]
@@ -3092,11 +2864,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return data
 		end
 
-		-- the one special-cased cell: the existence diff resolves into per-client replicated / unreplicated lists
-		-- rather than a component group (a bit gained is a create, a bit cleared a delete), and resolves *before*
-		-- the component cells because the returned record holds the bits deleted this frame so they can drop
-		-- per-component removals the client applies wholesale when deleting the entity (or pair target) locally.
-		-- masks are shard-relative, so the diff and the record are both per-shard.
+		-- the one special-cased cell: the existence diff resolves into per-client create / delete lists rather than
+		-- a group, and runs *before* the component cells because the returned record holds the bits deleted this
+		-- frame, which drop per-component removals the client applies wholesale when deleting the entity locally.
+		-- masks are shard-relative, so both are per shard.
 		local function resolve_existence_diff(
 			shard_next_visibilities: ShardVisibilities,
 			shard_last_visibilities: ShardVisibilities,
@@ -3168,10 +2939,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return entity_unreplicate_masks
 		end
 
-		-- visibility cells of one shard: fold every dirty cell into its component's cross-shard group, its send /
-		-- removed words accumulated into section keys. send and removed are disjoint, so a client falls into at most
-		-- one of them per cell. a cell whose value also changed emits only its removals here; its sends defer to
-		-- resolve_value_cells, run against the post-merge mask so every viewer gets the new value exactly once.
+		-- visibility cells of one shard: fold every dirty cell into its group, send / removed words accumulated
+		-- into nodes. send and removed are disjoint, so a client falls into at most one per cell. a cell whose
+		-- value also changed emits only its removals here; its sends defer to resolve_value_cells, run against the
+		-- post-merge mask so every viewer gets the new value exactly once.
 		local function resolve_visibility_cells(
 			shard_next_visibilities: ShardVisibilities,
 			shard_last_visibilities: ShardVisibilities,
@@ -3195,21 +2966,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				local rows = group.row_of
 
 				-- a pair whose target the client drops this frame needs no explicit removals: dropping the target locally
-				-- auto-removes the pair. a live cache entry is the dense id's current tenant (== the target the client
-				-- resolves with), so the sends of a dense id recycled within the frame are never taken for the old tenant;
-				-- a miss means the pair id carries only removals, which belong to the retired tenant -- naming that gen
-				-- keeps the skip generation-precise across a same-frame recycle. the target-side drops are loop-invariant,
-				-- so they narrow removed_allowed -- the word removals compute against in place of the raw allocated word --
-				-- once, outside the entity loop; the subject's own drop stays per entity.
+				-- removes the pair. a live gen-cache entry is the dense id's current tenant; a miss means the pair id
+				-- carries only removals, belonging to the retired tenant, whose gen keeps the skip generation-precise
+				-- across a same-frame recycle. the target-side drops are loop-invariant, so they narrow removed_allowed
+				-- once here; the subject's own drop stays per entity.
 				local target: Entity? = nil
 				local removed_allowed = allocated
 				if is_pair then
 					-- the relation-level recycle signature: the relation's dense id retired one definition and re-tracked
-					-- another since the last call, so the staged removals belong to the retired definition -- section
-					-- relation ids are dense on the wire and the new definition's announcement rebinds the client's mapping
-					-- before sections apply, so a shipped removal would misresolve to the new definition. drop them; the
-					-- client's mapping-teardown sweep owns the cleanup (see sweep_imported_cells in client.luau). the
-					-- target-level signature below is the same check one level down.
+					-- another since the last call, so the staged removals belong to the retired one. section relation ids
+					-- are dense on the wire and the new definition's announcement rebinds the client's mapping before
+					-- sections apply, so a shipped removal would misresolve; drop them, the client's mapping-teardown sweep
+					-- (sweep_imported_cells) owns the cleanup.
 					local relation_dense = ECS_PAIR_FIRST(component)
 					local retired_relation = retired_relation_gens[relation_dense]
 					if retired_relation ~= nil then
@@ -3223,25 +2991,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local retired = retired_target_gens[dense_target]
 					target = tracked_target_gens[dense_target]
 					if target == nil then
-						-- the target died (or shed its last pair) since staging: recover the gen-qualified id retired at deindex
-						-- time so removals can still name it on the wire. viewers who imported a dead target drop the pair with
-						-- it (their bits clear against the unreplicate record below), but a name-mapped target is never deleted
-						-- client-side, so its viewers need the explicit removals.
+						-- the target died (or shed its last pair) since staging: the retired gen lets removals still name it on
+						-- the wire. viewers who imported a dead target drop the pair with it, but a name-mapped target is never
+						-- deleted client-side, so its viewers need the explicit removals.
 						target = retired
 					else
 						if is_tag then
-							-- a tag relation's pairs follow their target's tag-ness, and the relation half is already known to be
-							-- a tag here, so only the target needs the check (jecs.is_tag on the packed pair id would re-resolve
-							-- and re-check both halves); gone targets never send, so the check is moot for them
+							-- a tag relation's pairs follow their target's tag-ness; the relation half is already known to be a
+							-- tag
 							is_tag = jecs.is_tag(world, target)
 						end
 						if retired ~= nil and retired ~= target then
-							-- the target-level recycle signature: the dense id retired one tenant and re-indexed as another since
-							-- the last call. the staged removals belong to the retired tenant, but pair-run targets are dense on
-							-- the wire and the recycle frame's announcement (or creation) rebinds the dense id before sections
-							-- apply, so a shipped removal would misresolve to the new tenant -- and in the same-subject case ride
-							-- the same run as the new tenant's send and remove the just-added pair. drop them, like the
-							-- relation-level signature above; the sweep owns the cleanup.
+							-- the target-level recycle signature, the relation-level one a level down: the dense id retired one
+							-- tenant and re-indexed as another since the last call, so the staged removals would misresolve to the
+							-- new tenant (pair-run targets are dense on the wire, rebound before sections apply) -- and in the
+							-- same-subject case remove the just-added pair. drop them; the sweep owns the cleanup.
 							removed_allowed = 0
 						end
 					end
@@ -3267,14 +3031,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						rows = pair_id_rows
 					end
 				else
-					-- the unpaired-cell recycle signature: this component's tracking stopped (its gen sits retired under
-					-- its dense id) and a different definition re-tracked the same dense id since the last call. unpaired
-					-- store keys are gen-qualified full ids, so nothing aliases here -- but section component ids are dense
-					-- on the wire and the new definition's announcement rebinds the client's mapping before sections
-					-- apply, so the removals would misresolve to the new definition (and the two definitions' sections,
-					-- aliased on the wire, would race on shared subjects). drop them; the sweep owns the cleanup. a live
-					-- entry equal to the component is a same-frame re-track of the same definition, whose genuine removals
-					-- must ship.
+					-- the unpaired-cell recycle signature: this component's tracking stopped and a different definition
+					-- re-tracked the same dense id since the last call. store keys are gen-qualified so nothing aliases
+					-- here, but section component ids are dense on the wire and the new definition's announcement rebinds
+					-- the mapping before sections apply, so the removals would misresolve; drop them. a live entry equal to
+					-- the component is a same-frame re-track of the same definition, whose genuine removals must ship.
 					local component_dense = dense(component)
 					if retired_relation_gens[component_dense] == component then
 						local live_relation = tracked_relation_gens[component_dense]
@@ -3290,9 +3051,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local send = if deferred then 0 else bit32.band(new, bit32.bnot(old), allocated)
 					local removed = bit32.band(old, bit32.bnot(new), removed_allowed)
 
-					-- drop removals the client applies wholesale this frame: the subject's own unreplication here (the
-					-- target's, being loop-invariant, already narrowed removed_allowed above). per-client, so only the
-					-- coinciding bits clear; send is already 0 for those slots.
+					-- drop removals the client applies wholesale this frame: the subject's own unreplication (the target's
+					-- already narrowed removed_allowed above). per-client, so only the coinciding bits clear.
 					if removed ~= 0 then
 						local subj_unrep = entity_unreplicate_masks[entity]
 						if subj_unrep then
@@ -3389,9 +3149,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				local targets = group.targets
 				local rows = group.row_of
 
-				-- the gen-qualified target this pair id's rows carry, read from the live-target gen cache (staged values
-				-- never outlive their target: its death stages removals that drop them, so a live entry always exists),
-				-- plus the per-pair-id row map (see resolve_visibility_cells)
+				-- the gen-qualified target this pair id's rows carry (staged values never outlive their target: its death
+				-- stages removals that drop them, so a live entry always exists), plus the per-pair-id row map
 				local target: Entity? = nil
 				if is_pair then
 					target = tracked_target_gens[ECS_PAIR_SECOND(component)]
@@ -3443,10 +3202,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- bucket pass: each cell lands in the section keyed by its accumulated mask node, one insert per cell no
-		-- matter how many clients -- or shards -- see it; a pair group's cells land one level deeper, in their
-		-- target's run within the section. a cell's send and removed masks are disjoint, so no client ever receives
-		-- both for one cell. consuming a group also resets it for the next frame (see the PacketGroup type).
+		-- bucket pass: each cell lands in the section keyed by its node, one insert per cell no matter how many
+		-- clients see it; a pair group's cells land in their target's run within the section. consuming a group
+		-- resets it for the next frame.
 		local function bucket_dirty_groups()
 			for n = 1, dirty_group_count do
 				local group = dirty_groups[n]
@@ -3460,12 +3218,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				local g_removed_nodes = group.removed_nodes
 				local g_targets = group.targets
 
-				-- one-entry caches over the row loop, mirroring the unreliable pass's cached draft (see
-				-- accumulate_unreliable_archetype): consecutive rows usually share their visibility node -- and pair
-				-- rows their target, since one pair id's cells resolve consecutively -- so a matching row reuses the
-				-- previous row's lists instead of re-walking node_section_drafts (and, for pair groups, the run map).
-				-- a real node is never 0, so the 0 sentinel can't false-hit; declared per group because the lists
-				-- belong to the group's own drafts.
+				-- one-entry caches over the row loop: consecutive rows usually share their node (and pair rows their
+				-- target, since one pair id's cells resolve consecutively), so a matching row reuses the previous row's
+				-- lists instead of re-walking node_section_drafts. a real node is never 0, so the sentinel can't
+				-- false-hit.
 				local cached_send_node: VisibilityNode = 0
 				local cached_send_target: number? = nil
 				local cached_send_lists: any = nil
@@ -3552,9 +3308,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- finalize pass: measure every draft of a node, then encode them back-to-back into one exactly-sized buffer
-		-- the whole node shares -- the expansion pass appends one buffer reference per node to each sharing client,
-		-- and assembly stamps it with one copy, no matter how many sections the node carries -- filling the per-node
-		-- outputs declared above.
+		-- the whole node shares, so assembly stamps it into each sharing client with one copy however many sections
+		-- it carries.
 		local function finalize_node_sections()
 			local node_section_drafts = frame_state.node_section_drafts
 			local node_section_values = frame_state.node_section_values
@@ -3597,19 +3352,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- appends one node's shared buffer to one client's accumulators. the node's buffer, size, and value arrays
-		-- ride in as arguments: they are invariant across the node's clients, so the callers resolve them once per
-		-- node rather than paying the node-keyed lookups here, once per client. the value arrays append in the
-		-- order their sections were written into the buffer, keeping the packet's side array aligned with it. the
-		-- element-wise append below is deliberate: table.move reads as the idiom for concatenating two lists
-		-- (wire.luau uses it for exactly that), but which one wins here depends on the shape, and the shape is easy
-		-- to misread -- section_values holds one array per *hookless section*, so its length is the node's hookless
-		-- section count (rarely more than a handful), while the call itself is paid once per node the client sees.
-		-- that makes this many-appends-of-a-short-list, which table.insert wins; table.move only wins the
-		-- one-append-of-a-long-list case. benchmarked both ways (2026-08-06): a micro-benchmark puts the crossover
-		-- near eight appends of a 4-element source (table.move ~50% faster at one append, ~36% slower at sixteen),
-		-- and the swap measured 9.5% slower at high fan-out against 14-20% faster on the broadcast one-node shape,
-		-- with the realistic mixed benches at parity either way.
+		-- appends one node's shared buffer to one client's accumulators; the node's buffer, size, and value arrays
+		-- ride in as arguments since they are invariant across the node's clients. the value arrays append in
+		-- section write order, keeping the side array aligned with the buffer. the element-wise append is
+		-- deliberate: section_values holds one array per hookless section (rarely more than a handful) and the call
+		-- runs once per node the client sees, so this is many appends of a short list, which table.insert wins --
+		-- table.move measured 9.5% slower at high fan-out against 14-20% faster on the broadcast one-node shape
+		-- (2026-08-06), with the realistic mixed benches at parity.
 		local function scatter(
 			client_index: number,
 			node_buffer: buffer,
@@ -3640,8 +3389,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- the current trie path's decoded runs, persistent scratch for expand_node: every read at depth i follows a
-		-- write at the same depth on the way down, so entries past the current path are never read.
+		-- the current trie path's decoded runs, persistent scratch for expand_node; entries past the current depth
+		-- are never read.
 		local path_bases = {} :: { number }
 		local path_words = {} :: { number }
 
@@ -3671,10 +3420,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- expansion pass: walk the trie depth-first, decoding each run once no matter how many nodes descend from
-		-- it; a node's sections scatter to every client of every run on its path (countrz -> clients_by_index). each
-		-- node the walk leaves is cleared into the free list for the next frame's append_mask_run, leaving the
-		-- persistent root empty behind it. single-shard keys are the shard's raw mask words, expanded flat.
+		-- expansion pass: walk the trie depth-first, decoding each run once however many nodes descend from it, and
+		-- scatter a node's sections to every client of every run on its path. each node the walk leaves is cleared
+		-- into the free list, leaving the root empty. single-shard keys are raw mask words, expanded flat.
 		local function expand_to_clients()
 			if multi_shard then
 				expand_node(mask_trie, 0)
@@ -3695,9 +3443,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- assembly pass: stamp each client's accumulated sections into their flat packet buffer, together with their
-		-- entity create/delete lists. clients with entity create/delete but no component changes still need a
-		-- packet; indices came from allocated bits, so clients_by_index resolves them.
+		-- assembly pass: stamp each client's accumulated sections into their flat packet buffer with their create /
+		-- delete lists. clients with only creates / deletes still need a packet.
 		local function assemble_for(packets: { [Client]: Packet }, this_packet_frame: number, index: number)
 			local client = clients_by_index[index]
 			if packets[client] == nil then
@@ -3732,24 +3479,20 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- builds a packet for every client in a single pass: a delta for each allocated client and a full packet for
-		-- each pending (newly-joined) client. the shard loop runs on the outside, each occupied shard resolving its
-		-- existence diff, dirty cells, and staged values against its own mask words and folding every cell's
-		-- per-shard send / removed words into a path through the frame's mask trie (skipped with a single occupied
-		-- shard -- the common case -- where the raw mask word keys the sections directly). the passes that follow
-		-- (see each function above) are shaped so cell work is paid once per cell per occupied shard, and clients
-		-- sharing a node -- across shards included -- have the node's sections, encoded back-to-back into one shared
-		-- buffer, stamped into their packet buffers with a single buffer.copy: a cell visible to everyone encodes a
-		-- single section no matter how many shards are occupied.
+		-- builds a packet for every client in a single pass: a delta per allocated client and a full per pending
+		-- client. the shard loop runs outside, each occupied shard resolving its existence diff, dirty cells, and
+		-- staged values against its own words and folding each cell's per-shard send / removed words into a path
+		-- through the mask trie (skipped with one occupied shard, where the raw word keys the sections directly).
+		-- cell work is paid once per cell per occupied shard, and clients sharing a node have its sections, encoded
+		-- once into one shared buffer, stamped into their packets with a single copy.
 		local function generate_packets(): { [Client]: Packet }
 			local packets = {} :: { [Client]: Packet }
 			local this_packet_frame = next_packet_frame()
 			group_frame += 1
 			reset_frame_state()
 
-			-- drain the name states staged since the last call; with nobody allocated there is no delta to ride
-			-- (joiners get the full set, and nobody holds a mapping a retraction would need to end), so the drain
-			-- discards them instead of collecting
+			-- drain the name states staged since the last call; with nobody allocated there is no delta to ride, so
+			-- the drain discards them (joiners get the full set)
 			if shared_names.has_staged() then
 				local collected: { [number]: string }? = if client_count > 0 then fetch_scratch() else nil
 				shared_names.drain_staged(collected)
@@ -3826,10 +3569,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				packets[client] = full_packet(client, this_packet_frame)
 			end
 
-			-- fresh clients' fulls build at the same point, where the slot's last masks exactly equal current
-			-- visibility (the resolve passes merged this frame's changes in), so full_packet re-marks the same bits it
-			-- finds and the next delta diffs correctly. the full replaces whatever delta the frame assembled for the
-			-- client: built after the delta resolved, it already contains everything the delta carried.
+			-- fresh clients' fulls build here too, where the slot's last masks exactly equal current visibility, so
+			-- full_packet re-marks the same bits and the next delta diffs correctly. the full replaces whatever delta
+			-- the frame assembled for the client, since it already contains everything the delta carried.
 			for client in fresh_clients do
 				fresh_clients[client] = nil
 				packets[client] = full_packet(client, this_packet_frame)
@@ -3858,16 +3600,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- UNRELIABLE (ALWAYS-REPLICATE) PACKET GENERATION
 
-		-- the chunk frame counter, cycling 0..2^32-1 like the packet frame: every chunk of one call carries it,
-		-- and clients drop chunks older than the newest reconciled (wrap-aware), so reordered delivery never snaps
-		-- values backward. independent of the packet frame counter above.
+		-- the chunk frame counter, cycling like the packet frame: clients drop chunks older than the newest
+		-- reconciled (wrap-aware), so reordered delivery never snaps values backward.
 		local chunk_frame = -1
 
-		-- per-call accumulators of the unreliable pass, mirroring the reliable frame accumulators above: drafts
-		-- collect per accumulated-visibility node, keyed [node][cell id] (the component, or the packed pair id), and
-		-- the finalize loop turns each node's drafts into its shared chunk list. both maps are cleared at entry so
-		-- an errored call's stranded tables are abandoned to the GC, mirroring reset_frame_state's policy (the
-		-- salvage guard contains user encode throws, but an internal error can still unwind mid-call).
+		-- per-call accumulators of the unreliable pass: drafts per node keyed [node][cell id], and each node's
+		-- finalized chunk list. cleared at entry so an errored call's stranded tables are abandoned to the GC, like
+		-- reset_frame_state.
 		local unreliable_node_drafts = {} :: { [VisibilityNode]: { [Id]: SectionDraft } }
 		local unreliable_node_chunks = {} :: { [VisibilityNode]: { buffer } }
 
@@ -3875,13 +3614,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		-- (the pass functions are shared top-level closures, like the reliable passes')
 		local unreliable_packets: { [Client]: { buffer } }? = nil
 
-		-- the walked cell's per-shard last trees, prefetched once per cell id by prefetch_unreliable_visibility
-		-- (false for shards holding none), plus the walk's one-entry cache: consecutive entities usually share their
-		-- visibility, so the previous entity's node and draft are reused whenever the resolve matches --
-		-- single-shard via a word comparison against the cached node key, multi-shard via the per-shard words of the
-		-- previous entity (unreliable_cell_words, valid while unreliable_words_valid), which skips the trie walk
-		-- entirely. a cached node of 0 marks an invisible entity, so equal-words runs of invisible entities skip on
-		-- the comparison alone. entries past shard_count are stale and never read.
+		-- the walked cell's per-shard last trees, prefetched once per cell id (false for shards holding none), plus
+		-- the walk's one-entry cache: consecutive entities usually share their visibility, so the previous entity's
+		-- node and draft are reused whenever the resolve matches -- single-shard by comparing the word against the
+		-- cached node, multi-shard by comparing per-shard words (unreliable_cell_words, valid while
+		-- unreliable_words_valid), skipping the trie walk. a cached node of 0 marks an invisible entity. entries
+		-- past shard_count are stale and never read.
 		local unreliable_cell_visibility = {} :: { { [Entity]: VisibilityMask } | false }
 		local unreliable_cell_words = {} :: { VisibilityMask }
 		local unreliable_words_valid = false
@@ -3906,14 +3644,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return any_visible
 		end
 
-		-- appends one archetype's cells of one unreliable cell id to the per-node drafts: per entity, the prefetched
-		-- last masks resolve to a node (the raw word with one occupied shard, a trie path otherwise -- exactly the
-		-- reliable pass's keying), and the live column read lands in the node's draft for the cell -- values under
-		-- the ids, nils under nulled. masks intersect each shard's allocated word so a departed client's stale bit
-		-- never creates or widens a chunk; a cell with no last mask is invisible (or not yet sent -- its membership
-		-- add is still in flight) and skips. cell names the mask-store row and the draft key (the component, or the
-		-- packed pair id); component/relation/target are the draft's wire naming, relation and target gen-qualified
-		-- as chunk pair sections encode them.
+		-- appends one archetype's cells of one unreliable cell id to the per-node drafts: per entity the prefetched
+		-- last masks resolve to a node (the reliable pass's keying), and the live column read lands in the node's
+		-- draft -- values under ids, nils under nulled. masks intersect the allocated words so a departed client's
+		-- stale bit never creates or widens a chunk; a cell with no last mask is invisible (or its membership add
+		-- still in flight) and skips. cell is the mask-store row and draft key; component / relation / target are
+		-- the draft's wire naming.
 		local function accumulate_unreliable_archetype(
 			entities: { any },
 			column: { any },
@@ -3925,10 +3661,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			for row, entity in entities do
 				local node: VisibilityNode
 				if multi_shard then
-					-- probe the shards' words against the previous entity's: while they keep matching nothing is appended, so
-					-- a full match reuses the cached node (0 included -- an invisible run) with no trie walk at all; the
-					-- first divergence replays the equal prefix into the trie and the loop appends inline from there, so a
-					-- miss costs the plain fused walk plus the comparisons
+					-- probe the shards' words against the previous entity's: a full match reuses the cached node with no
+					-- trie walk (0 included, an invisible run); the first divergence replays the equal prefix into the trie
+					-- and the loop appends inline from there
 					local same = unreliable_words_valid
 					local accumulated: VisibilityNode = 0
 					for shard = 1, shard_count do
@@ -4033,10 +3768,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- appends one node's chunk list to one client's packet list, creating the list on first touch. the chunk
-		-- list and its length ride in as arguments, resolved once per node by the callers like scatter's. the lists
-		-- escape to the caller, but the chunk buffers inside are shared by reference across every client of the
-		-- node. the element-wise append is deliberate for the same reason as scatter's.
+		-- appends one node's chunk list to one client's list; the lists escape to the caller, but the chunk buffers
+		-- inside are shared by reference across the node's clients. element-wise for the same reason as scatter.
 		local function unreliable_scatter(client_index: number, node_chunks: { buffer }, chunk_count: number)
 			local packets = unreliable_packets :: { [Client]: { buffer } }
 			local client = clients_by_index[client_index]
@@ -4078,20 +3811,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
-		-- builds the always-replicate chunks for every client in a single pass: every visible NetworkedUnreliable
-		-- cell's current value is re-read live and re-sent, so the caller should send the returned chunks through an
-		-- unreliable transport every frame -- a dropped or reordered chunk costs one frame of staleness, never
-		-- state. visibility is read from the last-sent masks (what each client's reliable stream currently holds),
-		-- so membership and privacy shifts take effect on this channel at the next generate_packets: a client
-		-- legitimately holds a cell until the reliable removal reaches it, so the two channels always agree, and the
-		-- two calls may run at independent cadences. cells walk per component through jecs' per-component archetype
-		-- records (the world_each scheme -- undocumented internals, like get_components' sparse_array read), so
-		-- archetypes without unreliable cells cost nothing -- a tag definition contributing only its pairs with
-		-- data-component targets, the one cell shape of a tag that carries values; per entity the work is one mask
-		-- probe per occupied shard, a column read, and the serdes encode, with cells of equal cross-shard
-		-- visibility sharing one serialization no matter how many clients receive it. chunk buffers are shared by reference across every
-		-- client of a node -- never mutate them -- and clients with nothing visible are omitted from the returned
-		-- map.
+		-- builds the always-replicate chunks for every client: every visible NetworkedUnreliable cell's current
+		-- value is re-read and re-sent, so the caller sends the returned chunks through an unreliable transport
+		-- every frame -- a dropped or reordered chunk costs one frame of staleness, never state. visibility is read
+		-- from the last-sent masks (what each client's reliable stream holds), so membership and privacy shifts
+		-- take effect here at the next generate_packets, keeping the two channels in agreement at independent
+		-- cadences. cells walk per component through jecs's component records, so archetypes without unreliable
+		-- cells cost nothing, and cells of equal cross-shard visibility share one serialization. chunk buffers are
+		-- shared by reference across a node's clients -- never mutate them -- and clients with nothing visible are
+		-- omitted.
 		local function generate_unreliable_chunks(chunk_bytes: number?): { [Client]: { buffer } }
 			local budget = default_chunk_bytes
 			if chunk_bytes ~= nil then
@@ -4122,18 +3850,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local archetypes = world.archetypes
 
 			for component in networked_unreliable do
-				-- a tag definition streams only its data pairs: its bare cells -- and its pairs with tag targets,
-				-- filtered in the pair walk below -- are valueless tag cells whose membership already rides the
-				-- reliable path, and streaming them would re-send every one as a data null each call, which the
-				-- client applies via world:set and world:set errors on tags. the tag-ness read is the cached one the
-				-- reliable resolve uses (tracked_relation_tags; every unreliable member is tracked, so the entry
-				-- always exists).
+				-- a tag definition streams only its data pairs: its bare cells and tag-target pairs are valueless, their
+				-- membership already rides the reliable path, and streaming them would apply a data null via world:set,
+				-- which errors on tags
 				local relation_is_tag = tracked_relation_tags[dense(component)]
 
-				-- target-specific modes: a definition lands in this set with *any* unreliable mode among its plain tag
-				-- and designations, so the bare cells stream only under a plain NetworkedUnreliable tag, and each pair
-				-- streams only when its governing mode -- its target's designation, else the plain tag -- is
-				-- NetworkedUnreliable (the pair walk below reads both hoisted here).
+				-- a definition lands in this set with *any* unreliable mode, so the bare cells stream only under a plain
+				-- NetworkedUnreliable tag, and each pair only when its governing mode (its target's designation, else the
+				-- plain tag) is NetworkedUnreliable
 				local plain_unreliable = tracked_by[component] == NetworkedUnreliable
 				local designated = designations[component]
 
@@ -4158,12 +3882,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					end
 				end
 
-				-- pair cells: the relation's wildcard record covers exactly the archetypes holding at least one pair of
-				-- this relation, and same-relation pairs sit contiguously in archetype.types (see each_target), so the
-				-- record's records/counts hand each archetype its exact pair slice with no types scan. the target gen
-				-- resolves through the pair index, which covers every live pair of a tracked relation. a tag relation's
-				-- pairs follow their target's tag-ness (the reliable resolve's rule), so its tag-target pairs -- tag
-				-- pairs, carrying no value -- skip like its bare cells above.
+				-- pair cells: the relation's wildcard record covers exactly the archetypes holding its pairs, contiguous
+				-- in archetype.types (see each_target), so records / counts hand each archetype its exact slice. a tag
+				-- relation's tag-target pairs carry no value and skip like its bare cells.
 				local idr_pair = component_index[pair(component, jecs.Wildcard)]
 				if idr_pair ~= nil then
 					local pair_counts = idr_pair.counts
@@ -4216,11 +3937,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 
 			-- finalize: each node's drafts encode once into its shared chunk list, behind the salvage guard (see
-			-- wire.finalize_chunks): a user encode failure -- a throwing hook, a violated size contract, a value no
-			-- chunk can fit, or missing hooks entirely -- drops exactly the offending values from this call's
-			-- chunks instead of erroring the whole call. warn-and-continue like measure_section_guarded, except the
-			-- always-replicate cadence re-sends the dropped values next call, failing (and warning) again until the
-			-- hook or value is fixed.
+			-- wire.finalize_chunks): a user encode failure drops exactly the offending values instead of erroring the
+			-- call, and the always-replicate cadence retries them next call, warning again until fixed.
 			local chunk_scratch = buffer.create(budget)
 			for node, drafts in unreliable_node_drafts do
 				unreliable_node_drafts[node] = nil
@@ -4272,23 +3990,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- CONSTRUCTION CATCH-UP
 
-	-- replays schema state added through the shared component set (see shared.luau) before this instance
-	-- existed, routing every pre-existing cell through the same handlers the hooks run, so construction order
-	-- is invisible: tagging a definition before or after the first duplecs.server(world) behaves identically.
-	-- no delta can be missed -- clients only exist on an instance, so nothing but schema predates construction --
-	-- which reduces the replay to establishing the mirrors, caches, announcements, and per-definition tracking
-	-- hooks (staging against zero occupied shards writes nothing, and a joiner's full packet reads live state),
-	-- and to firing the same guards a live add would have, which here surface from the construction call -- the
-	-- valueless-Private normalization among them, warning from here and rewriting the value in place. one
-	-- behavioral seam: a privacy filter sanitizes against the tracked-client set like any filter set, and no
-	-- client can be tracked before construction, so every client a pre-construction filter names is pruned,
-	-- from the value as well as the caches -- the standing contract that filters name only tracked clients
-	-- (see prune_privacy_filters) -- with each pruned filter warning from the construction call
-	-- (warn_pruned_clients), since a populated pre-construction filter can never mean what it says.
+	-- replays schema state added through the shared component set before this instance existed, routing every
+	-- pre-existing cell through the same handlers the hooks run, so construction order is invisible. no delta
+	-- can be missed -- clients only exist on an instance, so only schema predates construction -- which reduces
+	-- the replay to establishing the mirrors, caches, announcements, and per-definition hooks (staging against
+	-- zero occupied shards writes nothing), and to firing the same guards a live add would, surfacing from the
+	-- construction call. one seam: no client can be tracked before construction, so every client a
+	-- pre-construction filter names is pruned from the value and the caches, each such filter warning
+	-- (warn_pruned_clients).
 
-	-- holders are collected before any handler runs: the handlers connect hooks (the first
-	-- world:added/changed/removed on a component sets EcsOnAdd/etc on it, structurally moving it) and the
-	-- guards remove offending tags, either of which would invalidate the live world:each walk collecting them.
+	-- holders are collected before any handler runs: the handlers connect hooks (which structurally move the
+	-- component) and the guards remove offending tags, either of which would invalidate a live world:each walk.
 	local function collect_holders(id: Id): { Entity }
 		local holders = {} :: { Entity }
 		for entity in world:each(id) do
@@ -4311,12 +4023,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return subjects, pair_ids
 	end
 
-	-- pre-existing target designations replay before the tag's plain definitions, but either order converges:
-	-- a designation replayed first tracks the definition and stages its designated pairs, and the plain tag's
-	-- replay then stages the rest through start_tracking_component's already-tracked branch (staging against
-	-- zero occupied shards writes nothing anyway -- the replay establishes mirrors, hooks, and announcements).
-	-- misuse pairs (a designation on a Replicated subject, or a wildcard target) error from here like a live
-	-- add would.
+	-- designations replay before the tag's plain definitions, but either order converges: a designation replayed
+	-- first tracks the definition and stages its designated pairs, and the plain tag's replay stages the rest
+	-- through the already-tracked branch. misuse pairs error from here like a live add.
 	local function catch_up_tracking_tag(tag: Component, on_added: (Entity, Id) -> ())
 		local definitions = collect_holders(tag)
 		local subjects, pair_ids = collect_pair_holders(tag)
@@ -4329,10 +4038,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	local function catch_up()
-		-- filters and delegation first: everything below reads the gates they establish. Private precedes
-		-- InheritsPrivacy so each replayed edge derives its delegator's effective words against own words already
-		-- cached; the reverse order converges all the same -- a filter replayed after an edge fans out over its
-		-- descendants and re-derives them (see refresh_descendants) -- but pays a wasted derivation per edge.
+		-- filters and delegation first, since everything below reads the gates they establish; Private precedes
+		-- InheritsPrivacy so each replayed edge derives against own words already cached (the reverse order
+		-- converges but pays a wasted derivation per edge)
 		local private_holders = collect_holders(Private)
 		local private_subjects, private_pair_ids = collect_pair_holders(Private)
 		for _, entity in private_holders do
@@ -4372,12 +4080,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- SERVER INIT
 
-	-- connects the replication hooks (the tracking tags, Replicated, Private, InheritsPrivacy, and jecs.Name),
-	-- then replays whatever schema state predates this instance -- the shared component set is minted at the
-	-- world's first duplecs contact, so a schema module may have tagged definitions, added filters, or
-	-- delegated privacy before duplecs.server first ran here. called once before the constructor returns, so
-	-- tracking is live from construction either way: a misuse errors at the offending call site when a hook
-	-- catches it live, and from the construction call when the catch-up walks find it pre-existing.
+	-- connects the replication hooks, then replays whatever schema state predates this instance (a schema module
+	-- may have tagged definitions or added filters before duplecs.server first ran). called once before the
+	-- constructor returns, so a misuse errors at the offending call site when caught live, and from the
+	-- construction call when the catch-up finds it pre-existing.
 	local function initialize()
 		hooks.added(world, NetworkedOnce, on_networked_once_added)
 		hooks.removed(world, NetworkedOnce, on_networked_once_removed)
@@ -4402,12 +4108,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		hooks.added(world, InheritsPrivacy, on_inherits_added)
 		hooks.removed(world, InheritsPrivacy, on_inherits_removed)
 
-		-- seed the named mirror: a plain mirror write -- nothing is tracked or replicated yet, so no announcement
-		-- or restage can be due, and the loop body mutates nothing, so the live world:each walk is safe (unlike
-		-- the catch-up walks, whose handlers move entities, so they pre-collect). must run before the catch-up
-		-- walks, whose announce decisions read the mirror; the order against the hook connections above is free --
-		-- their structural moves (the first world:added/changed/removed on a component sets EcsOnAdd/etc on it,
-		-- moving it) run strictly before or strictly after this walk, never during it.
+		-- seed the named mirror before the catch-up walks, whose announce decisions read it. a plain mirror write:
+		-- nothing is tracked yet, so no announcement or restage is due, and the loop mutates nothing, so the live
+		-- walk is safe. the order against the hook connections above is free -- their structural moves run strictly
+		-- before or after this walk.
 		for entity in world:each(jecs.Name) do
 			named_entities[dense(entity)] = true
 		end
@@ -4463,13 +4167,10 @@ end
 export type ServerInstance = typeof(create_server(nil :: any, nil :: any))
 
 -- the memoized accessor (duplecs.server): the first call on a world constructs the instance and stores it on
--- the world's shared record -- inside the world itself, see shared.luau for why nothing module-level may
--- reference it -- so every later call returns that same instance and any system can resolve it from the world
--- alone. the split from create_server exists for the memo's types: the record's slot is typed unknown (the
--- instance type lives here, below shared.luau in the require graph), so the early return needs the typeof
--- above to hand callers the full instance type. a constructor error (a pre-existing misuse surfaced by the
--- catch-up walks) simply propagates with nothing memoized: it is a programming bug to stop and fix, not a
--- state to recover from.
+-- the world's shared record (inside the world itself, see shared.luau); later calls return it. split from
+-- create_server for the memo's types: the record's slot is typed unknown, so the early return needs the
+-- typeof above. a constructor error propagates with nothing memoized -- a programming bug to fix, not a state
+-- to recover from.
 return function(world: World): ServerInstance
 	local shared_record = get_shared.get_record(world)
 	local instance = shared_record.server
