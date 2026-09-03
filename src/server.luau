@@ -797,10 +797,32 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- and the wire-shape refusals announcing warns on): named ids the client maps automatically -- tracked
 	-- component definitions and named (unreplicated) pair targets -- announced as (id, name) entries in packet
 	-- headers, so a client world defining the same names resolves them without set_client_entity. this half
-	-- decides which ids are relevant (the tracking, Replicated, and jecs.Name hooks below call in) and drains
-	-- the store at packet time. it takes the reporter's warn, so its refusals ride this instance's warn hook
-	-- like every other warning here.
+	-- decides which ids are relevant (refresh_announcement below, which the tracking, Replicated, and jecs.Name
+	-- hooks call in to) and drains the store at packet time. it takes the reporter's warn, so its refusals ride
+	-- this instance's warn hook like every other warning here.
 	local shared_names = create_names(world, warn)
+
+	-- brings the store in line with the entity's current announcement relevance: a named, unreplicated id that
+	-- is a tracked definition (through a plain tag or target designations) or the target of a tracked pair is
+	-- announced, and anything else has whatever announcement it holds withdrawn. every hook that moves one of
+	-- those inputs calls this after updating its mirror, so relevance is derived in one place rather than
+	-- re-spelled per hook -- both store operations are idempotent, so calling it from every site is safe. it
+	-- reads the mirrors rather than the world: inside a removed hook the world still holds the component being
+	-- removed while the mirrors already reflect its absence, which is exactly when a withdrawal must see it
+	-- gone. the retract is gated on the announced tenant being this entity so a stale caller (a dead id
+	-- resolved through a dense-keyed store) can never withdraw a newer tenant's announcement.
+	local function refresh_announcement(entity: Entity)
+		local dense_id = dense(entity)
+		if
+			named_entities[dense_id] ~= nil
+			and replicated_entities[dense_id] == nil
+			and (tracked_by[entity] ~= nil or designations[entity] ~= nil or tracked_pairs_by_target[dense_id] ~= nil)
+		then
+			shared_names.announce(entity)
+		elseif shared_names.announced_id(dense_id) == entity then
+			shared_names.retract(dense_id)
+		end
+	end
 
 	-- CHANGE TRACKING
 
@@ -866,11 +888,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			if (target_gen :: any) ~= 0 then
 				-- capture the gen-qualified id while the target is alive, for removals that resolve after its death
 				tracked_target_gens[target] = target_gen
-				-- the target's first tracked pair: a named, unreplicated target is a shared definition clients should map
-				-- by name (replicated targets map through their creation entry instead)
-				if replicated_entities[target] == nil then
-					shared_names.announce(target_gen)
-				end
+				-- the target's first tracked pair may make it announcement-relevant: a named, unreplicated target is a
+				-- shared definition clients map by name (replicated targets map through their creation entry instead)
+				refresh_announcement(target_gen)
 			end
 		end
 		bucket[pair_id] = (bucket[pair_id] or 0) + 1
@@ -900,11 +920,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					tracked_target_gens[target] = nil
 					retired_target_gens[target] = target_gen
 				end
-				-- the target's last tracked pair is gone: withdraw its announced name unless it is also a tracked
-				-- component definition (through a plain tag or target designations)
+				-- the target's last tracked pair is gone: its announcement now stands only if it is also a tracked
+				-- component definition. resolved through the announced tenant, since the target may already be dead
+				-- here and only the store still holds its gen-qualified id
 				local announced = shared_names.announced_id(target)
-				if announced ~= nil and tracked_by[announced] == nil and designations[announced] == nil then
-					shared_names.retract(target)
+				if announced ~= nil then
+					refresh_announcement(announced)
 				end
 			end
 		end
@@ -1016,7 +1037,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		tracked_relation_tags[dense_id] = jecs.is_tag(world, component)
 
 		-- a named definition announces itself so clients map it automatically
-		shared_names.announce(component)
+		refresh_announcement(component)
 
 		-- stage initial visibility of existing cells; newly-visible clients read live values during the resolve
 		-- pass. with no plain tag the bare cells are ineligible, so only the pair walk stages anything.
@@ -1102,11 +1123,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		tracked_relation_gens[dense_id] = nil
 		tracked_relation_tags[dense_id] = nil
 
-		-- withdraw the announced name unless the definition doubles as a named pair target of another tracked
+		-- the announcement now stands only if the definition doubles as a named pair target of another tracked
 		-- relation
-		if shared_names.announced_id(dense_id) == component and tracked_pairs_by_target[dense_id] == nil then
-			shared_names.retract(dense_id)
-		end
+		refresh_announcement(component)
 	end
 
 	-- stages one designated target's existing gameplay pairs after a designation change: visibility for every
@@ -1519,17 +1538,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			fail(`{tracking_tag_names[tracking_tag]} components cannot be replicated!`)
 		end
 
-		local dense_id = dense(entity)
-		replicated_entities[dense_id] = true
+		replicated_entities[dense(entity)] = true
 
-		-- a replicated entity maps through its creation entry, never by name: withdraw the announcement. the staged
+		-- a replicated entity maps through its creation entry, never by name: withdraw any announcement. the staged
 		-- retraction is what unmaps the clients the entity is *not* visible to -- its eventual deletion never
 		-- reaches them, and a lingering name mapping would misbind the dense id's next tenant -- while a client
 		-- receiving the creation adopts the mapping out of name provenance first, so the same retraction leaves
 		-- them untouched.
-		if shared_names.announced_id(dense_id) == entity then
-			shared_names.retract(dense_id)
-		end
+		refresh_announcement(entity)
 
 		-- current cell values reach newly-visible clients via the live read at snapshot time; the entity also just
 		-- became a replicable pair target
@@ -1543,13 +1559,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- replicated_entities is cleared first so the restage below recomputes each mask as 0, staging the entity
 		-- delete and every cell removal
-		local dense_id = dense(entity)
-		replicated_entities[dense_id] = nil
+		replicated_entities[dense(entity)] = nil
 
 		-- an unreplicated entity still targeted by tracked pairs is back to mapping by name (if it has one)
-		if tracked_pairs_by_target[dense_id] ~= nil then
-			shared_names.announce(entity)
-		end
+		refresh_announcement(entity)
 
 		restage_entity(entity)
 	end
@@ -1565,49 +1578,30 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if id ~= jecs.Name then
 			return
 		end
-		local dense_id = dense(entity)
-		named_entities[dense_id] = true
+		named_entities[dense(entity)] = true
 		-- pairs targeting the entity may just have gained a replicable target
 		restage_pairs_targeting(entity)
-		-- announce the relevant: a tracked definition (through a plain tag or target designations), or an
-		-- unreplicated target of tracked pairs (replicated targets map through their creation entry instead)
-		if
-			tracked_by[entity] ~= nil
-			or designations[entity] ~= nil
-			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
-		then
-			shared_names.announce(entity)
-		end
+		refresh_announcement(entity)
 	end
 
 	local function on_name_changed(entity: Entity, id: Id)
 		if id ~= jecs.Name then
 			return
 		end
-		-- a rename doesn't change replicability; announce-relevance is re-derived (the same condition as
-		-- on_name_added) rather than gated on an existing announcement -- a name refused at announce time (empty or
-		-- too long) leaves the id unannounced, and its fix arrives through this hook
-		local dense_id = dense(entity)
-		if
-			tracked_by[entity] ~= nil
-			or designations[entity] ~= nil
-			or (tracked_pairs_by_target[dense_id] ~= nil and replicated_entities[dense_id] == nil)
-		then
-			shared_names.announce(entity)
-		end
+		-- a rename doesn't change replicability; announce-relevance is re-derived rather than gated on an existing
+		-- announcement -- a name refused at announce time (empty or too long) leaves the id unannounced, and its fix
+		-- arrives through this hook
+		refresh_announcement(entity)
 	end
 
 	local function on_name_removed(entity: Entity, id: Id)
 		if id ~= jecs.Name then
 			return
 		end
-		local dense_id = dense(entity)
-		named_entities[dense_id] = nil
+		named_entities[dense(entity)] = nil
 		-- pairs targeting the entity may just have lost their replicable target
 		restage_pairs_targeting(entity)
-		if shared_names.announced_id(dense_id) == entity then
-			shared_names.retract(dense_id)
-		end
+		refresh_announcement(entity)
 	end
 
 	-- PRIVACY DELEGATION

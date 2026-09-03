@@ -4,8 +4,9 @@
 
 -- the server's shared-name store, one per instance (constructed by create_server): the announced set, the
 -- transitions staged against it, and the two refusals announcing can warn on. server.luau owns *which* ids are
--- announcement-relevant -- its tracking, Replicated, and jecs.Name hooks decide that and call in -- while this
--- module owns the store itself and the drains the packet passes read out of it. the warn it takes is the
+-- announcement-relevant -- its refresh_announcement derives that from its mirrors whenever a tracking,
+-- Replicated, or jecs.Name hook moves an input, and calls in -- while this module owns the store itself and the
+-- drains the packet passes read out of it. the warn it takes is the
 -- instance's reporter's (diagnostics.create_reporter), so its refusals ride the same injectable hook as every
 -- other warning in the half.
 --
