@@ -4,7 +4,9 @@
 -- wire.luau's header readers, which stay internal. one walk serves the server describing what it just
 -- generated and a client describing what it received: each half's factory (see INSPECTORS), built from the
 -- references that half passes in, supplies the resolver the walk uses -- how a wire id maps to a local entity,
--- how a local entity is named, and the world's serdes store.
+-- how a local entity is named, and the world's serdes store. it is the tree's one allocating packet decoder:
+-- the verification suite drives describe_packet / describe_chunk directly with a resolver mapping every wire
+-- id to itself, reshaping the descriptions into its own assertion views.
 --
 -- byte counts never depend on decoding: every size comes from the wire's own length prefixes and counts, so a
 -- section whose ids don't resolve, whose hooks are missing on the describing side, or whose decode hook throws
@@ -60,7 +62,7 @@ local decode_values = wire.decode_values
 -- sections and the deletion list carry) and gen_entity a gen-qualified one (the creation and names lists) to
 -- the local id, nil when nothing local stands for it; name reads a local entity's jecs.Name; resolve_serdes
 -- is the world's serdes store.
-type Resolver = {
+export type Resolver = {
 	entity: (dense_id: number) -> number?,
 	gen_entity: (gen_id: number) -> number?,
 	name: (entity: number) -> string?,
@@ -500,6 +502,8 @@ local function create_client_inspector(
 end
 
 return {
+	describe_packet = describe_packet,
+	describe_chunk = describe_chunk,
 	create_server_inspector = create_server_inspector,
 	create_client_inspector = create_client_inspector,
 }

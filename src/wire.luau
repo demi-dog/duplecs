@@ -133,14 +133,14 @@
 
 -- read_packet_header / read_section_header are the one decode authority for each layout's header; readers
 -- walk the lists themselves from the returned counts and offset, so the client's reconcile stays a fused
--- stream-parse-and-apply allocating only decode's per-value buffers. decode_packet / decode_section build
--- allocating record views on the same readers for the verification suite and diagnostics, and inspect.luau's
--- describers -- the public face of this module -- walk them for both halves' describe_packet / describe_chunk.
+-- stream-parse-and-apply allocating only decode's per-value buffers. the one allocating walk over whole
+-- packets and chunks is inspect.luau's -- the public face of this module, behind both halves' describe_packet
+-- / describe_chunk, which the verification suite also asserts through.
 
 local jecs = require("../roblox_packages/jecs")
 
 -- jecs.pair retyped to the plain-number domain this module works in (every id is a number at runtime), so the
--- serdes-key and record-view call sites don't cast per call.
+-- serdes-key call sites don't cast per call.
 local pair = (jecs.pair :: any) :: (relation: number, target: number) -> number
 
 local types = require("./types")
@@ -151,8 +151,8 @@ local id_to_string = diagnostics.id_to_string
 
 type Serdes<T = any> = types.Serdes<T>
 
--- resolves the serdes hooks a section's inline values are encoded with (finalize_section) or decoded with
--- (decode_section), shaped like the serdes store's resolve_serdes (see serdes.luau)
+-- resolves the serdes hooks a section's inline values are encoded with (measure_section), shaped like the
+-- serdes store's resolve_serdes (see serdes.luau)
 type ResolveSerdes = (component: any, relation: any) -> Serdes?
 
 -- section buffer flag bits. flag_inline_values / flag_has_* double as the run flag bits of grouped pair
@@ -236,7 +236,8 @@ local function read_version(data: buffer): number
 end
 
 -- validates a packet buffer's version byte against wire_version; every whole-packet entry point (the client's
--- reconcile_packet and get_packet_frame, decode_packet below) gates on this before reading any other field.
+-- reconcile_packet and get_packet_frame, inspect.luau's describe_packet) gates on this before reading any
+-- other field.
 local function check_version(data: buffer)
 	local version = read_version(data)
 	if version ~= wire_version then
@@ -1109,16 +1110,6 @@ local function measure_section_salvaging(draft: SectionDraft, resolve_serdes: Re
 	return measure_section(draft, resolve_serdes), pruned, first_error
 end
 
--- measure + write in one step, encoding a section into its own exactly-sized buffer with a hookless section's
--- values as the second return. no longer called by the packet passes (they sum measured drafts into shared
--- multi-section buffers); kept as the module's single-section entry point.
-local function finalize_section(draft: SectionDraft, resolve_serdes: ResolveSerdes): (buffer, { any }?)
-	local size = measure_section(draft, resolve_serdes)
-	local data = buffer.create(size)
-	local _, side = write_section(data, 0, draft)
-	return data, side
-end
-
 -- encodes one visibility group's unreliable drafts into chunk buffers of at most `budget` bytes (the chunk
 -- layout above), appended to `chunks`. cells pack greedily in draft order: when the next cell would overflow
 -- the open chunk, it closes and a fresh section naming the same component opens the next, so every chunk
@@ -1490,42 +1481,6 @@ local function assemble_packet(
 	}
 end
 
--- record views for the verification suite and diagnostics; the reconcile path never materializes them. every
--- id is a raw wire id, never mapped through a client's table: dense for everything a section carries (and the
--- unreplicated list), gen-qualified in the replicated list and names view; component is the packed pair id
--- for pair sections. list fields are nil when absent from the wire.
-export type DecodedSection = {
-	component: number,
-	relation: number?,
-	target: number?,
-	ids: { number }?,
-	values: { any }?,
-	nulled: { number }?,
-	removed: { number }?,
-}
-
--- one component's view merged across a packet's sections (the same component may span several when its cells
--- resolve to different visibility masks), each section's lists appended in packet order.
-export type DecodedComponent = {
-	relation: number?,
-	target: number?,
-	ids: { number }?,
-	values: { any }?,
-	nulled: { number }?,
-	removed: { number }?,
-}
-
-export type DecodedPacket = {
-	data: buffer,
-	values: { { any } }?,
-	frame: number,
-	replicated: { number },
-	unreplicated: { number },
-	names: { [number]: string },
-	sections: { DecodedSection },
-	components: { [number]: DecodedComponent },
-}
-
 -- decodes `count` serdes-encoded values at data[offset], returning them and the offset just past. each value
 -- decodes from a fresh value-sized buffer, its length read off the u16 prefix unless the registration
 -- declares a static size.
@@ -1547,270 +1502,6 @@ local function decode_values(data: buffer, offset: number, serdes: Serdes, count
 		decoded[i] = decode(encoded)
 	end
 	return decoded, offset
-end
-
--- decodes one section into DecodedSection records (one per run for a grouped section), returning them, the
--- offset just past the section, and the advanced side-array cursor. a hookless single-list section's values
--- field is the packet's side-array table itself (shared across clients), so it must never be mutated; grouped
--- hookless runs get fresh slices. inline values without resolvable serdes hooks error.
-local function decode_section(
-	data: buffer,
-	section_offset: number,
-	packet_values: { { any } }?,
-	values_index: number,
-	resolve_serdes: ResolveSerdes?
-): ({ DecodedSection }, number, number)
-	local flags, next_offset, offset, first_id, target_id, ids_count, nulled_count, removed_count, run_count =
-		read_section_header(data, section_offset)
-
-	local function read_ids(count: number): { number }?
-		if count == 0 then
-			return nil
-		end
-		local list = table.create(count) :: { number }
-		for i = 1, count do
-			list[i] = read_id(data, offset)
-			offset += id_width
-		end
-		return list
-	end
-
-	if run_count ~= nil then
-		local relation = first_id
-		local side: { any }? = nil
-		local side_cursor = 0
-		if bit32.band(flags, flag_side_values) ~= 0 then
-			values_index += 1
-			side = (packet_values :: { { any } })[values_index]
-		end
-		local wide = bit32.band(flags, flag_wide) ~= 0
-
-		local sections = table.create(run_count) :: { DecodedSection }
-		for r = 1, run_count do
-			local run_flags, list_offset, run_target, _, run_ids_count, run_nulled_count, run_removed_count =
-				read_run_header(data, offset, wide)
-			offset = list_offset
-
-			local component = pair(relation, run_target)
-			local ids = read_ids(run_ids_count)
-			local values: { any }? = nil
-			if run_ids_count > 0 then
-				if bit32.band(run_flags, flag_inline_values) ~= 0 then
-					local serdes = if resolve_serdes then resolve_serdes(component, relation) else nil
-					if serdes == nil then
-						fail(`decode_section: no serdes hooks to decode the inline values of {id_to_string(component)}`)
-					end
-					-- cast: fail never returns, but the solver doesn't treat user functions as diverging
-					values, offset = decode_values(data, offset, serdes :: Serdes, run_ids_count)
-				else
-					local sliced: { any } = table.create(run_ids_count)
-					table.move(side :: { any }, side_cursor + 1, side_cursor + run_ids_count, 1, sliced)
-					side_cursor += run_ids_count
-					values = sliced
-				end
-			end
-			local nulled = read_ids(run_nulled_count)
-			local removed = read_ids(run_removed_count)
-
-			sections[r] = {
-				component = component,
-				relation = relation,
-				target = run_target,
-				ids = ids,
-				values = values,
-				nulled = nulled,
-				removed = removed,
-			}
-		end
-		return sections, next_offset, values_index
-	end
-
-	local component = first_id
-	local relation: number? = nil
-	if target_id ~= nil then
-		relation = first_id
-		component = pair(first_id, target_id)
-	end
-
-	local ids = read_ids(ids_count)
-	local values: { any }? = nil
-	if ids_count > 0 then
-		if bit32.band(flags, flag_inline_values) ~= 0 then
-			local serdes = if resolve_serdes then resolve_serdes(component, relation) else nil
-			if serdes == nil then
-				fail(`decode_section: no serdes hooks to decode the inline values of {id_to_string(component)}`)
-			end
-			-- cast: fail never returns, but the solver doesn't treat user functions as diverging
-			values, offset = decode_values(data, offset, serdes :: Serdes, ids_count)
-		else
-			values_index += 1
-			values = (packet_values :: { { any } })[values_index]
-		end
-	end
-	local nulled = read_ids(nulled_count)
-	local removed = read_ids(removed_count)
-
-	local section = {
-		component = component,
-		relation = relation,
-		target = target_id,
-		ids = ids,
-		values = values,
-		nulled = nulled,
-		removed = removed,
-	}
-	return { section }, next_offset, values_index
-end
-
-local merged_fields = { "ids", "values", "nulled", "removed" }
-
--- parses a packet into the DecodedPacket record view, with a per-component view merged by appending each
--- section's lists in packet order; retractions decode as empty-string names. data / values ride along so the
--- record still reconciles when handed to reconcile_packet.
-local function decode_packet(packet: types.Packet, resolve_serdes: ResolveSerdes?): DecodedPacket
-	local data = packet.data
-	local packet_values = packet.values
-	check_version(data)
-
-	local packet_frame, offset, unreplicated_count, replicated_count, names_count = read_packet_header(data)
-
-	local unreplicated = table.create(unreplicated_count) :: { number }
-	for i = 1, unreplicated_count do
-		unreplicated[i] = read_id(data, offset)
-		offset += id_width
-	end
-	local replicated = table.create(replicated_count) :: { number }
-	for i = 1, replicated_count do
-		replicated[i] = read_gen_id(data, offset)
-		offset += gen_id_width
-	end
-
-	local names = {} :: { [number]: string }
-	for _ = 1, names_count do
-		local id, name, next_offset = read_name(data, offset)
-		names[id] = name
-		offset = next_offset
-	end
-
-	local sections = {} :: { DecodedSection }
-	local values_index = 0
-	local data_size = buffer.len(data)
-	while offset < data_size do
-		local decoded, section_end, next_values_index =
-			decode_section(data, offset, packet_values, values_index, resolve_serdes)
-		offset = section_end
-		values_index = next_values_index
-		table.move(decoded, 1, #decoded, #sections + 1, sections)
-	end
-
-	local components = {} :: { [number]: DecodedComponent }
-	for _, decoded in sections do
-		local merged = components[decoded.component]
-		if merged == nil then
-			merged = {
-				relation = decoded.relation,
-				target = decoded.target,
-			} :: DecodedComponent
-			components[decoded.component] = merged
-		end
-		local decoded_any = decoded :: any
-		local merged_any = merged :: any
-		for _, field in merged_fields do
-			local source = decoded_any[field]
-			if source ~= nil then
-				local list = merged_any[field]
-				if list == nil then
-					list = {}
-					merged_any[field] = list
-				end
-				table.move(source, 1, #source, #list + 1, list)
-			end
-		end
-	end
-
-	return {
-		data = data,
-		values = packet_values,
-		frame = packet_frame,
-		replicated = replicated,
-		unreplicated = unreplicated,
-		names = names,
-		sections = sections,
-		components = components,
-	}
-end
-
-export type DecodedChunk = {
-	frame: number,
-	sections: { DecodedSection },
-}
-
--- parses one unreliable chunk into a record view: the frame counter and every section in chunk order, with
--- raw (dense) wire ids; removed is always nil (removals never ride chunks). chunk values are always
--- serdes-encoded, so unresolvable hooks error.
-local function decode_chunk(chunk: buffer, resolve_serdes: ResolveSerdes?): DecodedChunk
-	check_chunk_version(chunk)
-	local frame = read_chunk_frame(chunk)
-
-	local sections = {} :: { DecodedSection }
-	local sections_count = 0
-	local offset = chunk_header_width
-	local chunk_size = buffer.len(chunk)
-	while offset < chunk_size do
-		local _, next_offset, list_offset, first_id, target_id, ids_count, nulled_count =
-			read_chunk_section_header(chunk, offset)
-
-		local component = first_id
-		local relation: number? = nil
-		if target_id ~= nil then
-			relation = first_id
-			component = pair(first_id, target_id)
-		end
-
-		offset = list_offset
-		local ids: { number }? = nil
-		local values: { any }? = nil
-		if ids_count > 0 then
-			local list = table.create(ids_count) :: { number }
-			for i = 1, ids_count do
-				list[i] = read_id(chunk, offset)
-				offset += id_width
-			end
-			ids = list
-			local serdes = if resolve_serdes then resolve_serdes(component, relation) else nil
-			if serdes == nil then
-				fail(`decode_chunk: no serdes hooks to decode the values of {id_to_string(component)}`)
-			end
-			-- cast: fail never returns, but the solver doesn't treat user functions as diverging
-			values, offset = decode_values(chunk, offset, serdes :: Serdes, ids_count)
-		end
-		local nulled: { number }? = nil
-		if nulled_count > 0 then
-			local list = table.create(nulled_count) :: { number }
-			for i = 1, nulled_count do
-				list[i] = read_id(chunk, offset)
-				offset += id_width
-			end
-			nulled = list
-		end
-
-		sections_count += 1
-		sections[sections_count] = {
-			component = component,
-			relation = relation,
-			target = target_id,
-			ids = ids,
-			values = values,
-			nulled = nulled,
-			removed = nil,
-		}
-		offset = next_offset
-	end
-
-	return {
-		frame = frame,
-		sections = sections,
-	}
 end
 
 return {
@@ -1849,7 +1540,6 @@ return {
 	measure_section = measure_section,
 	measure_section_salvaging = measure_section_salvaging,
 	write_section = write_section,
-	finalize_section = finalize_section,
 	assemble_packet = assemble_packet,
 	finalize_chunks = finalize_chunks,
 
@@ -1865,10 +1555,7 @@ return {
 	read_chunk_frame = read_chunk_frame,
 	read_chunk_section_header = read_chunk_section_header,
 
-	-- record-view decoders (test/debug-facing; reconcile never uses them). decode_values also backs
-	-- inspect.luau, the public wrapper over this module's readers
+	-- the inspector's value decoder (inspect.luau, the public wrapper over this module's readers); reconcile
+	-- fuses its own decode into the apply loop
 	decode_values = decode_values,
-	decode_section = decode_section,
-	decode_packet = decode_packet,
-	decode_chunk = decode_chunk,
 }

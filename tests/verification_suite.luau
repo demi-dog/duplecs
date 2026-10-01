@@ -43,6 +43,8 @@ local pair = jecs.pair
 
 local duplecs = require("../src")
 local wire = require("../src/wire")
+-- the debug packet inspector's walk, which the harness's record views reshape (see decode_packet below)
+local inspect = require("../src/inspect")
 -- the per-world record getter behind duplecs.shared: the harness decodes inline serdes values through the
 -- record's resolve_serdes -- the module's own resolution chain -- rather than a mirror of its own
 local shared = require("../src/shared")
@@ -180,11 +182,108 @@ local function deep_copy(value)
 	return copy
 end
 
--- tests assert against the decoded record view produced by wire.decode_packet
--- rather than re-parsing wire buffers themselves; see src/wire.luau for the
--- record shape (DecodedPacket/DecodedSection) and the authoritative wire
--- layouts.
-local decode_packet = wire.decode_packet
+-- tests assert against a record view of each packet rather than re-parsing wire buffers themselves. the
+-- tree's one allocating packet decoder is the inspector's walk (src/inspect.luau, behind both halves'
+-- describe_packet / describe_chunk); the harness drives it with an identity resolver -- every wire id maps
+-- to itself and nothing is named -- so descriptions carry raw wire ids (dense in sections and the
+-- unreplicated list, gen-qualified in the replicated list and names) and serdes lookups key by them exactly
+-- as the store does. decode_packet / decode_chunk below reshape the descriptions into the views tests read;
+-- see src/types.luau for the description shapes and src/wire.luau for the authoritative wire layouts.
+local function identity_id(id)
+	return id
+end
+
+local function no_name()
+	return nil
+end
+
+local function no_serdes()
+	return nil
+end
+
+local function identity_resolver(resolve_serdes)
+	return {
+		entity = identity_id,
+		gen_entity = identity_id,
+		name = no_name,
+		resolve_serdes = resolve_serdes or no_serdes,
+	}
+end
+
+-- the resolver for callers decoding without serdes hooks: their inline values stay nil
+local hookless_resolver = identity_resolver(nil)
+
+local merged_fields = { "ids", "values", "nulled", "removed" }
+
+-- the packet's record view: data / values ride along so the record still reconciles when handed to
+-- reconcile_packet; replicated / unreplicated list the raw entity-list ids; names maps each announced gen id
+-- to its name, "" for a retraction; sections are the description's own (one per run of a grouped section;
+-- ids is always a list, empty when the wire carries none); components merges every section of one component
+-- (the same component may span several when its cells resolve to different visibility masks) by appending
+-- each section's lists in packet order, a list staying nil when no section contributed to it. inline values
+-- decode through resolve_serdes when given, and stay nil where it resolves no hooks or the hooks fail.
+local function decode_packet(packet, resolve_serdes)
+	local resolver = if resolve_serdes then identity_resolver(resolve_serdes) else hookless_resolver
+	local described = inspect.describe_packet(packet, resolver)
+
+	local replicated = table.create(#described.created)
+	for i, entry in described.created do
+		replicated[i] = entry.id
+	end
+	local unreplicated = table.create(#described.deleted)
+	for i, entry in described.deleted do
+		unreplicated[i] = entry.id
+	end
+	local names = {}
+	for _, entry in described.names do
+		names[entry.id] = if entry.retracted then "" else entry.name
+	end
+
+	local components = {}
+	for _, section in described.sections do
+		local merged = components[section.component]
+		if merged == nil then
+			merged = {
+				relation = section.relation,
+				target = section.target,
+			}
+			components[section.component] = merged
+		end
+		for _, field in merged_fields do
+			local source = section[field]
+			if source ~= nil and #source > 0 then
+				local list = merged[field]
+				if list == nil then
+					list = {}
+					merged[field] = list
+				end
+				table.move(source, 1, #source, #list + 1, list)
+			end
+		end
+	end
+
+	return {
+		data = packet.data,
+		values = packet.values,
+		frame = described.frame,
+		replicated = replicated,
+		unreplicated = unreplicated,
+		names = names,
+		sections = described.sections,
+		components = components,
+	}
+end
+
+-- one unreliable chunk's record view: its frame counter and every section in chunk order, raw wire ids as
+-- above (removed is always nil: removals never ride chunks)
+local function decode_chunk(chunk, resolve_serdes)
+	local resolver = if resolve_serdes then identity_resolver(resolve_serdes) else hookless_resolver
+	local described = inspect.describe_chunk(chunk, resolver)
+	return {
+		frame = described.frame,
+		sections = described.sections,
+	}
+end
 
 -- environment setup
 
@@ -277,10 +376,11 @@ local function make_env()
 	-- this is the module's own resolver, not a copy of it: the serdes store the
 	-- encoder just resolved through lives in the server world's shared record, so
 	-- the harness can never drift from the chain under test (the target-derived
-	-- link for a tag relation's pairs included). the decoders hand it raw wire ids
-	-- -- dense component/relation ids and pairs packed from dense halves -- which
-	-- is exactly how the store keys pairs, and test definition entities are
-	-- generation 0, so a dense definition id is its own store key too.
+	-- link for a tag relation's pairs included). the inspector's walk, under the
+	-- harness's identity resolver, hands it raw wire ids -- dense component/relation
+	-- ids and pairs packed from dense halves -- which is exactly how the store keys
+	-- pairs, and test definition entities are generation 0, so a dense definition
+	-- id is its own store key too.
 	local resolve_serdes = shared.get_record(world).resolve_serdes
 
 	local function frame()
@@ -3114,11 +3214,11 @@ test("packets referencing unknown server ids reconcile as a no-op", function(env
 	local bogus = 999983
 
 	-- hand-encodes a hookless section into the packet buffer at offset (see
-	-- finalize_section), returning the offset just past it. only ever emits
-	-- an ids list, a removed list, or both -- never nulled -- so counts are
-	-- narrow (u16) and written in has_ids/has_removed order. no inline
-	-- values, so no length prefix -- the section's size follows from its
-	-- counts (see the layout).
+	-- src/wire.luau's write_plain_section), returning the offset just past
+	-- it. only ever emits an ids list, a removed list, or both -- never
+	-- nulled -- so counts are narrow (u16) and written in has_ids/has_removed
+	-- order. no inline values, so no length prefix -- the section's size
+	-- follows from its counts (see the layout).
 	local function write_section(data, offset, component, ids, removed)
 		local ids_count = if ids then #ids else 0
 		local removed_count = if removed then #removed else 0
@@ -3244,20 +3344,23 @@ test("get_packet_frame errors loudly on a wire format version mismatch", functio
 	end, "getting the packet frame of a packet with a mismatched wire format version", "wire format version")
 end)
 
-test("decode_packet errors loudly on a wire format version mismatch", function(env)
-	local s = env.server
+test("describe_packet errors loudly on a wire format version mismatch", function(env)
+	local s, c = env.server, env.client
 	local e = s.world:entity()
 	s.world:add(e, s.net.Replicated)
 	s.world:set(e, s.defs.Health, 1)
 
 	local packet = env.frame()[env.player_a]
-	-- the intact packet decodes first, so the refusal below is the version check firing rather than a decoder
+	-- the intact packet describes first, so the refusal below is the version check firing rather than a walk
 	-- that errors on everything
-	expect(decode_packet(packet).components[s.defs.Health] ~= nil, "the packet decodes before the corruption")
+	expect(s.net.describe_packet(packet).components[s.defs.Health] ~= nil, "the packet describes before the corruption")
 	buffer.writeu8(packet.data, 0, wire_version + 1)
 	expect_error(function()
-		decode_packet(packet)
-	end, "decoding a packet with a mismatched wire format version", "wire format version")
+		s.net.describe_packet(packet)
+	end, "describing a packet with a mismatched wire format version on the server", "wire format version")
+	expect_error(function()
+		c.net.describe_packet(packet)
+	end, "describing a packet with a mismatched wire format version on a client", "wire format version")
 end)
 
 -- 13) whitelist editing and visibility corrections
@@ -4586,26 +4689,51 @@ test("mixed masks don't leak across a broadcast and a cross-shard whitelist in o
 		return nil
 	end
 
+	-- the raw packet's side array a hookless section reads its values from: the view's values are copies, so
+	-- reference identity is asserted on the packets themselves. each hookless section setting values consumes
+	-- the next side array in packet order (no pair sections here, so no grouped run shares one)
+	local function side_array(raw, packet, component)
+		local index = 0
+		for _, section in packet.sections do
+			if section.side_values > 0 then
+				index += 1
+				if section.component == component then
+					return raw.values[index]
+				end
+			end
+		end
+		return nil
+	end
+
 	local health_a = find_section(packet_a, s.defs.Health)
 	local health_b = find_section(packet_b, s.defs.Health)
 	local health_cross = find_section(packet_cross, s.defs.Health)
 	expect(health_a ~= nil and health_b ~= nil and health_cross ~= nil, "every player has a Health section")
 	expect_equal(health_a.values[1], 2, "the broadcast section carries the changed value")
+	local health_values = side_array(packets[env.player_a], packet_a, s.defs.Health)
+	-- anchored, so the identity assertions below cannot pass as nil == nil
+	expect(health_values ~= nil, "the broadcast section reads from a side array")
 	expect_equal(
-		health_b.values,
-		health_a.values,
+		side_array(packets[env.player_b], packet_b, s.defs.Health),
+		health_values,
 		"the broadcast section's values are shared by reference between a whitelisted and an unlisted player"
 	)
-	expect_equal(health_cross.values, health_a.values, "the broadcast section's values are shared across shards too")
+	expect_equal(
+		side_array(packets[cross], packet_cross, s.defs.Health),
+		health_values,
+		"the broadcast section's values are shared across shards too"
+	)
 
 	local inventory_a = find_section(packet_a, s.defs.Inventory)
 	local inventory_cross = find_section(packet_cross, s.defs.Inventory)
 	expect(inventory_a ~= nil, "the whitelisted player receives the Inventory section")
 	expect(inventory_cross ~= nil, "the other-shard whitelisted player receives it too")
 	expect_equal(inventory_a.values[1].gold, 1, "the private section carries its own value, not the broadcast's")
+	local inventory_values = side_array(packets[env.player_a], packet_a, s.defs.Inventory)
+	expect(inventory_values ~= nil, "the private section reads from a side array")
 	expect_equal(
-		inventory_cross.values,
-		inventory_a.values,
+		side_array(packets[cross], packet_cross, s.defs.Inventory),
+		inventory_values,
 		"the whitelisted Inventory section's values are shared across shards"
 	)
 	expect_equal(
@@ -6320,8 +6448,10 @@ test("players sharing a visibility mask receive the same section by reference", 
 	)
 	expect_equal(packets[env.player_b].values[1], packets[env.player_a].values[1], "B references the same values table")
 	-- the shared array is the section's own values list, holding exactly the one cell: an array rebuilt per
-	-- player would compare unequal above while still decoding to the right value here
-	expect_equal(section_a.values, packets[env.player_a].values[1], "the section decodes out of that very array")
+	-- player would compare unequal above while still decoding to the right value here. the view's values
+	-- are a copy of the side array's slice, so the section is matched to that array by content
+	expect_equal(#section_a.values, 1, "the section decodes one value")
+	expect_equal(section_a.values[1], packets[env.player_a].values[1][1], "out of that very array")
 	expect_equal(#packets[env.player_a].values[1], 1, "the shared array holds exactly the one cell's value")
 	expect_equal(packets[env.player_a].values[1][1], 5, "and it is the value that was set")
 end)
@@ -7323,8 +7453,8 @@ local f64_serdes = {
 }
 
 -- same encoding as f64_serdes, but size is a plain number instead of omitted:
--- exercises the static-size sizing branch in finalize_section /
--- finalize_grouped_section (size * ids_count, and the wire framing omits the
+-- exercises the static-size sizing branch in measure_plain_section /
+-- measure_grouped_section (size * ids_count, and the wire framing omits the
 -- length prefix entirely)
 local f64_static_serdes = {
 	size = 8,
@@ -8146,8 +8276,9 @@ test("a poisoned run in a grouped pair section is pruned while the healthy run r
 	local packet = env.sync(env.player_a)
 
 	-- the two targets must genuinely share one grouped section: two plain sections would prune one section
-	-- whole and leave the other alone, proving nothing about runs. decode_packet's per-run view erases the
-	-- distinction (see section 21's raw_section_flags), so the section flags are read here directly
+	-- whole and leave the other alone, proving nothing about runs. decode_packet's per-run view marks each
+	-- run's layout but not which section it came from (see section 21's raw_section_flags), so the section
+	-- flags are read here directly
 	local grouped_count = 0
 	local data = packet.data
 	local _, offset, unreplicated_count, replicated_count, names_count = read_packet_header(data)
@@ -14129,12 +14260,11 @@ end)
 
 -- 21) grouped pair sections
 
--- raw section flags for a packet's sections: decode_packet's per-run
--- DecodedSection view intentionally erases the legacy/grouped distinction (a
--- lone-run grouped section and a legacy single-target section decode to the
--- same shape), so the tests below that must tell the layouts apart read the
--- section headers themselves instead -- see the grouped layout in
--- src/wire.luau.
+-- raw section flags for a packet's sections: decode_packet's view lists one
+-- section description per run, each marking its layout ("plain" or "grouped")
+-- but not which wire section it came from, so the tests below that count
+-- grouped sections -- several runs sharing one -- read the section headers
+-- themselves instead -- see the grouped layout in src/wire.luau.
 local function raw_section_flags(packet)
 	local flags_list = {}
 	local data = packet.data
@@ -15812,15 +15942,13 @@ local function chunk_ids_contain(list, dense_id)
 		return false
 	end
 	for _, chunk in list do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return f64_serdes
 		end)
 		for _, section in view.sections do
-			if section.ids then
-				for _, id in section.ids do
-					if id == dense_id then
-						return true
-					end
+			for _, id in section.ids do
+				if id == dense_id then
+					return true
 				end
 			end
 			if section.nulled then
@@ -16027,7 +16155,7 @@ test("a tag relation streams its data-target pairs and skips its tag-target ones
 
 	local sections = 0
 	for _, chunk in chunks do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return f64_serdes
 		end)
 		for _, section in view.sections do
@@ -16340,7 +16468,7 @@ test("a NetworkedUnreliable relation's pair values round-trip and encode as sing
 
 	local found_pair_section = false
 	for _, chunk in chunks do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return f64_serdes
 		end)
 		for _, section in view.sections do
@@ -16625,11 +16753,14 @@ test("a static-size encode throwing on one value keeps every surviving value and
 	-- every chunk still parses, and between them they carry all four surviving values
 	local seen = {}
 	for _, chunk in chunks do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return throwing_static_serdes
 		end)
 		for _, section in view.sections do
-			if section.ids ~= nil and section.values ~= nil then
+			if #section.ids > 0 then
+				-- the inspector's walk contains a decode failure to the section's values rather than
+				-- erroring, so a section that no longer parses shows up here as values gone nil
+				expect(section.values ~= nil, "every streamed section's values decode")
 				for index, id in section.ids do
 					seen[id] = section.values[index]
 				end
@@ -17201,7 +17332,7 @@ test("get_chunk_frame reads the chunk frame counter carried in the chunk's buffe
 		"matches the u32 just past the leading version byte"
 	)
 
-	local view = wire.decode_chunk(chunk, function()
+	local view = decode_chunk(chunk, function()
 		return f64_serdes
 	end)
 	expect_equal(c.net.get_chunk_frame(chunk), view.frame, "agrees with decode_chunk's view of the same chunk")
@@ -19895,7 +20026,7 @@ end)
 
 test("the spec's warnings-and-errors appendix quotes every message the sources raise", function()
 	local messages = collect_source_messages()
-	expect(#messages >= 56, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
+	expect(#messages >= 53, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
 
 	-- the entries' quoted messages, not the appendix whole: a message that survives only in an entry's prose
 	-- has no entry of its own, which is exactly the drift this direction exists to catch
@@ -19928,7 +20059,7 @@ end)
 test("the spec's warnings-and-errors appendix quotes no message the sources no longer raise", function()
 	local source_text = read_source_text()
 	local messages = collect_appendix_messages(read_diagnostics_appendix())
-	expect(#messages >= 53, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
+	expect(#messages >= 51, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
 
 	for _, message in messages do
 		local checked = 0
@@ -20147,7 +20278,7 @@ test("a Networked designation pulls exactly its target off the unreliable channe
 	-- the Networked-designated target's pairs -- already delivered reliably -- do not
 	local streamed = {}
 	for _, chunk in s.net.generate_unreliable_chunks()[env.player_a] do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return f64_serdes
 		end)
 		for _, section in view.sections do
@@ -20218,7 +20349,7 @@ test("chunks carry only the unreliably-designated target's pairs on a mixed defi
 
 	local sections = 0
 	for _, chunk in chunks do
-		local view = wire.decode_chunk(chunk, function()
+		local view = decode_chunk(chunk, function()
 			return f64_serdes
 		end)
 		for _, section in view.sections do
