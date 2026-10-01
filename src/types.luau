@@ -128,8 +128,8 @@ export type ChunkDescription = {
 }
 
 -- the server's opt-in byte counters for one generate_packets / generate_unreliable_chunks call (see
--- set_packet_stats in server.luau). encoded_bytes is paid once per group of clients sharing the bytes;
--- sent_bytes, entries, and side_values are summed over every recipient.
+-- stats.luau). encoded_bytes is paid once per group of clients sharing the bytes; sent_bytes, entries, and
+-- side_values are summed over every recipient.
 export type ComponentStats = {
 	encoded_bytes: number,
 	sent_bytes: number,

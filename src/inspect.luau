@@ -1,9 +1,10 @@
 --!strict
 
 -- the debug packet inspector behind both halves' describe_packet / describe_chunk: the public wrapper over
--- wire.luau's header readers, which stay internal. each half passes its own resolver (how a wire id maps to a
--- local entity, how a local entity is named, and its world's serdes store), so one walk serves the server
--- describing what it just generated and a client describing what it received.
+-- wire.luau's header readers, which stay internal. one walk serves the server describing what it just
+-- generated and a client describing what it received: each half's factory (see INSPECTORS), built from the
+-- references that half passes in, supplies the resolver the walk uses -- how a wire id maps to a local entity,
+-- how a local entity is named, and the world's serdes store.
 --
 -- byte counts never depend on decoding: every size comes from the wire's own length prefixes and counts, so a
 -- section whose ids don't resolve, whose hooks are missing on the describing side, or whose decode hook throws
@@ -20,6 +21,7 @@ local wire = require("./wire")
 -- jecs.pair retyped to the plain-number domain, like wire.luau's
 local pair = (jecs.pair :: any) :: (relation: number, target: number) -> number
 
+type World = types.World
 type Id = types.Id
 type Entity = types.Entity
 type Serdes = types.Serdes
@@ -30,6 +32,9 @@ type SectionDescription = types.SectionDescription
 type ComponentDescription = types.ComponentDescription
 type PacketDescription = types.PacketDescription
 type ChunkDescription = types.ChunkDescription
+
+-- the serdes store's resolver (see serdes.luau), keyed by local ids
+type ResolveSerdes = (component: any, relation: any) -> Serdes?
 
 local flag_inline_values = wire.flag_inline_values
 local flag_side_values = wire.flag_side_values
@@ -49,15 +54,17 @@ local read_chunk_frame = wire.read_chunk_frame
 local read_chunk_section_header = wire.read_chunk_section_header
 local decode_values = wire.decode_values
 
+-- DESCRIBE
+
 -- what one half knows about its own world, for resolving the wire's ids: entity maps a dense wire id (what
 -- sections and the deletion list carry) and gen_entity a gen-qualified one (the creation and names lists) to
 -- the local id, nil when nothing local stands for it; name reads a local entity's jecs.Name; resolve_serdes
--- is the world's serdes store, keyed by local ids.
-export type Resolver = {
+-- is the world's serdes store.
+type Resolver = {
 	entity: (dense_id: number) -> number?,
 	gen_entity: (gen_id: number) -> number?,
 	name: (entity: number) -> string?,
-	resolve_serdes: (component: any, relation: any) -> Serdes?,
+	resolve_serdes: ResolveSerdes,
 }
 
 -- the per-call naming context: the resolver plus the names the described packet itself announces, keyed by
@@ -413,7 +420,86 @@ local function describe_chunk(chunk: buffer, resolver: Resolver): ChunkDescripti
 	}
 end
 
+-- INSPECTORS
+
+-- the describe pair over one resolver, as each half exports it
+local function create_inspector(
+	resolver: Resolver
+): ((packet: Packet) -> PacketDescription, (chunk: buffer) -> ChunkDescription)
+	local function describe_resolved_packet(packet: Packet): PacketDescription
+		return describe_packet(packet, resolver)
+	end
+
+	local function describe_resolved_chunk(chunk: buffer): ChunkDescription
+		return describe_chunk(chunk, resolver)
+	end
+
+	return describe_resolved_packet, describe_resolved_chunk
+end
+
+-- both halves name a local entity by its jecs.Name in the describing world
+local function create_name_reader(world: World): (entity: number) -> string?
+	return function(entity: number): string?
+		local name = world:get(entity :: any, jecs.Name)
+		return if type(name) == "string" then name else nil
+	end
+end
+
+-- the server's view, whose wire ids are its own: a dense wire id resolves to the live entity holding that slot
+-- now, a gen-qualified one only while that exact entity lives, and values decode through the world's serdes
+-- store. resolution reads the world as it stands when describe runs, so describing a packet right after
+-- generating it names everything it carries, while an entity deleted since (a deletion entry's, typically)
+-- resolves to nothing.
+local function create_server_inspector(world: World, resolve_serdes: ResolveSerdes)
+	-- never replaced on a live world
+	local entity_index = world.entity_index
+	return create_inspector({
+		entity = function(dense_id: number): number?
+			return jecs.entity_index_get_alive(entity_index :: any, dense_id) :: any
+		end,
+		gen_entity = function(gen_id: number): number?
+			if world:contains(gen_id :: any) then
+				return gen_id
+			end
+			return nil
+		end,
+		name = create_name_reader(world),
+		resolve_serdes = resolve_serdes,
+	})
+end
+
+-- a client's view: wire ids resolve through its mapping -- client_entity_map (dense server id -> client
+-- entity) and get_client_entity (the generation-checked lookup of a gen-qualified server id) -- to a live
+-- mapped entity only, so describing before reconcile sees the mappings the packet has yet to establish as
+-- unresolved, the packet's own announcements still naming them. values decode through the world's serdes
+-- store.
+local function create_client_inspector(
+	world: World,
+	resolve_serdes: ResolveSerdes,
+	client_entity_map: { [number]: Entity },
+	get_client_entity: (server_entity: number) -> Entity?
+)
+	return create_inspector({
+		entity = function(dense_id: number): number?
+			local client_entity = client_entity_map[dense_id]
+			if client_entity ~= nil and world:contains(client_entity) then
+				return client_entity :: any
+			end
+			return nil
+		end,
+		gen_entity = function(gen_id: number): number?
+			local client_entity = get_client_entity(gen_id)
+			if client_entity ~= nil and world:contains(client_entity) then
+				return client_entity :: any
+			end
+			return nil
+		end,
+		name = create_name_reader(world),
+		resolve_serdes = resolve_serdes,
+	})
+end
+
 return {
-	describe_packet = describe_packet,
-	describe_chunk = describe_chunk,
+	create_server_inspector = create_server_inspector,
+	create_client_inspector = create_client_inspector,
 }

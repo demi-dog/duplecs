@@ -17,6 +17,7 @@ local pair = jecs.pair
 local types = require("./types")
 local wire = require("./wire")
 local inspect = require("./inspect")
+local stats = require("./stats")
 local get_shared = require("./shared")
 local create_pools = require("./pools")
 local create_names = require("./names")
@@ -96,8 +97,6 @@ type Component<T = any> = types.Component<T>
 type Id<T = any> = types.Id<T>
 type Client = types.Client
 type Packet = types.Packet
-type PacketDescription = types.PacketDescription
-type ChunkDescription = types.ChunkDescription
 
 type ChangedValues = { [Entity]: _Nulled | unknown }
 
@@ -156,160 +155,6 @@ type ShardVisibilities = { [Id]: { [Entity]: VisibilityMask } }
 type Privacy = types.Privacy
 type PrivacyFilterCache = { [Entity]: { [Component]: Privacy } }
 type AllowMaskCache = { [Entity]: { [Component]: ShardMasks } }
-
-type PacketStats = types.PacketStats
-type ComponentStats = types.ComponentStats
-
--- one visibility node's bytes of one stats key (a component, or a relation for its pairs), encoded once and
--- multiplied by the node's recipient count at expansion
-type NodeShare = { bytes: number, entries: number, side_values: number }
-type NodeBreakdown = { [Id]: NodeShare }
-
--- PACKET STATS
---
--- the opt-in byte counters behind set_packet_stats (see the PACKET STATS block in create_packet_generation for
--- where the passes call these). pure helpers, kept out of create_server's local budget. they run only while
--- the counters are enabled, so none of this is on the disabled path.
-
-local function new_packet_stats(): PacketStats
-	return {
-		packets = 0,
-		sent_bytes = 0,
-		overhead_bytes = 0,
-		components = {},
-	}
-end
-
-local function stats_entry(stats: PacketStats, key: Id): ComponentStats
-	local entry = stats.components[key]
-	if entry == nil then
-		entry = {
-			encoded_bytes = 0,
-			sent_bytes = 0,
-			entries = 0,
-			side_values = 0,
-		}
-		stats.components[key] = entry
-	end
-	return entry
-end
-
-local function node_share(breakdown: NodeBreakdown, key: Id): NodeShare
-	local share = breakdown[key]
-	if share == nil then
-		share = { bytes = 0, entries = 0, side_values = 0 }
-		breakdown[key] = share
-	end
-	return share
-end
-
-local function popcount(word: number): number
-	local count = 0
-	while word ~= 0 do
-		word = bit32.band(word, word - 1)
-		count += 1
-	end
-	return count
-end
-
--- tallies a node's (or a full packet's) measured drafts -- measure stashed each one's size and serdes plan on
--- it -- adding their encoded bytes to the stats and returning the per-key breakdown the node's recipients are
--- charged at expansion. pair drafts key by their relation, so a definition serving as both an unpaired
--- component and a relation rolls both roles into one entry. a grouped draft's hookless runs carry their own
--- serdes field; a single-run pair draft encodes the plain layout, whose plan lives on the draft.
-local function tally_drafts(stats: PacketStats, drafts: { SectionDraft }, count: number): NodeBreakdown
-	local breakdown = {} :: NodeBreakdown
-	for i = 1, count do
-		local draft = drafts[i]
-		local key: Id = (draft.relation or draft.component) :: any
-		local size = draft.size :: number
-		local entries = 0
-		local side_values = 0
-		local runs = draft.runs
-		if runs ~= nil then
-			local grouped = #runs > 1
-			for _, run in runs do
-				local ids_count = if run.ids then #run.ids else 0
-				entries += ids_count + (if run.nulled then #run.nulled else 0) + (if run.removed
-					then #run.removed
-					else 0)
-				local hookless = if grouped then run.serdes == nil else draft.serdes == nil
-				if hookless then
-					side_values += ids_count
-				end
-			end
-		else
-			local ids_count = if draft.ids then #draft.ids else 0
-			entries += ids_count + (if draft.nulled then #draft.nulled else 0) + (if draft.removed
-				then #draft.removed
-				else 0)
-			if draft.serdes == nil then
-				side_values += ids_count
-			end
-		end
-		local share = node_share(breakdown, key)
-		share.bytes += size
-		share.entries += entries
-		share.side_values += side_values
-		stats_entry(stats, key).encoded_bytes += size
-	end
-	return breakdown
-end
-
--- the chunk counterpart of tally_drafts, read back off a node's finished chunks: every chunk section's bytes
--- (continuations' repeated headers included) go to its component, keyed back from the wire's dense id
--- through the node's drafts; the chunk headers are overhead, counted from the returned lists.
-local function tally_chunks(stats: PacketStats, drafts: { [any]: SectionDraft }, chunks: { buffer }): NodeBreakdown
-	local key_of = {} :: { [number]: Id }
-	for _, draft in drafts do
-		local key: Id = (draft.relation or draft.component) :: any
-		key_of[dense(key)] = key
-	end
-	local breakdown = {} :: NodeBreakdown
-	for _, chunk in chunks do
-		local offset = wire.chunk_header_width
-		local chunk_size = buffer.len(chunk)
-		while offset < chunk_size do
-			local _, next_offset, _, first_id, _, ids_count, nulled_count =
-				wire.read_chunk_section_header(chunk, offset)
-			local key = key_of[first_id]
-			local size = next_offset - offset
-			local share = node_share(breakdown, key)
-			share.bytes += size
-			share.entries += ids_count + nulled_count
-			stats_entry(stats, key).encoded_bytes += size
-			offset = next_offset
-		end
-	end
-	return breakdown
-end
-
--- charges a node's breakdown to its recipients: every byte, entry, and side value once per client receiving
--- the node's shared bytes
-local function charge_recipients(stats: PacketStats, breakdown: NodeBreakdown?, recipients: number)
-	if breakdown == nil or recipients == 0 then
-		return
-	end
-	for key, share in breakdown do
-		local entry = stats_entry(stats, key)
-		entry.sent_bytes += share.bytes * recipients
-		entry.entries += share.entries * recipients
-		entry.side_values += share.side_values * recipients
-	end
-end
-
--- a packet's bytes outside its sections: the header, the entity lists, and the names list, read off the
--- packet's own header -- independent of the per-node attribution, so the two summing to the packet's length
--- is a real check rather than a tautology
-local function packet_overhead(data: buffer): number
-	local _, offset, unreplicated_count, replicated_count, names_count = wire.read_packet_header(data)
-	offset += unreplicated_count * wire.id_width + replicated_count * wire.gen_id_width
-	for _ = 1, names_count do
-		local _, _, next_offset = wire.read_name(data, offset)
-		offset = next_offset
-	end
-	return offset
-end
 
 local function create_server(world: World, shared_record: get_shared.Record)
 	-- DIAGNOSTICS
@@ -3161,102 +3006,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local get_run = pools.get_run
 
 		-- PACKET STATS
-		--
-		-- the opt-in byte counters (set_packet_stats). while disabled the passes pay one branch on building_stats
-		-- per visibility node -- at finalize and at expansion, and once per full packet -- and nothing per cell or
-		-- per client. while enabled each node's drafts tally once into a per-key breakdown (tally_drafts), and the
-		-- expansion charges it times the node's recipient count, read off the node's mask words (a popcount per
-		-- word, the trie path's words in multi-shard mode) rather than per client; the per-packet totals come from
-		-- the returned packets' own headers. a fresh client's delta is assembled and then replaced by its full,
-		-- so its bits are masked out of the recipient counts (fresh_words) and only the full is charged.
-		local packet_stats_enabled = false
-		local last_packet_stats: PacketStats? = nil
-		local last_chunk_stats: PacketStats? = nil
 
-		-- the running call's counters, nil while disabled; every node's breakdown, keyed like the node stores; and
-		-- the fresh clients' bits per shard, for the reliable call's recipient counts
-		local building_stats: PacketStats? = nil
-		local node_breakdowns = {} :: { [VisibilityNode]: NodeBreakdown }
-		local fresh_words = {} :: { [number]: VisibilityMask }
-
-		-- one mask word's recipients within its shard, fresh clients excluded
-		local function node_recipients(word: VisibilityMask, shard: number): number
-			local fresh = fresh_words[shard]
-			if fresh ~= nil then
-				word = bit32.band(word, bit32.bnot(fresh))
-			end
-			return popcount(word)
-		end
-
-		-- opens a call's counters; the caller has checked packet_stats_enabled. stores an errored call left behind
-		-- are dropped here.
-		local function begin_stats(include_fresh: boolean)
-			building_stats = new_packet_stats()
-			table.clear(node_breakdowns)
-			table.clear(fresh_words)
-			if include_fresh then
-				for client in fresh_clients do
-					local client_index = tracked_clients[client]
-					if client_index ~= nil then
-						local shard = shard_of(client_index)
-						fresh_words[shard] = bit32.bor(fresh_words[shard] or 0, slot_bit_of(client_index))
-					end
-				end
-			end
-		end
-
-		-- closes a call's counters with the returned buffers' own totals, returning the finished stats
-		local function finish_stats(buffers: { buffer }, overheads: { number }): PacketStats
-			local stats = building_stats :: PacketStats
-			for i, data in buffers do
-				stats.packets += 1
-				stats.sent_bytes += buffer.len(data)
-				stats.overhead_bytes += overheads[i]
-			end
-			building_stats = nil
-			table.clear(node_breakdowns)
-			table.clear(fresh_words)
-			return stats
-		end
-
-		local function finish_packet_stats(packets: { [Client]: Packet })
-			local buffers = {} :: { buffer }
-			local overheads = {} :: { number }
-			for _, packet in packets do
-				table.insert(buffers, packet.data)
-				table.insert(overheads, packet_overhead(packet.data))
-			end
-			last_packet_stats = finish_stats(buffers, overheads)
-		end
-
-		local function finish_chunk_stats(packets: { [Client]: { buffer } })
-			local buffers = {} :: { buffer }
-			local overheads = {} :: { number }
-			for _, chunks in packets do
-				for _, chunk in chunks do
-					table.insert(buffers, chunk)
-					table.insert(overheads, wire.chunk_header_width)
-				end
-			end
-			last_chunk_stats = finish_stats(buffers, overheads)
-		end
-
-		-- turning the counters off drops the last calls' tables, so a stale reading can't outlive the switch
-		local function set_packet_stats(enabled: boolean)
-			packet_stats_enabled = enabled == true
-			if not packet_stats_enabled then
-				last_packet_stats = nil
-				last_chunk_stats = nil
-			end
-		end
-
-		local function get_packet_stats(): PacketStats?
-			return last_packet_stats
-		end
-
-		local function get_chunk_stats(): PacketStats?
-			return last_chunk_stats
-		end
+		-- the opt-in byte counters (see stats.luau). each entry point opens the recorder, nil while the counters
+		-- are off, which the passes branch on once per visibility node and once per full packet; only the entry
+		-- points assign it, so a recorder an errored call left behind is replaced before anything reads it.
+		local packet_stats = stats.create_packet_stats(tracked_clients, fresh_clients, shard_of, slot_bit_of)
+		local stats_recorder: stats.StatsRecorder? = nil
 
 		-- clears one masks table's swept bits for the shard, dropping the word when it zeroes (zero words are always
 		-- omitted, so equal restrictions compare equal).
@@ -3601,10 +3356,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			for _, draft in sections do
 				sections_size += measure_section_guarded(draft)
 			end
-			local stats = building_stats
-			if stats ~= nil then
-				-- a full packet is its own encoding, sent to its one recipient
-				charge_recipients(stats, tally_drafts(stats, sections, #sections), 1)
+			local recorder = stats_recorder
+			if recorder ~= nil then
+				recorder.charge_full(sections)
 			end
 			local section_data = buffer.create(sections_size)
 			local section_offset = 0
@@ -4460,9 +4214,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					drafts[count] = draft
 					size += measure_section_guarded(draft)
 				end
-				local stats = building_stats
-				if stats ~= nil then
-					node_breakdowns[node] = tally_drafts(stats, drafts, count)
+				local recorder = stats_recorder
+				if recorder ~= nil then
+					recorder.tally_node(node, drafts, count)
 				end
 				local data = buffer.create(size)
 				local offset = 0
@@ -4534,13 +4288,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			if node_buffer then
 				local node_size = frame_state.node_sizes[node]
 				local section_values = frame_state.node_section_values[node]
-				local stats = building_stats
-				if stats ~= nil then
-					local recipients = 0
-					for i = 1, depth do
-						recipients += node_recipients(path_words[i], path_bases[i] // 32 + 1)
-					end
-					charge_recipients(stats, node_breakdowns[node], recipients)
+				local recorder = stats_recorder
+				if recorder ~= nil then
+					recorder.charge_path(node, path_words, path_bases, depth)
 				end
 				for i = 1, depth do
 					local base_index = path_bases[i]
@@ -4577,9 +4327,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local m = mask :: number
 					local node_size = node_sizes[mask]
 					local section_values = node_section_values[mask]
-					local stats = building_stats
-					if stats ~= nil then
-						charge_recipients(stats, node_breakdowns[mask], node_recipients(m, 1))
+					local recorder = stats_recorder
+					if recorder ~= nil then
+						recorder.charge_word(mask, m, 1)
 					end
 					while m ~= 0 do
 						local index = bit32.countrz(m)
@@ -4637,10 +4387,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local this_packet_frame = next_packet_frame()
 			group_frame += 1
 			reset_frame_state()
-			building_stats = nil
-			if packet_stats_enabled then
-				begin_stats(true)
-			end
+			stats_recorder = packet_stats.begin_packets()
 
 			-- drain the name states staged since the last call; with nobody allocated there is no delta to ride, so
 			-- the drain discards them (joiners get the full set)
@@ -4728,8 +4475,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				packets[client] = full_packet(client, this_packet_frame)
 			end
 
-			if building_stats ~= nil then
-				finish_packet_stats(packets)
+			local recorder = stats_recorder
+			if recorder ~= nil then
+				recorder.finish_packets(packets)
 			end
 
 			compact_shards()
@@ -4945,13 +4693,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local node_chunks = unreliable_node_chunks[node]
 			if node_chunks then
 				local chunk_count = #node_chunks
-				local stats = building_stats
-				if stats ~= nil then
-					local recipients = 0
-					for i = 1, depth do
-						recipients += node_recipients(path_words[i], path_bases[i] // 32 + 1)
-					end
-					charge_recipients(stats, node_breakdowns[node], recipients)
+				local recorder = stats_recorder
+				if recorder ~= nil then
+					recorder.charge_path(node, path_words, path_bases, depth)
 				end
 				for i = 1, depth do
 					local base_index = path_bases[i]
@@ -5000,13 +4744,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 			chunk_frame = (chunk_frame + 1) % 2 ^ 32
 			local packets = {} :: { [Client]: { buffer } }
-			building_stats = nil
-			if packet_stats_enabled then
-				begin_stats(false)
-			end
+			local recorder = packet_stats.begin_chunks()
+			stats_recorder = recorder
 			if next(networked_unreliable) == nil then
-				if building_stats ~= nil then
-					finish_chunk_stats(packets)
+				if recorder ~= nil then
+					recorder.finish_chunks(packets)
 				end
 				return packets
 			end
@@ -5103,8 +4845,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 
 			if next(unreliable_node_drafts) == nil then
-				if building_stats ~= nil then
-					finish_chunk_stats(packets)
+				if recorder ~= nil then
+					recorder.finish_chunks(packets)
 				end
 				return packets
 			end
@@ -5123,9 +4865,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 						`a serdes encode failed while chunking {id_to_string(salvage_id, world)}! {pruned} value(s) were dropped from this call's chunks and will not replicate until the hook or value is fixed: {salvage_error}`
 					)
 				end
-				local stats = building_stats
-				if stats ~= nil then
-					node_breakdowns[node] = tally_chunks(stats, drafts, chunks)
+				if recorder ~= nil then
+					recorder.tally_chunk_node(node, drafts, chunks)
 				end
 				for _, draft in drafts do
 					release_draft(draft)
@@ -5143,9 +4884,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				for mask, node_chunks in unreliable_node_chunks do
 					local m = mask :: number
 					local chunk_count = #node_chunks
-					local stats = building_stats
-					if stats ~= nil then
-						charge_recipients(stats, node_breakdowns[mask], node_recipients(m, 1))
+					if recorder ~= nil then
+						recorder.charge_word(mask, m, 1)
 					end
 					while m ~= 0 do
 						local index = bit32.countrz(m)
@@ -5161,14 +4901,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				unreliable_node_chunks[node] = nil
 			end
 
-			if building_stats ~= nil then
-				finish_chunk_stats(packets)
+			if recorder ~= nil then
+				recorder.finish_chunks(packets)
 			end
 
 			return packets
 		end
 
-		return generate_packets, generate_unreliable_chunks, set_packet_stats, get_packet_stats, get_chunk_stats
+		return generate_packets,
+			generate_unreliable_chunks,
+			packet_stats.set_packet_stats,
+			packet_stats.get_packet_stats,
+			packet_stats.get_chunk_stats
 	end
 
 	local generate_packets, generate_unreliable_chunks, set_packet_stats, get_packet_stats, get_chunk_stats =
@@ -5176,35 +4920,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- INSPECTION
 
-	-- the debug inspector's view of this world (see inspect.luau): a dense wire id resolves to the live entity
-	-- holding that slot now, a gen-qualified one only while that exact entity lives, and values decode through
-	-- this world's serdes store. resolution reads the world as it stands when describe runs, so describing a
-	-- packet right after generating it names everything it carries, while an entity deleted since (a deletion
-	-- entry's, typically) resolves to nothing.
-	local inspect_resolver: inspect.Resolver = {
-		entity = function(dense_id: number): number?
-			return jecs.entity_index_get_alive(entity_index :: any, dense_id) :: any
-		end,
-		gen_entity = function(gen_id: number): number?
-			if world:contains(gen_id :: any) then
-				return gen_id
-			end
-			return nil
-		end,
-		name = function(entity: number): string?
-			local name = world:get(entity :: any, jecs.Name)
-			return if type(name) == "string" then name else nil
-		end,
-		resolve_serdes = shared_record.resolve_serdes,
-	}
-
-	local function describe_packet(packet: Packet): PacketDescription
-		return inspect.describe_packet(packet, inspect_resolver)
-	end
-
-	local function describe_chunk(chunk: buffer): ChunkDescription
-		return inspect.describe_chunk(chunk, inspect_resolver)
-	end
+	-- the debug inspector's view of this world (see inspect.luau): wire ids are this world's own
+	local describe_packet, describe_chunk = inspect.create_server_inspector(world, shared_record.resolve_serdes)
 
 	-- CONSTRUCTION CATCH-UP
 
