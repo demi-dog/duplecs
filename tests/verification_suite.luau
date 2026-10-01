@@ -1691,7 +1691,7 @@ test("locally cascade-deleting an imported entity tears down its mapping", funct
 	expect_equal(c.net.get_server_entity(le), nil, "and the reverse mapping went with it")
 end)
 
--- 9) client deletion semantics (safe_delete)
+-- 9) client deletion semantics (delete_client_entities)
 
 test("unreplicating a parent detaches imported children instead of deleting them", function(env)
 	local s, c = env.server, env.client
@@ -1792,6 +1792,292 @@ test("cyclical local relations with imported dependents delete cleanly", functio
 	expect_equal(c.world:contains(lq), true, "imported dependent of the cycle survives")
 	expect_equal(c.net.get_client_entity(q), lq, "imported dependent mapping intact")
 	expect_equal(c.world:has(lq, pair(R, a)), false, "imported dependent detached from the deleted cycle member")
+end)
+
+-- the tests below shape client worlds directly and hand-assemble the packets deleting from them: the server
+-- emits a packet's deletion list in table-iteration order, so only a hand-built list can pin that the
+-- outcome is independent of it. ids are arbitrary generation-0 server ids, far clear of the definitions
+-- make_client maps.
+
+-- a packet carrying only entity lists: unreplicated holds dense server ids, replicated gen-qualified ones
+local function entity_list_packet(unreplicated, replicated)
+	return { data = wire.assemble_packet(0, unreplicated, replicated, nil, nil, 0, nil).data }
+end
+
+-- a fresh client entity mapped to server_id, as a replicated creation would leave it
+local function import_entity(c, server_id)
+	local client_entity = c.world:entity()
+	c.net.set_client_entity(server_id, client_entity)
+	return client_entity
+end
+
+test("a packet deleting a group and its imported members reaches the same outcome in any list order", function(env)
+	local ids = {
+		group = 100001,
+		m1 = 100002,
+		m2 = 100003,
+		survivor = 100004,
+		nested = 100005,
+		deep = 100006,
+	}
+	local orders = {
+		{ "group", "m1", "m2" },
+		{ "m1", "m2", "group" },
+		{ "m2", "group", "m1" },
+	}
+	for _, order in orders do
+		local label = table.concat(order, ",")
+		local c = env.make_client()
+		local g = import_entity(c, ids.group)
+		local m1 = import_entity(c, ids.m1)
+		local m2 = import_entity(c, ids.m2)
+		-- imported children the packet does not delete: one of the group, one of a deleted member, and one
+		-- hanging off a local dependent of a deleted member
+		local survivor = import_entity(c, ids.survivor)
+		local nested = import_entity(c, ids.nested)
+		local deep = import_entity(c, ids.deep)
+		c.world:add(m1, pair(jecs.ChildOf, g))
+		c.world:add(m2, pair(jecs.ChildOf, g))
+		c.world:add(survivor, pair(jecs.ChildOf, g))
+		c.world:add(nested, pair(jecs.ChildOf, m2))
+		c.world:set(nested, c.defs.Health, 7)
+
+		-- local dependents: of the group, of a member, and of a survivor (which must outlive the batch)
+		local group_local = c.world:entity()
+		c.world:add(group_local, pair(jecs.ChildOf, g))
+		local member_local = c.world:entity()
+		c.world:add(member_local, pair(jecs.ChildOf, m1))
+		c.world:add(deep, pair(jecs.ChildOf, member_local))
+		local survivor_local = c.world:entity()
+		c.world:add(survivor_local, pair(jecs.ChildOf, survivor))
+
+		local list = {}
+		for _, name in order do
+			table.insert(list, ids[name])
+		end
+		c.net.reconcile_packet(entity_list_packet(list, nil))
+
+		for _, name in order do
+			expect_equal(c.net.get_client_entity(ids[name]), nil, `{label}: {name}'s mapping ends`)
+		end
+		expect_equal(c.world:contains(g), false, `{label}: group deleted`)
+		expect_equal(c.world:contains(m1), false, `{label}: m1 deleted`)
+		expect_equal(c.world:contains(m2), false, `{label}: m2 deleted`)
+		expect_equal(c.world:contains(group_local), false, `{label}: the group's local dependent deleted`)
+		expect_equal(c.world:contains(member_local), false, `{label}: a member's local dependent deleted`)
+
+		expect_equal(c.world:contains(survivor), true, `{label}: the group's undeleted imported child survives`)
+		expect_equal(c.net.get_client_entity(ids.survivor), survivor, `{label}: survivor mapping intact`)
+		expect_equal(c.world:target(survivor, jecs.ChildOf), nil, `{label}: survivor detached from the group`)
+		expect_equal(c.world:contains(survivor_local), true, `{label}: the survivor's local dependent survives`)
+		expect_equal(
+			c.world:has(survivor_local, pair(jecs.ChildOf, survivor)),
+			true,
+			`{label}: the survivor's local dependent keeps its pair`
+		)
+
+		expect_equal(c.world:contains(nested), true, `{label}: a deleted member's undeleted imported child survives`)
+		expect_equal(c.net.get_client_entity(ids.nested), nested, `{label}: nested mapping intact`)
+		expect_equal(c.world:target(nested, jecs.ChildOf), nil, `{label}: nested detached from the member`)
+		expect_equal(c.world:get(nested, c.defs.Health), 7, `{label}: nested keeps its other cells`)
+
+		expect_equal(c.world:contains(deep), true, `{label}: an imported child of a deleted local dependent survives`)
+		expect_equal(c.net.get_client_entity(ids.deep), deep, `{label}: deep mapping intact`)
+		expect_equal(c.world:target(deep, jecs.ChildOf), nil, `{label}: deep detached from the local dependent`)
+	end
+end)
+
+test("a packet deleting imported cycles deletes them whole and spares outside dependents", function(env)
+	local ids = { a = 100011, b = 100012, outside = 100013, mixed = 100014, half = 100015, spared = 100016 }
+	local orders = {
+		{ "a", "b", "mixed", "half" },
+		{ "half", "mixed", "b", "a" },
+	}
+	for _, order in orders do
+		local label = table.concat(order, ",")
+		local c = env.make_client()
+		local R = c.world:entity()
+		c.world:add(R, pair(jecs.OnDeleteTarget, jecs.Delete))
+
+		-- an imported cycle the packet deletes whole, with an imported dependent it does not delete
+		local a = import_entity(c, ids.a)
+		local b = import_entity(c, ids.b)
+		c.world:add(a, pair(R, b))
+		c.world:add(b, pair(R, a))
+		local outside = import_entity(c, ids.outside)
+		c.world:add(outside, pair(R, b))
+
+		-- a cycle through a local entity
+		local mixed = import_entity(c, ids.mixed)
+		local x = c.world:entity()
+		c.world:add(mixed, pair(R, x))
+		c.world:add(x, pair(R, mixed))
+
+		-- a cycle with an imported member the packet does not delete
+		local half = import_entity(c, ids.half)
+		local spared = import_entity(c, ids.spared)
+		c.world:add(half, pair(R, spared))
+		c.world:add(spared, pair(R, half))
+
+		local list = {}
+		for _, name in order do
+			table.insert(list, ids[name])
+		end
+		c.net.reconcile_packet(entity_list_packet(list, nil))
+
+		expect_equal(c.world:contains(a), false, `{label}: cycle member a deleted`)
+		expect_equal(c.world:contains(b), false, `{label}: cycle member b deleted`)
+		expect_equal(c.world:contains(outside), true, `{label}: the cycle's undeleted imported dependent survives`)
+		expect_equal(c.world:has(outside, pair(R, b)), false, `{label}: outside detached from the cycle`)
+		expect_equal(c.world:contains(mixed), false, `{label}: imported member of the local cycle deleted`)
+		expect_equal(c.world:contains(x), false, `{label}: local member of the cycle deleted`)
+		expect_equal(c.world:contains(half), false, `{label}: deleted half of the split cycle gone`)
+		expect_equal(c.world:contains(spared), true, `{label}: undeleted half of the split cycle survives`)
+		expect_equal(c.net.get_client_entity(ids.spared), spared, `{label}: spared mapping intact`)
+		expect_equal(c.world:has(spared, pair(R, half)), false, `{label}: spared detached from the deleted half`)
+	end
+end)
+
+test("a packet deleting a group and recreating its recycled ids starts the new tenants clean", function(env)
+	-- the server deleted a group and one member, then recycled both dense ids into fresh entities within one
+	-- interval, so the packet deletes each id and creates it again under a bumped generation. the client world
+	-- recycles its own dense ids too, so a client pair left on the old group could alias the new tenant.
+	local c = env.client
+	local group_id, member_id, survivor_id = 100021, 100022, 100023
+	local generation = 2 ^ 24
+	local g = import_entity(c, group_id)
+	local m = import_entity(c, member_id)
+	local survivor = import_entity(c, survivor_id)
+	c.world:add(m, pair(jecs.ChildOf, g))
+	c.world:add(survivor, pair(jecs.ChildOf, g))
+	local group_local = c.world:entity()
+	c.world:add(group_local, pair(jecs.ChildOf, g))
+
+	c.net.reconcile_packet(
+		entity_list_packet({ group_id, member_id }, { group_id + generation, member_id + generation })
+	)
+
+	expect_equal(c.world:contains(g), false, "old group deleted")
+	expect_equal(c.world:contains(m), false, "old member deleted")
+	expect_equal(c.world:contains(group_local), false, "old group's local dependent deleted")
+	expect_equal(c.net.get_client_entity(group_id), nil, "the old group's generation no longer resolves")
+	expect_equal(c.net.get_client_entity(member_id), nil, "the old member's generation no longer resolves")
+
+	local new_g = c.net.get_client_entity(group_id + generation)
+	local new_m = c.net.get_client_entity(member_id + generation)
+	expect(new_g ~= nil and c.world:contains(new_g), "the group's new tenant is created")
+	expect(new_m ~= nil and c.world:contains(new_m), "the member's new tenant is created")
+	expect(new_g ~= g and new_m ~= m, "the new tenants are fresh client entities")
+	expect_equal(c.net.get_server_entity(new_g), group_id + generation, "new group maps back to its generation")
+	expect_equal(c.net.get_server_entity(new_m), member_id + generation, "new member maps back to its generation")
+	expect_equal(c.world:target(new_m, jecs.ChildOf), nil, "the new member inherits no parent")
+
+	expect_equal(c.world:contains(survivor), true, "the group's undeleted imported child survives")
+	expect_equal(c.world:target(survivor, jecs.ChildOf), nil, "survivor detached rather than aliasing a new tenant")
+	expect_equal(c.world:has(survivor, pair(jecs.ChildOf, new_g)), false, "survivor not parented to the new group")
+end)
+
+test("a deletion batch's removal hooks see its members deleted, never detached, and already unmapped", function(env)
+	-- a packet's deletions apply as one batch: every deleted entity's mapping ends before any deletion runs, and
+	-- a dependent the same packet deletes goes down with its target rather than being detached from it first.
+	-- the group leads the list, the order in which a one-at-a-time pass would detach the member.
+	local c = env.client
+	local group_id, member_id, survivor_id = 100031, 100032, 100033
+	local g = import_entity(c, group_id)
+	local m = import_entity(c, member_id)
+	local survivor = import_entity(c, survivor_id)
+	local calls = {}
+	c.world:removed(jecs.ChildOf, function(entity, _, delete)
+		table.insert(calls, { entity = entity, delete = delete, mapped = c.net.get_server_entity(entity) })
+	end)
+	c.world:add(m, pair(jecs.ChildOf, g))
+	c.world:add(survivor, pair(jecs.ChildOf, g))
+
+	c.net.reconcile_packet(entity_list_packet({ group_id, member_id }, nil))
+
+	local member_calls = {}
+	local survivor_calls = {}
+	for _, call in calls do
+		if call.entity == m then
+			table.insert(member_calls, call)
+		elseif call.entity == survivor then
+			table.insert(survivor_calls, call)
+		end
+	end
+	expect_equal(#member_calls, 1, "the member's pair is removed once")
+	expect_equal(member_calls[1].delete, true, "the member's pair goes with its own deletion")
+	expect_equal(member_calls[1].mapped, nil, "the member is already unmapped inside the hook")
+	expect_equal(#survivor_calls, 1, "the survivor's pair is removed once")
+	expect_equal(survivor_calls[1].delete, nil, "the survivor's pair is detached, not deleted")
+	expect_equal(survivor_calls[1].mapped, survivor_id, "the survivor is still mapped inside the hook")
+	expect_equal(c.world:contains(m), false, "member deleted")
+	expect_equal(c.world:contains(survivor), true, "survivor survives")
+end)
+
+test("a server-side group delete and revoke each reconcile in one packet, sparing client-side survivors", function(env)
+	local s, c = env.server, env.client
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true })
+	local members = {}
+	for i = 1, 8 do
+		local member = s.world:entity()
+		s.world:add(member, s.net.Replicated)
+		s.world:set(member, s.defs.Health, i)
+		s.world:add(member, pair(jecs.ChildOf, group))
+		s.world:add(member, pair(s.net.InheritsPrivacy, group))
+		members[i] = member
+	end
+	-- an imported entity outside the group the client parents to the group locally
+	local outsider = s.world:entity()
+	s.world:add(outsider, s.net.Replicated)
+	env.sync(env.player_a)
+
+	local lg = c.net.get_client_entity(group)
+	local lmembers = {}
+	for i, member in members do
+		lmembers[i] = c.net.get_client_entity(member)
+		expect_equal(c.world:has(lmembers[i], pair(jecs.ChildOf, lg)), true, `member {i} parented before the revoke`)
+	end
+	local loutsider = c.net.get_client_entity(outsider)
+	c.world:add(loutsider, pair(jecs.ChildOf, lg))
+	local visual = c.world:entity()
+	c.world:add(visual, pair(jecs.ChildOf, lmembers[1]))
+
+	-- revoking the group's visibility deletes it and every member from the client in one packet
+	s.world:set(group, s.net.Private, {})
+	local packet = env.sync(env.player_a)
+	expect_equal(#packet.unreplicated, 9, "the revoke deletes the group and its members in one packet")
+	expect_equal(c.world:contains(lg), false, "group deleted by the revoke")
+	for i, member in members do
+		expect_equal(c.world:contains(lmembers[i]), false, `member {i} deleted by the revoke`)
+		expect_equal(c.net.get_client_entity(member), nil, `member {i}'s mapping ends`)
+	end
+	expect_equal(c.world:contains(visual), false, "a member's local dependent deleted")
+	expect_equal(c.world:contains(loutsider), true, "the client-parented outsider survives")
+	expect_equal(c.world:target(loutsider, jecs.ChildOf), nil, "outsider detached from the revoked group")
+
+	-- re-admitting recreates them, parented again
+	s.world:set(group, s.net.Private, { [env.player_a] = true })
+	env.sync(env.player_a)
+	local lg2 = c.net.get_client_entity(group)
+	expect(lg2 ~= nil and c.world:contains(lg2), "group recreated on re-admit")
+	for i, member in members do
+		local lm = c.net.get_client_entity(member)
+		expect(lm ~= nil and c.world:contains(lm), `member {i} recreated on re-admit`)
+		expect_equal(c.world:has(lm, pair(jecs.ChildOf, lg2)), true, `member {i} parented again`)
+		expect_equal(c.world:get(lm, c.defs.Health), i, `member {i} carries its value again`)
+	end
+
+	-- deleting the group server-side cascades through the members there and deletes them all client-side
+	s.world:delete(group)
+	packet = env.sync(env.player_a)
+	expect_equal(#packet.unreplicated, 9, "the delete removes the group and its members in one packet")
+	expect_equal(c.world:contains(lg2), false, "group deleted")
+	for i, member in members do
+		expect_equal(c.net.get_client_entity(member), nil, `member {i} deleted with the group`)
+	end
+	expect_equal(c.world:contains(loutsider), true, "the outsider still survives")
 end)
 
 -- 10) overrides

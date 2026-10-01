@@ -33,7 +33,7 @@
 --   spawn  -- (a) the gate and its N members spawned in one frame; client = an exported player reconciling
 --     the frame's creations.
 --   delete -- (d) world:delete(group) in one frame, the InheritsPrivacy and ChildOf cascades deleting every
---     member; client = an exported player reconciling N + 1 deletions through safe_delete. Spawn and delete
+--     member; client = an exported player reconciling N + 1 deletions in one batch. Spawn and delete
 --     alternate in one loop, so every rep is one full group lifecycle.
 --   admit  -- (b) a player who sees the gate but not its members being added to the export whitelist, a
 --     whole-group visibility flip; client = that player reconciling N creations.

@@ -89,7 +89,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- while recycled dense keys revive their slot in place. server-dense keys stay unambiguous because the
 	-- server never holds two live entities on one dense id and reconcile applies deletes before creates;
 	-- client-dense keys because every mapping-ending path clears the entry (the unreplicated list via
-	-- delete_client_entity, the Imported removed hook behind everything else). what dense keys give up is
+	-- delete_client_entities, the Imported removed hook behind everything else). what dense keys give up is
 	-- stale-reference rejection by key identity, so reads split by caller: internal reads index directly with
 	-- entities known live (archetype walks, contains-guarded lookups, or the removed hook's mid-teardown entity,
 	-- whose dense slot cannot have recycled yet), while the public get_server_entity guards with the
@@ -206,49 +206,80 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- prevents cascading (OnDeleteTarget, Delete) into imported entities, which might still exist on the server
-	-- with Replicated dependents. pairs referencing this entity that exist only locally are *not* renewed if the
-	-- entity gets Replicated again.
-	local function safe_delete(client_entity: Entity)
+	-- applies a packet's deletion list (`count` dense server ids at data[offset]) as one batch, returning the
+	-- offset past it. deleting must not cascade (OnDeleteTarget, Delete) into imported entities the packet
+	-- doesn't delete, which might still exist on the server with Replicated dependents: those are detached
+	-- instead. pairs referencing a deleted entity that exist only locally are *not* renewed if the entity gets
+	-- Replicated again.
+	--
+	-- the batch semantics: every listed entity's mapping ends first, before anything is classified or deleted,
+	-- so the walk below reads a dependent the same packet deletes as local -- already queued, so neither walked
+	-- again nor detached moments before its own deletion -- and an imported dependent is exactly one the packet
+	-- leaves mapped. it also means hooks fired by any of the batch's deletions see every entity the packet
+	-- deletes as unmapped, the way an entity always was inside its own deletion's hooks.
+	local function delete_client_entities(data: buffer, offset: number, count: number): number
+		local queue = table.create(count) :: { Entity }
+		local visited = {} :: { [Entity]: true }
+		local queued = 0
+		for _ = 1, count do
+			local server_entity = read_id(data, offset)
+			offset += id_width
+			local client_entity = client_entity_map[server_entity]
+			if client_entity ~= nil then
+				remove_references(client_entity, server_entity)
+				-- visited dedupes a client entity mapped under two listed server ids; the liveness check is
+				-- defensive (the Imported removed hook ends a deleted entity's mapping), keeping a dead entity's
+				-- recycled dense slot out of the walk's pair lookups
+				if visited[client_entity] == nil and world:contains(client_entity) then
+					visited[client_entity] = true
+					queued += 1
+					queue[queued] = client_entity
+				end
+			end
+		end
+		if queued == 0 then
+			return offset
+		end
+
+		-- the cleanup relations, resolved once per batch rather than once per walked entity
+		local relations = {} :: { Entity }
+		for relation in world:each(pair(jecs.OnDeleteTarget, jecs.Delete)) do
+			table.insert(relations, relation)
+		end
+
 		-- walks the local (OnDeleteTarget, Delete) closure without deleting yet: detaches imported dependents
 		-- (removing the iterated pair is iteration-safe) and queues local ones; visited keeps cyclical relations
-		-- from re-queueing.
-		local queue = { client_entity }
-		local visited = { [client_entity] = true } :: { [Entity]: true }
-		local count = 1
+		-- from re-queueing. an entity no pair targets has no dependents at all, so its walk is skipped outright
+		-- -- the common case for a group's members.
 		local index = 0
-		while index < count do
+		while index < queued do
 			index += 1
 			local entity = queue[index]
-			for relation in world:each(pair(jecs.OnDeleteTarget, jecs.Delete)) do
+			if component_index[pair(jecs.Wildcard, entity)] == nil then
+				continue
+			end
+			for _, relation in relations do
 				for dependent in world:each(pair(relation, entity)) do
 					if get_server_entity(dependent) then
 						world:remove(dependent, pair(relation, entity))
 					elseif visited[dependent] == nil then
 						visited[dependent] = true
-						count += 1
-						queue[count] = dependent
+						queued += 1
+						queue[queued] = dependent
 					end
 				end
 			end
 		end
 
-		-- with every imported dependent detached, deletion order is free; an entity a prior iteration already
+		-- with every imported dependent detached, deletion order is free; an entity an earlier deletion already
 		-- cascade-deleted is skipped.
-		for i = 1, count do
+		for i = 1, queued do
 			local entity = queue[i]
 			if world:contains(entity) then
 				world:delete(entity)
 			end
 		end
-	end
-
-	local function delete_client_entity(server_entity: number)
-		local client_entity = client_entity_map[server_entity]
-		if client_entity then
-			remove_references(client_entity, server_entity)
-			safe_delete(client_entity)
-		end
+		return offset
 	end
 
 	local function on_imported_added(client_entity: Entity, id: Id)
@@ -269,12 +300,12 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if id ~= Imported then
 			return
 		end
-		-- covers deletions that bypass delete_client_entity (cascades). the client should avoid adding
-		-- (OnDeleteTarget, Delete) to imported entities; the resulting mismatch is *not* auto-corrected. the raw
-		-- read (not get_server_entity) is deliberate: this can fire inside world:delete's teardown, where the
-		-- liveness guard must not decide anything (the pinned jecs keeps the dying entity alive-indexed until its
-		-- removed hooks have run, but that isn't contractual); the dense slot cannot recycle before the deletion
-		-- completes, so the read is unambiguous.
+		-- covers deletions outside reconcile's deletion batch (local ones and their cascades), which ends its own
+		-- mappings up front. the client should avoid adding (OnDeleteTarget, Delete) to imported entities; the
+		-- resulting mismatch is *not* auto-corrected. the raw read (not get_server_entity) is deliberate: this can
+		-- fire inside world:delete's teardown, where the liveness guard must not decide anything (the pinned jecs
+		-- keeps the dying entity alive-indexed until its removed hooks have run, but that isn't contractual); the
+		-- dense slot cannot recycle before the deletion completes, so the read is unambiguous.
 		local server_entity = server_entity_map[dense(client_entity)]
 		if server_entity then
 			remove_references(client_entity, server_entity)
@@ -1006,9 +1037,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- the layout in wire.luau)
 		check_version(data)
 		local _, offset, unreplicated_count, replicated_count, names_count = read_packet_header(data)
-		for _ = 1, unreplicated_count do
-			delete_client_entity(read_id(data, offset))
-			offset += id_width
+		if unreplicated_count > 0 then
+			offset = delete_client_entities(data, offset, unreplicated_count)
 		end
 		for _ = 1, replicated_count do
 			create_client_entity(read_gen_id(data, offset))
