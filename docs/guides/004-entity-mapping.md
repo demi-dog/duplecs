@@ -34,6 +34,18 @@ end)
 
 Never send a client id raw — it means nothing (or worse, something else) in the server world. In the other direction, when a server value *embeds* an entity id, the client must translate it on arrival with `get_client_entity` — a [changed override](010-overrides.md) is the tool for that.
 
+An entity being deleted still resolves through `get_server_entity` inside the `world:removed` hooks its deletion fires, whether the server deleted it or your own code did. A system keeping its own state by server id (pending requests, say) can clean up from a removed hook on its own component:
+
+```lua
+-- client
+world:removed(c.Health, function(entity)
+	local server_id = net.get_server_entity(entity)
+	if server_id then
+		pending_heals[server_id] = nil
+	end
+end)
+```
+
 ## Manual mapping: `set_client_entity`
 
 `set_client_entity(server_id, client_entity)` registers a mapping by hand. Two uses:

@@ -142,7 +142,7 @@ Registers a mapping between a server id and a client entity and tags the client 
 Returns the client entity mapped to a server id, or `nil` if unmapped. Pass the full gen-qualified id as learned from `get_server_entity` or a creation/names entry — a stale generation resolves to `nil` rather than to the slot's current tenant.
 
 #### `client.get_server_entity(client_entity: Entity) -> number?`
-Returns the server id for a client entity, or `nil` if it has no mapping. This is the id to send to the server when referencing an entity in a request.
+Returns the server id for a client entity, or `nil` if it has no mapping. This is the id to send to the server when referencing an entity in a request. A mapped entity being deleted still resolves inside the `world:removed` hooks its deletion fires.
 
 #### `client.set_changed_override<T>(component: Id<T>, on_changed: ChangedOverride<T>?)`
 Registers (or clears, when `nil`) the handler invoked during reconciliation for the component's set and `nulled` entries, replacing the default `world:set`/`world:add`. A pair with a wildcard target registers per-relation; concrete pairs without their own override fall back to their relation's. Typical uses: client-side prediction, and translating server ids embedded in payloads.

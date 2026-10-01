@@ -2323,6 +2323,32 @@ test("set_client_entity rejects remapping a live server id", function(env)
 	expect_equal(c.world:has(spare, c.net.Imported), true, "and the client entity is tagged Imported")
 end)
 
+test("set_client_entity rejects a dead client entity and maps nothing", function(env)
+	-- nothing would ever end a mapping onto a dead entity: the server id would resolve to it, and its dense slot's
+	-- next tenant inherit the reverse entry
+	local s, c = env.server, env.client
+	local e = s.world:entity()
+	local dead = c.world:entity()
+	c.world:delete(dead)
+	expect_error(function()
+		c.net.set_client_entity(e, dead)
+	end, "mapping onto a dead client entity", "is deleted or being deleted, so it cannot be mapped")
+	expect_equal(c.net.get_client_entity(e), nil, "the server id maps to nothing")
+
+	local reborn = mint_recycled(c.world, dead)
+	expect_equal(c.net.get_server_entity(reborn), nil, "the dead entity's dense slot's next tenant resolves nothing")
+
+	-- the server id's creation then behaves as if the call never happened
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 4)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect(le ~= nil and le ~= dead and le ~= reborn, "the creation minted a fresh client entity")
+	expect_equal(c.net.get_server_entity(le), e, "which resolves to the server id")
+	expect_equal(c.world:get(le, c.defs.Health), 4, "and carries the created entity's value")
+	expect_equal(c.net.get_server_entity(reborn), nil, "while the tenant still resolves nothing")
+end)
+
 test("a pre-mapped creation adopts the prepared client entity (client-side prediction)", function(env)
 	local s, c = env.server, env.client
 	local e = s.world:entity()
@@ -2463,6 +2489,306 @@ test("locally cascade-deleting an imported entity tears down its mapping", funct
 	expect_equal(c.world:contains(le), false, "imported entity cascade-deleted locally")
 	expect_equal(c.net.get_client_entity(e), nil, "mapping torn down by the Imported removal hook")
 	expect_equal(c.net.get_server_entity(le), nil, "and the reverse mapping went with it")
+end)
+
+-- a deleted imported entity's mapping ends in two steps (see begin_teardown in client.luau): the server id stops
+-- resolving the moment the deletion begins, while the entity itself resolves to its server id through every
+-- removed hook the deletion fires, whatever the hooked component's id, until the deletion completes. the tests
+-- below pin that for local deletions; section 9 pins it for a packet's deletion batch.
+
+test("jecs keeps a dying entity alive-indexed through every removed hook its deletion fires", function()
+	-- the precondition of the mid-deletion mapping: get_server_entity guards with the generation-aware
+	-- world:contains, so a dying entity resolves inside its removed hooks only while jecs still indexes it as
+	-- alive there. hooks on ids sorting before and after a third id cover both sides of Imported's own hook,
+	-- and a cascade-deleted child's hooks must see both the child and its dying parent alive.
+	local message =
+		"precondition no longer holds: jecs no longer keeps a dying entity alive-indexed inside its removed hooks -- if jecs changed world:delete's order, a deleted imported entity no longer resolves to its server id from its own removed hooks (see begin_teardown in client.luau)"
+	local world = jecs.world()
+	local Before = world:component()
+	local Middle = world:entity()
+	local After = world:entity()
+	expect(Before < Middle and Middle < After, "the ids sort before and after Middle")
+
+	local parent = world:entity()
+	world:set(parent, Before, 1)
+	world:add(parent, Middle)
+	world:add(parent, After)
+	local child = world:entity()
+	world:set(child, Before, 2)
+	world:add(child, After)
+	world:add(child, pair(jecs.ChildOf, parent))
+
+	local seen = {}
+	for name, id in { Before = Before, Middle = Middle, After = After } do
+		world:removed(id, function(entity, _, delete)
+			table.insert(seen, {
+				key = `{if entity == parent then "parent" else "child"} {name}`,
+				delete = delete,
+				alive = world:contains(entity),
+				parent_alive = world:contains(parent),
+			})
+		end)
+	end
+
+	world:delete(parent)
+
+	local fired = {}
+	for _, call in seen do
+		fired[call.key] = true
+		expect_equal(call.delete, true, `{call.key}: the hook fired for the deletion`)
+		expect(call.alive == true and call.parent_alive == true, `{call.key}: {message}`)
+	end
+	for _, key in { "parent Before", "parent Middle", "parent After", "child Before", "child After" } do
+		expect(fired[key] ~= nil, `{key}'s removed hook fired`)
+	end
+	expect_equal(world:contains(parent), false, "the parent is gone once the deletion returns")
+	expect_equal(world:contains(child), false, "and so is its child")
+end)
+
+-- registers removed hooks on Health and Burning -- Health a component minted below Imported, Burning an entity
+-- minted above it, so their hooks fire on either side of Imported's own in a dying entity's sorted types --
+-- recording how the mapping between client_entity and server_entity resolved from inside each. returns the
+-- records, keyed by definition name, for expect_resolved_mid_deletion.
+local function observe_mapping_in_removed_hooks(c, client_entity, server_entity)
+	expect(
+		c.defs.Health < c.net.Imported and c.net.Imported < c.defs.Burning,
+		"precondition: Health's id sorts before Imported's and Burning's after it"
+	)
+	local seen = {}
+	for _, name in { "Health", "Burning" } do
+		c.world:removed(c.defs[name], function(entity, _, delete)
+			if entity ~= client_entity then
+				return
+			end
+			seen[name] = {
+				delete = delete,
+				server = c.net.get_server_entity(entity),
+				client = c.net.get_client_entity(server_entity),
+			}
+		end)
+	end
+	return seen
+end
+
+-- the mid-deletion half of a deleted mapping's end, as the helper above observed it: inside both hooks the dying
+-- entity resolves to its exact server id, while the server id resolves to nothing once the teardown has begun.
+-- a packet's deletion batch begins it before any deletion runs, so pass packet_deletion to check the hook
+-- below Imported's too; a local deletion begins it only in Imported's own removed hook, and what a hook on a
+-- lower id sees there is deliberately unspecified.
+local function expect_resolved_mid_deletion(seen, server_entity, label, packet_deletion)
+	for _, name in { "Health", "Burning" } do
+		local call = seen[name]
+		expect(call ~= nil, `{label}: {name}'s removed hook fired`)
+		expect_equal(call.delete, true, `{label}: {name} went with the entity's deletion`)
+		expect_equal(call.server, server_entity, `{label}: the entity resolves to its server id inside {name}'s hook`)
+	end
+	if packet_deletion then
+		expect_equal(
+			seen.Health.client,
+			nil,
+			`{label}: the server id resolves to nothing inside the hook below Imported's`
+		)
+	end
+	expect_equal(
+		seen.Burning.client,
+		nil,
+		`{label}: the server id resolves to nothing inside the hook above Imported's`
+	)
+end
+
+-- a Replicated server entity with a nonzero generation (so a resolved id is checked whole, not just its dense
+-- half), carrying Health and Burning, synced to A's client. returns the server entity and its client entity.
+local function replicate_recycled_entity(env)
+	local s, c = env.server, env.client
+	local first = s.world:entity()
+	s.world:delete(first)
+	local e = s.world:entity()
+	expect(
+		jecs.ECS_ID(e) == jecs.ECS_ID(first) and e ~= first,
+		"precondition: jecs did not recycle the deleted id, scenario cannot be tested"
+	)
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 1)
+	s.world:add(e, s.defs.Burning)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	expect(le ~= nil, "precondition: the server entity is mapped to a client entity")
+	expect(c.world:has(le, c.defs.Burning), "precondition: the client entity carries both hooked definitions")
+	return e, le
+end
+
+-- registers removed hooks on the named definitions that each try to map server_entity onto client_entity as it
+-- dies, recording each attempt's outcome by definition name for expect_mapping_refused. the call is pcalled
+-- inside the hook, since an error escaping a jecs hook would abort the deletion midway.
+local function attempt_mapping_in_removed_hooks(c, client_entity, server_entity, names)
+	local attempts = {}
+	for _, name in names do
+		c.world:removed(c.defs[name], function(entity, _, delete)
+			if entity ~= client_entity then
+				return
+			end
+			local ok, err = pcall(c.net.set_client_entity, server_entity, entity)
+			attempts[name] = { delete = delete, ok = ok, err = tostring(err) }
+		end)
+	end
+	return attempts
+end
+
+-- every attempt the helper above recorded was refused as mapping a dying entity
+local function expect_mapping_refused(attempts, names, label)
+	for _, name in names do
+		local attempt = attempts[name]
+		expect(attempt ~= nil, `{label}: {name}'s removed hook fired`)
+		expect_equal(attempt.delete, true, `{label}: {name} went with the entity's deletion`)
+		expect_equal(attempt.ok, false, `{label}: mapping the dying entity inside {name}'s hook errored`)
+		expect(
+			string.find(attempt.err, "is deleted or being deleted, so it cannot be mapped", 1, true) ~= nil,
+			`{label}: the error inside {name}'s hook names the dying entity, got {attempt.err}`
+		)
+	end
+end
+
+-- once a deletion that refused a mapping onto its entity returns, nothing of the refused mapping lingers: the
+-- server id resolves nothing, the dead entity's dense slot's next tenant resolves nothing (also past the next
+-- packet's collection), and the server id stays free to map
+local function expect_refused_mapping_left_nothing(env, dead, server_entity, label)
+	local c = env.client
+	expect_equal(c.world:contains(dead), false, `{label}: the entity is gone`)
+	expect_equal(c.net.get_client_entity(server_entity), nil, `{label}: the refused server id maps to nothing`)
+	local reborn = mint_recycled(c.world, dead)
+	expect_equal(c.net.get_server_entity(reborn), nil, `{label}: the dead entity's next tenant resolves nothing`)
+	env.sync(env.player_a)
+	expect_equal(c.net.get_server_entity(reborn), nil, `{label}: nor does it once the next packet lands`)
+	expect_equal(c.net.get_client_entity(server_entity), nil, `{label}: and the refused server id still maps nothing`)
+	c.net.set_client_entity(server_entity, reborn)
+	expect_equal(c.net.get_client_entity(server_entity), reborn, `{label}: the refused server id maps normally`)
+	expect_equal(c.net.get_server_entity(reborn), server_entity, `{label}: onto the tenant, which resolves it back`)
+end
+
+test(
+	"a local deletion's removal hooks resolve the imported entity to its server id on either side of Imported",
+	function(env)
+		local s, c = env.server, env.client
+		local e, le = replicate_recycled_entity(env)
+		local other = s.world:entity()
+		s.world:add(other, s.net.Replicated)
+		env.sync(env.player_a)
+		local lother = c.net.get_client_entity(other)
+
+		local seen = observe_mapping_in_removed_hooks(c, le, e)
+		c.world:delete(le)
+
+		expect_resolved_mid_deletion(seen, e, "local deletion")
+		expect_equal(c.world:contains(le), false, "the imported entity is gone")
+		expect_equal(c.net.get_server_entity(le), nil, "the dead entity resolves nothing once the deletion returns")
+		expect_equal(c.net.get_client_entity(e), nil, "nor does its server id")
+
+		-- the server still holds the entity, so its sections keep arriving: as a subject the id skips silently, as a
+		-- pair target it warns like any unmapped target
+		s.world:set(e, s.defs.Health, 2)
+		env.sync(env.player_a)
+		expect_equal(c.net.get_client_entity(e), nil, "the subject's section left the server id unmapped")
+		s.world:set(other, pair(s.defs.Likes, e), 3)
+		expected_warning("section's pair target")
+		env.sync(env.player_a)
+		expect_equal(c.world:target(lother, c.defs.Likes), nil, "the pair aimed at the deleted entity was skipped")
+		expect_equal(c.net.get_client_entity(e), nil, "and the server id stays unmapped")
+	end
+)
+
+test("a local cascade into an imported entity resolves it to its server id inside its removal hooks", function(env)
+	local c = env.client
+	local e, le = replicate_recycled_entity(env)
+	local lp = c.world:entity()
+	c.world:add(le, pair(jecs.ChildOf, lp))
+
+	local seen = observe_mapping_in_removed_hooks(c, le, e)
+	c.world:delete(lp)
+
+	expect_resolved_mid_deletion(seen, e, "local cascade")
+	expect_equal(c.world:contains(le), false, "the imported child was cascade-deleted")
+	expect_equal(c.net.get_server_entity(le), nil, "the dead child resolves nothing once the deletion returns")
+	expect_equal(c.net.get_client_entity(e), nil, "nor does its server id")
+end)
+
+test("an entity reusing a locally deleted imported entity's dense id inherits none of its mapping", function(env)
+	-- a local deletion leaves the dead entity's reverse entry standing until the next packet collects it (see
+	-- tearing_down in client.luau); the dense slot's next tenant must never read it as its own, and a mapping the
+	-- tenant gains before that packet must survive the collection
+	local s, c = env.server, env.client
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	local parent = s.world:entity()
+	s.world:add(parent, s.net.Replicated)
+	local f = s.world:entity()
+	s.world:add(f, s.net.Replicated)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+	local lparent = c.net.get_client_entity(parent)
+	local lf = c.net.get_client_entity(f)
+
+	c.world:delete(le)
+	local reborn = mint_recycled(c.world, le)
+	expect_equal(c.net.get_server_entity(reborn), nil, "the new tenant resolves no server id")
+	expect_equal(c.net.get_client_entity(e), nil, "and the dead entity's server id resolves nothing")
+	expect_error(function()
+		c.world:add(reborn, c.net.Imported)
+	end, "adding Imported to the unmapped new tenant", "cannot be added to entities with no server mapping")
+
+	-- the tenant predicts a server entity before its creation arrives; the packet carrying it collects the dead
+	-- entity's entry first, which must leave the tenant's own mapping standing
+	local predicted = s.world:entity()
+	c.net.set_client_entity(predicted, reborn)
+	expect_equal(c.net.get_server_entity(reborn), predicted, "the tenant resolves its own mapping")
+	s.world:add(predicted, s.net.Replicated)
+	s.world:set(predicted, s.defs.Health, 9)
+	env.sync(env.player_a)
+	expect_equal(c.net.get_client_entity(predicted), reborn, "the creation adopted the tenant")
+	expect_equal(c.net.get_server_entity(reborn), predicted, "the collection left the tenant's mapping standing")
+	expect_equal(c.world:get(reborn, c.defs.Health), 9, "and the predicted entity's value landed on it")
+	env.sync(env.player_a)
+	expect_equal(c.net.get_server_entity(reborn), predicted, "a following packet leaves it standing too")
+
+	-- an unmapped tenant depending on an imported entity is local to the packet that deletes its target
+	c.world:delete(lf)
+	local local_tenant = mint_recycled(c.world, lf)
+	c.world:add(local_tenant, pair(jecs.ChildOf, lparent))
+	s.world:delete(parent)
+	env.sync(env.player_a)
+	expect_equal(c.world:contains(lparent), false, "the imported parent was deleted")
+	expect_equal(c.world:contains(local_tenant), false, "the unmapped tenant was cascade-deleted, not detached")
+end)
+
+test("set_client_entity rejects an imported entity whose local deletion's teardown has begun", function(env)
+	-- the teardown begins in Imported's removed hook, so a hook on an id sorting after Imported's sees it. what a
+	-- hook on a lower id sees is deliberately unspecified, so only Burning's is checked.
+	local s, c = env.server, env.client
+	local e, le = replicate_recycled_entity(env)
+	expect(c.net.Imported < c.defs.Burning, "precondition: Burning's id sorts after Imported's")
+	local fresh = s.world:entity()
+
+	local attempts = attempt_mapping_in_removed_hooks(c, le, fresh, { "Burning" })
+	c.world:delete(le)
+
+	expect_mapping_refused(attempts, { "Burning" }, "local deletion")
+	expect_equal(c.net.get_client_entity(e), nil, "the deleted entity's own server id resolves nothing")
+	expect_refused_mapping_left_nothing(env, le, fresh, "local deletion")
+end)
+
+test("removing Imported from a live entity ends its mapping at once", function(env)
+	local s, c = env.server, env.client
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	env.sync(env.player_a)
+	local le = c.net.get_client_entity(e)
+
+	c.world:remove(le, c.net.Imported)
+
+	expect_equal(c.world:contains(le), true, "the client entity stays")
+	expect_equal(c.net.get_server_entity(le), nil, "the entity resolves no server id")
+	expect_equal(c.net.get_client_entity(e), nil, "nor does the server id resolve to it")
+	env.sync(env.player_a)
+	expect_equal(c.net.get_server_entity(le), nil, "a following packet restores nothing")
 end)
 
 -- 9) client deletion semantics (delete_client_entities)
@@ -2751,41 +3077,170 @@ test("a packet deleting a group and recreating its recycled ids starts the new t
 	expect_equal(c.world:has(survivor, pair(jecs.ChildOf, new_g)), false, "survivor not parented to the new group")
 end)
 
-test("a deletion batch's removal hooks see its members deleted, never detached, and already unmapped", function(env)
-	-- a packet's deletions apply as one batch: every deleted entity's mapping ends before any deletion runs, and
-	-- a dependent the same packet deletes goes down with its target rather than being detached from it first.
-	-- the group leads the list, the order in which a one-at-a-time pass would detach the member.
-	local c = env.client
-	local group_id, member_id, survivor_id = 100031, 100032, 100033
-	local g = import_entity(c, group_id)
-	local m = import_entity(c, member_id)
-	local survivor = import_entity(c, survivor_id)
-	local calls = {}
-	c.world:removed(jecs.ChildOf, function(entity, _, delete)
-		table.insert(calls, { entity = entity, delete = delete, mapped = c.net.get_server_entity(entity) })
-	end)
-	c.world:add(m, pair(jecs.ChildOf, g))
-	c.world:add(survivor, pair(jecs.ChildOf, g))
+test(
+	"a deletion batch's removal hooks see its members deleted, never detached, and still resolving to their server ids",
+	function(env)
+		-- a packet's deletions apply as one batch: every deleted entity's teardown begins before any deletion runs --
+		-- its server id stops resolving, while the entity itself resolves to that id until its deletion completes --
+		-- and a dependent the same packet deletes goes down with its target rather than being detached from it
+		-- first. the group leads the list, the order in which a one-at-a-time pass would detach the member.
+		local c = env.client
+		local group_id, member_id, survivor_id = 100031, 100032, 100033
+		local g = import_entity(c, group_id)
+		local m = import_entity(c, member_id)
+		local survivor = import_entity(c, survivor_id)
+		local calls = {}
+		c.world:removed(jecs.ChildOf, function(entity, _, delete)
+			table.insert(calls, {
+				entity = entity,
+				delete = delete,
+				mapped = c.net.get_server_entity(entity),
+				group_mapped = c.net.get_server_entity(g),
+				member_resolved = c.net.get_client_entity(member_id),
+			})
+		end)
+		c.world:add(m, pair(jecs.ChildOf, g))
+		c.world:add(survivor, pair(jecs.ChildOf, g))
 
-	c.net.reconcile_packet(entity_list_packet({ group_id, member_id }, nil))
+		c.net.reconcile_packet(entity_list_packet({ group_id, member_id }, nil))
+
+		local member_calls = {}
+		local survivor_calls = {}
+		for _, call in calls do
+			if call.entity == m then
+				table.insert(member_calls, call)
+			elseif call.entity == survivor then
+				table.insert(survivor_calls, call)
+			end
+		end
+		expect_equal(#member_calls, 1, "the member's pair is removed once")
+		expect_equal(member_calls[1].delete, true, "the member's pair goes with its own deletion")
+		expect_equal(member_calls[1].mapped, member_id, "the member still resolves to its server id inside the hook")
+		expect_equal(member_calls[1].group_mapped, group_id, "and so does the group whose deletion cascaded into it")
+		expect_equal(member_calls[1].member_resolved, nil, "while the member's server id already resolves to nothing")
+		expect_equal(#survivor_calls, 1, "the survivor's pair is removed once")
+		expect_equal(survivor_calls[1].delete, nil, "the survivor's pair is detached, not deleted")
+		expect_equal(survivor_calls[1].mapped, survivor_id, "the survivor is still mapped inside the hook")
+		expect_equal(c.world:contains(m), false, "member deleted")
+		expect_equal(c.world:contains(survivor), true, "survivor survives")
+		expect_equal(c.net.get_server_entity(m), nil, "the deleted member resolves nothing once the batch returns")
+		expect_equal(c.net.get_server_entity(g), nil, "nor does the deleted group")
+	end
+)
+
+test(
+	"a replicated deletion's removal hooks resolve the entity to its server id on either side of Imported",
+	function(env)
+		local s, c = env.server, env.client
+		local e, le = replicate_recycled_entity(env)
+
+		local seen = observe_mapping_in_removed_hooks(c, le, e)
+		s.world:delete(e)
+		local packet = env.sync(env.player_a)
+
+		expect_equal(packet.unreplicated[1], jecs.ECS_ID(e), "precondition: the packet deletes the entity")
+		expect_resolved_mid_deletion(seen, e, "replicated deletion", true)
+		expect_equal(c.world:contains(le), false, "the client entity is gone")
+		expect_equal(c.net.get_server_entity(le), nil, "the dead entity resolves nothing once reconcile returns")
+		expect_equal(c.net.get_client_entity(e), nil, "nor does its server id")
+	end
+)
+
+test(
+	"set_client_entity rejects an entity mid-way through a replicated deletion, on either side of Imported",
+	function(env)
+		-- the batch begins every member's teardown before deleting any, so hooks on ids below Imported's see it too
+		local s, c = env.server, env.client
+		local e, le = replicate_recycled_entity(env)
+		local fresh = s.world:entity()
+
+		local attempts = attempt_mapping_in_removed_hooks(c, le, fresh, { "Health", "Burning" })
+		s.world:delete(e)
+		local packet = env.sync(env.player_a)
+
+		expect_equal(packet.unreplicated[1], jecs.ECS_ID(e), "precondition: the packet deletes the entity")
+		expect(
+			c.defs.Health < c.net.Imported and c.net.Imported < c.defs.Burning,
+			"precondition: Health's id sorts before Imported's and Burning's after it"
+		)
+		expect_mapping_refused(attempts, { "Health", "Burning" }, "replicated deletion")
+		expect_refused_mapping_left_nothing(env, le, fresh, "replicated deletion")
+	end
+)
+
+test("every member of a deletion batch resolves to its server id from any of the batch's removal hooks", function(env)
+	-- the batch begins every member's teardown before deleting any, so a hook fired by the first deletion still
+	-- resolves the members deleted after it, a local dependent cascade-deleted with a member resolves that
+	-- member, and once a member's own deletion completes it resolves nothing. ids carry a generation so each
+	-- resolution is checked whole.
+	local c = env.make_client()
+	local generation = 2 ^ 24
+	local names = { "a", "b", "d" }
+	local ids = { a = 100091 + generation, b = 100092 + generation, d = 100093 + generation }
+	local members = {}
+	for _, name in names do
+		members[name] = import_entity(c, ids[name])
+		c.world:set(members[name], c.defs.Health, 1)
+	end
+	local dependent = c.world:entity()
+	c.world:set(dependent, c.defs.Health, 2)
+	c.world:add(dependent, pair(jecs.ChildOf, members.a))
 
 	local member_calls = {}
-	local survivor_calls = {}
-	for _, call in calls do
-		if call.entity == m then
+	local dependent_call = nil
+	c.world:removed(c.defs.Health, function(entity, _, delete)
+		local call = { entity = entity, delete = delete, server = {}, client = {} }
+		for _, name in names do
+			call.server[name] = c.net.get_server_entity(members[name])
+			call.client[name] = c.net.get_client_entity(ids[name])
+		end
+		if entity == dependent then
+			dependent_call = call
+		else
 			table.insert(member_calls, call)
-		elseif call.entity == survivor then
-			table.insert(survivor_calls, call)
+		end
+	end)
+
+	local list = {}
+	for _, name in names do
+		table.insert(list, jecs.ECS_ID(ids[name]))
+	end
+	c.net.reconcile_packet(entity_list_packet(list, nil))
+
+	expect_equal(#member_calls, 3, "each member's hook fired once")
+	-- the order the batch deleted its members in is its own business: whichever went first saw every member
+	-- resolve, and each member resolves inside its own hook
+	local first = member_calls[1]
+	for _, name in names do
+		expect_equal(first.server[name], ids[name], `{name} resolves inside the first deletion's hook`)
+		expect_equal(first.client[name], nil, `{name}'s server id resolves to nothing inside it`)
+	end
+	local dead = {}
+	for index, call in member_calls do
+		expect_equal(call.delete, true, `deletion #{index} removed Health with its entity`)
+		for _, name in names do
+			if members[name] == call.entity then
+				expect_equal(call.server[name], ids[name], `{name} resolves inside its own hook`)
+			elseif dead[name] ~= nil then
+				expect_equal(call.server[name], nil, `{name}, deleted earlier, resolves nothing inside a later hook`)
+			end
+		end
+		for _, name in names do
+			if members[name] == call.entity then
+				dead[name] = true
+			end
 		end
 	end
-	expect_equal(#member_calls, 1, "the member's pair is removed once")
-	expect_equal(member_calls[1].delete, true, "the member's pair goes with its own deletion")
-	expect_equal(member_calls[1].mapped, nil, "the member is already unmapped inside the hook")
-	expect_equal(#survivor_calls, 1, "the survivor's pair is removed once")
-	expect_equal(survivor_calls[1].delete, nil, "the survivor's pair is detached, not deleted")
-	expect_equal(survivor_calls[1].mapped, survivor_id, "the survivor is still mapped inside the hook")
-	expect_equal(c.world:contains(m), false, "member deleted")
-	expect_equal(c.world:contains(survivor), true, "survivor survives")
+
+	expect(dependent_call ~= nil, "the local dependent's hook fired")
+	expect_equal(dependent_call.delete, true, "the local dependent was cascade-deleted")
+	expect_equal(dependent_call.server.a, ids.a, "the dependent's hook resolves the member it died with")
+	expect_equal(c.world:contains(dependent), false, "the local dependent is gone")
+	for _, name in names do
+		expect_equal(c.world:contains(members[name]), false, `{name} is deleted`)
+		expect_equal(c.net.get_server_entity(members[name]), nil, `{name} resolves nothing once the batch returns`)
+		expect_equal(c.net.get_client_entity(ids[name]), nil, `{name}'s server id resolves nothing`)
+	end
 end)
 
 -- the tests below pin that the deletion walk follows every cascade jecs's world:delete does, not just pairs whose

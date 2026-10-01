@@ -132,8 +132,20 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- entities known live (archetype walks, contains-guarded lookups, or the removed hook's mid-teardown entity,
 	-- whose dense slot cannot have recycled yet), while the public get_server_entity guards with the
 	-- generation-aware world:contains.
+	--
+	-- a mapping whose client entity is deleted ends in two steps, so removals behave the same whether a
+	-- component goes on its own or with its entity: the server id stops resolving the moment the deletion
+	-- begins (sections and overrides must never reach a dead entity, and reconcile may rebind the id in the
+	-- same packet), while the entity keeps resolving to its server id through every removed hook its
+	-- teardown fires, ending once it is gone (see begin_teardown).
 	local client_entity_map = {} :: { [number]: Entity }
 	local server_entity_map = {} :: { [number]: number }
+
+	-- client entities, by dense id, whose deletion has begun but whose server_entity_map entry is still
+	-- standing. an entry outlives its entity until finish_teardowns drains it, and meanwhile marks the dense
+	-- slot's server_entity_map entry as belonging to that entity alone, so a next tenant of the slot never
+	-- reads it as its own.
+	local tearing_down = {} :: { [number]: Entity }
 
 	-- dense server ids whose mapping a shared-name announcement established: a name retraction may only end
 	-- these (a creation-established mapping ends through the unreplicated list, a manual one belongs to the
@@ -151,16 +163,31 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	local function set_client_entity(server_entity_gen: number, client_entity: Entity)
 		local dense_id = dense(server_entity_gen)
+		local client_dense = dense(client_entity)
 		client_entity_map[dense_id] = client_entity
-		server_entity_map[dense(client_entity)] = server_entity_gen
+		server_entity_map[client_dense] = server_entity_gen
+		-- the entry just written belongs to this entity, superseding any a previous tenant left tearing down
+		tearing_down[client_dense] = nil
 		unmapped_warned[dense_id] = nil
 		world:add(client_entity, Imported)
 	end
 
+	-- whether a client entity known live holds a mapping: a dense slot's entry left standing by a previous
+	-- tenant's teardown is that tenant's alone (see tearing_down)
+	local function is_mapped(client_entity: Entity): boolean
+		local client_dense = dense(client_entity)
+		if server_entity_map[client_dense] == nil then
+			return false
+		end
+		local torn = tearing_down[client_dense]
+		return torn == nil or torn == client_entity
+	end
+
 	-- world:contains is generation-aware, so a caller's dead reference resolves to nil even when its dense slot
-	-- already holds a next tenant's mapping (see the maps above)
+	-- already holds a next tenant's mapping (see the maps above). an entity mid-deletion still resolves: jecs
+	-- keeps it alive-indexed until its removed hooks have run.
 	local function get_server_entity(client_entity: Entity): number?
-		if world:contains(client_entity) ~= true then
+		if world:contains(client_entity) ~= true or not is_mapped(client_entity) then
 			return nil
 		end
 		return server_entity_map[dense(client_entity)]
@@ -224,7 +251,14 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		return nil
 	end
 
+	-- a dead entity, or one whose teardown has begun, would take a mapping nothing ever ends: its teardown's
+	-- finish step is already past or disowned by the write (see set_client_entity), so the server id would
+	-- resolve to a dead entity and the slot's next tenant inherit the entry. a local deletion's hooks on ids below
+	-- Imported's run before its teardown begins, so calls from there pass unseen.
 	local function set_client_entity_public(server_entity_gen: number, client_entity: Entity)
+		if world:contains(client_entity) ~= true or tearing_down[dense(client_entity)] == client_entity then
+			fail(`client entity {id_to_string(client_entity)} is deleted or being deleted, so it cannot be mapped!`)
+		end
 		local existing_entity = client_entity_map[dense(server_entity_gen)]
 		if existing_entity == nil or world:contains(existing_entity) ~= true then
 			set_client_entity(server_entity_gen, client_entity)
@@ -241,6 +275,31 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if client_entity_map[dense_id] == client_entity then
 			client_entity_map[dense_id] = nil
 			name_mapped[dense_id] = nil
+		end
+	end
+
+	-- the first step of ending a deleted entity's mapping (see the maps above): the server id stops resolving,
+	-- while the entity's own server_entity_map entry stands until finish_teardowns. idempotent, since a
+	-- reconcile deletion begins its batch's teardowns up front and the Imported removed hook begins them again
+	-- inside each world:delete.
+	local function begin_teardown(client_entity: Entity, server_entity: number)
+		local dense_id = dense(server_entity)
+		if client_entity_map[dense_id] == client_entity then
+			client_entity_map[dense_id] = nil
+			name_mapped[dense_id] = nil
+		end
+		tearing_down[dense(client_entity)] = client_entity
+	end
+
+	-- the second step: drops the server_entity_map entries of every teardown whose entity is gone. reconcile
+	-- runs it after its own deletions and at the start of each packet, which collects local deletions made
+	-- since; correctness never waits on it (is_mapped disowns a finished teardown's entry), only memory does.
+	local function finish_teardowns()
+		for client_dense, client_entity in tearing_down do
+			if world:contains(client_entity) ~= true then
+				tearing_down[client_dense] = nil
+				server_entity_map[client_dense] = nil
+			end
 		end
 	end
 
@@ -281,11 +340,12 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- instead. pairs referencing a deleted entity that exist only locally are *not* renewed if the entity gets
 	-- Replicated again.
 	--
-	-- the batch semantics: every listed entity's mapping ends first, before anything is classified or deleted,
-	-- so the walk below reads a dependent the same packet deletes as local -- already queued, so neither walked
-	-- again nor detached moments before its own deletion -- and an imported dependent is exactly one the packet
-	-- leaves mapped. it also means hooks fired by any of the batch's deletions see every entity the packet
-	-- deletes as unmapped, the way an entity always was inside its own deletion's hooks.
+	-- the batch semantics: every listed entity is queued, and its teardown begun, before anything is classified
+	-- or deleted, so the walk below reads a dependent the same packet deletes as already queued -- neither
+	-- walked again nor detached moments before its own deletion -- and an imported dependent is exactly one the
+	-- packet leaves mapped. it also means hooks fired by any of the batch's deletions see every entity the
+	-- packet deletes as mid-teardown: each still resolves to its server id, while no listed server id resolves
+	-- to its entity. the teardowns finish once every deletion has run.
 	local function delete_client_entities(data: buffer, offset: number, count: number): number
 		local queue = table.create(count) :: { Entity }
 		local visited = {} :: { [Entity]: true }
@@ -295,14 +355,18 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			offset += id_width
 			local client_entity = client_entity_map[server_entity]
 			if client_entity ~= nil then
-				remove_references(client_entity, server_entity)
-				-- visited dedupes a client entity mapped under two listed server ids; the liveness check is
-				-- defensive (the Imported removed hook ends a deleted entity's mapping), keeping a dead entity's
-				-- recycled dense slot out of the walk's pair lookups
-				if visited[client_entity] == nil and world:contains(client_entity) then
-					visited[client_entity] = true
-					queued += 1
-					queue[queued] = client_entity
+				-- the liveness check is defensive (a deletion begins its entity's teardown, unmapping the server
+				-- id), keeping a dead entity's recycled dense slot out of the walk's pair lookups; visited dedupes
+				-- a client entity mapped under two listed server ids
+				if world:contains(client_entity) ~= true then
+					remove_references(client_entity, server_entity)
+				else
+					begin_teardown(client_entity, server_entity)
+					if visited[client_entity] == nil then
+						visited[client_entity] = true
+						queued += 1
+						queue[queued] = client_entity
+					end
 				end
 			end
 		end
@@ -316,16 +380,20 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		local detach_ids = {} :: { Id }
 		local detached = 0
 
-		-- claims every entity of one archetype that jecs would delete along with `id`: an imported one is
-		-- collected for detaching from it, a local one queued; visited keeps cyclical dependencies from
-		-- re-queueing.
+		-- claims every entity of one archetype that jecs would delete along with `id`: one already queued is
+		-- skipped (visited also keeps cyclical dependencies from re-queueing), an imported one is collected for
+		-- detaching from it, and a local one queued. the queued check comes first, since the batch's own
+		-- entities still read as mapped mid-teardown.
 		local function claim(entities: { Entity }, id: Id)
 			for _, holder in entities do
-				if get_server_entity(holder) then
+				if visited[holder] ~= nil then
+					continue
+				end
+				if is_mapped(holder) then
 					detached += 1
 					detach_holders[detached] = holder
 					detach_ids[detached] = id
-				elseif visited[holder] == nil then
+				else
 					visited[holder] = true
 					queued += 1
 					queue[queued] = holder
@@ -395,6 +463,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				world:delete(entity)
 			end
 		end
+		finish_teardowns()
 
 		-- then finish what jecs 0.11.0's cascade can leave undone (see remove_stale_pairs); a deleted entity
 		-- nothing still targets has no pair(Wildcard, entity) record left, so the common case is one lookup
@@ -420,19 +489,25 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	hooks.added(world, Imported, on_imported_added)
 
-	hooks.removed(world, Imported, function(client_entity: Entity, id: Id)
+	hooks.removed(world, Imported, function(client_entity: Entity, id: Id, delete: boolean?)
 		-- a pair using Imported as its relation never owns a mapping
 		if id ~= Imported then
 			return
 		end
-		-- covers deletions outside reconcile's deletion batch (local ones and their cascades), which ends its own
-		-- mappings up front. the client should avoid adding (OnDeleteTarget, Delete) to imported entities; the
-		-- resulting mismatch is *not* auto-corrected. the raw read (not get_server_entity) is deliberate: this can
-		-- fire inside world:delete's teardown, where the liveness guard must not decide anything (the pinned jecs
-		-- keeps the dying entity alive-indexed until its removed hooks have run, but that isn't contractual); the
-		-- dense slot cannot recycle before the deletion completes, so the read is unambiguous.
+		-- a deletion only begins the teardown: this hook fires at Imported's place in the entity's sorted types,
+		-- and ending the mapping here would let the entity's other removed hooks resolve it or not by component
+		-- id. reconcile's deletion batch has begun its own teardowns already; this covers local deletions and
+		-- their cascades. the client should avoid adding (OnDeleteTarget, Delete) to imported entities; the
+		-- resulting mismatch is *not* auto-corrected. the raw read (not get_server_entity) is unambiguous: the
+		-- entity is mapped (on_imported_added guarantees it while Imported stands), and its dense slot cannot
+		-- recycle before the deletion completes.
 		local server_entity = server_entity_map[dense(client_entity)]
-		if server_entity then
+		if server_entity == nil then
+			return
+		end
+		if delete then
+			begin_teardown(client_entity, server_entity)
+		else
 			remove_references(client_entity, server_entity)
 		end
 	end)
@@ -633,9 +708,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- pairs targeting the entity
 		each_pair_targeting(client_target, function(entities: { Entity }, id: Id)
 			local relation = jecs.pair_first(world, id)
-			if server_entity_map[dense(relation)] ~= nil then
+			if is_mapped(relation) then
 				for _, subject in entities do
-					if server_entity_map[dense(subject)] ~= nil then
+					if is_mapped(subject) then
 						count += 1
 						subjects[count] = subject
 						cell_ids[count] = id
@@ -662,9 +737,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 					local id = archetype_types[i]
 					-- cast: jecs.pair_second's return is Component<unknown>, unrelated to Entity either way
 					local pair_target: Entity = jecs.pair_second(world, id) :: any
-					if pair_target == client_target or server_entity_map[dense(pair_target)] ~= nil then
+					if pair_target == client_target or is_mapped(pair_target) then
 						for _, subject in entities do
-							if server_entity_map[dense(subject)] ~= nil then
+							if is_mapped(subject) then
 								count += 1
 								subjects[count] = subject
 								cell_ids[count] = id
@@ -680,7 +755,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if idr_unpaired ~= nil then
 			for archetype_id in idr_unpaired.records do
 				for _, subject in world_archetypes[archetype_id].entities do
-					if server_entity_map[dense(subject)] ~= nil then
+					if is_mapped(subject) then
 						count += 1
 						subjects[count] = subject
 						cell_ids[count] = client_target
@@ -1140,6 +1215,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- refuse a packet encoded with a different wire format before reading any other field (see check_version /
 		-- the layout in wire.luau)
 		check_version(data)
+		-- collects the mapping entries of imported entities deleted locally since the last packet
+		finish_teardowns()
 		local _, offset, unreplicated_count, replicated_count, names_count = read_packet_header(data)
 		if unreplicated_count > 0 then
 			offset = delete_client_entities(data, offset, unreplicated_count)
