@@ -94,7 +94,7 @@ With pesde, run `pesde add demidog/duplecs`, or declare the dependency in `pesde
 
 ```toml
 [dependencies]
-duplecs = { name = "demidog/duplecs", version = "^1.0.0" }
+duplecs = { name = "demidog/duplecs", version = "^2.0.0" }
 jecs = { wally = "ukendio/jecs", version = "^0.11.0" }
 ```
 
@@ -102,7 +102,7 @@ With Wally, declare it in `wally.toml`:
 
 ```toml
 [dependencies]
-duplecs = "demi-dog/duplecs@^1.0.0"
+duplecs = "demi-dog/duplecs@^2.0.0"
 jecs = "ukendio/jecs@^0.11.0"
 ```
 

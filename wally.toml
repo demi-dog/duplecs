@@ -15,7 +15,7 @@
 # punctuated scope can match across both (decided 2026-08-11).
 [package]
 name = "demi-dog/duplecs"
-version = "1.0.0"
+version = "2.0.0"
 description = "Generalized per-world replication for jecs"
 license = "MIT"
 repository = "https://github.com/demi-dog/duplecs"
