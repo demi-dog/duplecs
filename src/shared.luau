@@ -42,6 +42,7 @@ export type Components = {
 	Replicated: Component<nil>,
 	Private: Component<Privacy>,
 	InheritsPrivacy: Component<nil>,
+	ExportsPrivacy: Component<Privacy>,
 	Serdes: Component<Serdes?>,
 	Imported: Component<nil>,
 }
@@ -85,14 +86,17 @@ local function preregister(): Components
 	local NetworkedOnce = jecs.tag() :: Component<nil>
 	local NetworkedUnreliable = jecs.tag() :: Component<nil>
 
-	-- see get_record's mint arm for each component's semantics; the two arms must stay twins. Private and
-	-- Serdes are the set's two data components, so they alone draw from jecs's component range.
+	-- see get_record's mint arm for each component's semantics; the two arms must stay twins. Private,
+	-- ExportsPrivacy, and Serdes are the set's three data components, so they alone draw from jecs's component
+	-- range.
 	local Private = jecs.component() :: Component<Privacy>
 
 	-- InheritsPrivacy's cleanup policy rides the meta buffer, so world creation replays it before any user pair
 	-- of the relation can exist -- jecs snapshots the flag when the relation's first pair record is created.
 	local InheritsPrivacy = jecs.tag() :: Component<nil>
 	jecs.meta(InheritsPrivacy, pair(jecs.OnDeleteTarget, jecs.Delete) :: any, nil)
+
+	local ExportsPrivacy = jecs.component() :: Component<Privacy>
 
 	local Imported = jecs.tag() :: Component<nil>
 
@@ -104,6 +108,7 @@ local function preregister(): Components
 	jecs.meta(Replicated, jecs.Name, "duplecs.Replicated")
 	jecs.meta(Private, jecs.Name, "duplecs.Private")
 	jecs.meta(InheritsPrivacy, jecs.Name, "duplecs.InheritsPrivacy")
+	jecs.meta(ExportsPrivacy, jecs.Name, "duplecs.ExportsPrivacy")
 	jecs.meta(Serdes, jecs.Name, "duplecs.Serdes")
 	jecs.meta(Imported, jecs.Name, "duplecs.Imported")
 
@@ -114,6 +119,7 @@ local function preregister(): Components
 		Replicated = Replicated,
 		Private = Private,
 		InheritsPrivacy = InheritsPrivacy,
+		ExportsPrivacy = ExportsPrivacy,
 		Serdes = Serdes,
 		Imported = Imported,
 	}) :: Components
@@ -181,6 +187,11 @@ local function get_record(world: World): Record
 		local InheritsPrivacy = world:entity() :: Component<nil>
 		world:add(InheritsPrivacy, pair(jecs.OnDeleteTarget, jecs.Delete))
 
+		-- an entity-level ExportsPrivacy filter narrows what the entity's InheritsPrivacy delegators inherit below
+		-- the entity's own gate (see PRIVACY DELEGATION in server.luau); the value follows Private's rules exactly,
+		-- and absence hands delegators the entity's own gate unchanged.
+		local ExportsPrivacy = world:component() :: Component<Privacy>
+
 		local Imported = world:entity() :: Component<nil>
 
 		-- the serdes store's component; the store itself is constructed around it below, either mode
@@ -199,6 +210,7 @@ local function get_record(world: World): Record
 		world:set(Replicated, jecs.Name, "duplecs.Replicated")
 		world:set(Private, jecs.Name, "duplecs.Private")
 		world:set(InheritsPrivacy, jecs.Name, "duplecs.InheritsPrivacy")
+		world:set(ExportsPrivacy, jecs.Name, "duplecs.ExportsPrivacy")
 		world:set(Serdes, jecs.Name, "duplecs.Serdes")
 		world:set(Imported, jecs.Name, "duplecs.Imported")
 
@@ -211,6 +223,7 @@ local function get_record(world: World): Record
 			Replicated = Replicated,
 			Private = Private,
 			InheritsPrivacy = InheritsPrivacy,
+			ExportsPrivacy = ExportsPrivacy,
 			Serdes = Serdes,
 			Imported = Imported,
 		}) :: Components

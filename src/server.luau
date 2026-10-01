@@ -173,6 +173,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local NetworkedUnreliable = components.NetworkedUnreliable
 	local Private = components.Private
 	local InheritsPrivacy = components.InheritsPrivacy
+	local ExportsPrivacy = components.ExportsPrivacy
 
 	-- the tags' short names for diagnostics (their jecs.Name carries the duplecs. prefix)
 	local tracking_tag_names = {
@@ -185,6 +186,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- entity; the resolve pass routes its diff into the per-client create / delete lists instead of a component
 	-- group.
 	local Existence = world:entity() :: Component<nil>
+
+	-- the second synthetic key: an entity's ExportsPrivacy filter caches under it in the privacy stores, beside
+	-- the Existence-keyed entity-level filter, so sanitization, the join grant, departure pruning, the freed-slot
+	-- sweep, and compaction cover both with no extra arms. never staged as a cell -- the exported words only
+	-- enter delegators' derivations (see PRIVACY DELEGATION).
+	local Exported = world:entity() :: Component<nil>
 
 	-- GENERAL FUNCTIONS
 
@@ -290,9 +297,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local tracked_target_gens = {} :: { [number]: Entity }
 	local retired_target_gens = {} :: { [number]: Entity }
 
-	-- latest privacy filter of every Private cell, keyed [entity][key], key being the paired component or
-	-- Existence for an unpaired Private (which gates the whole entity). a filter is always a table
-	-- (on_private_set normalizes nil to empty_whitelist), and an empty one blocks everyone: allow words absent =
+	-- latest privacy filter of every Private cell, keyed [entity][key], key being the paired component, Existence
+	-- for an unpaired Private (which gates the whole entity), or Exported for the entity's ExportsPrivacy filter.
+	-- a filter is always a table (cache_filter_value normalizes nil to empty_whitelist), and an empty one blocks
+	-- everyone: allow words absent =
 	-- open to all allocated clients, present (even with no words) = gated to exactly those bits. blacklists
 	-- sanitize into allow words too (the allocated clients they don't name), so every reader keeps allow
 	-- semantics; a blacklist naming only untracked clients restricts nothing and is never cached (on_private_set
@@ -314,13 +322,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- (the group may already be dead mid-cascade), and a group's death removes its edges before its dense id can
 	-- recycle. like the other mirrors it reads correctly inside a removal hook, when world:target still sees the
 	-- old pair. effective_masks holds derived words for delegating entities only -- own intersect every parent's
-	-- effective, absent when nothing inherited restricts -- while own words stay untouched in allow_masks, whose
+	-- exported, absent when nothing inherited restricts -- while own words stay untouched in allow_masks, whose
 	-- 1:1 mapping to filter membership the grant loop, sweeps, and compaction rely on; entity_gate_masks takes
-	-- effective over own.
+	-- effective over own. exported_masks holds the words an entity hands its delegators when it narrows them --
+	-- its gate intersect its ExportsPrivacy filter's words -- present exactly while the filter is cached, and
+	-- exported_gate_masks takes it over the entity's gate. both derived stores are copies the sweeps and
+	-- compaction edit in place like the own words.
 	local delegation_parents = {} :: { [Entity]: { [number]: Entity } }
 	-- the reverse (group -> its delegators), maintained in lockstep, so the fan-out never queries the world
 	local delegation_children = {} :: { [Entity]: { [Entity]: true } }
 	local effective_masks = {} :: { [Entity]: ShardMasks }
+	local exported_masks = {} :: { [Entity]: ShardMasks }
 
 	-- client slots: each client gets a (shard, bit) pair so every stored mask is one 32-bit word and mask math
 	-- stays native bit32; shards number from 1 so shard-keyed tables stay in the array part, and shard s holds
@@ -445,6 +457,16 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		local entity_masks = allow_masks[entity]
 		return if entity_masks then entity_masks[Existence] else nil
+	end
+
+	-- the entity-level allow words an entity hands its delegators: its exported words while it holds an
+	-- ExportsPrivacy filter, else its own gate unchanged (see PRIVACY DELEGATION).
+	local function exported_gate_masks(entity: Entity): ShardMasks?
+		local exported = exported_masks[entity]
+		if exported ~= nil then
+			return exported
+		end
+		return entity_gate_masks(entity)
 	end
 
 	-- the shard-invariant half of an entity's existence visibility, fetched once per staging rather than per
@@ -1470,11 +1492,46 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- (orthogonal gates intersect), so delegation forms a DAG. scoped to the entity-level gate only -- a
 	-- (component, group) key can't be encoded in a single pair target -- and a delegator's own filter intersects
 	-- every inherited gate: everything narrows, matching the entity -> cell subset invariant.
+	--
+	-- two gates per entity. the *self* gate is what the entity itself passes: own words intersect every parent's
+	-- exported words (effective_masks, delegators only). the *exported* gate is what its delegators inherit: the
+	-- self gate intersect the entity's ExportsPrivacy filter's words (exported_masks, exporters only), the self
+	-- gate itself when the entity exports nothing. so an export narrows the entities below an entity without
+	-- touching the entity's own visibility, and a delegator is visible to at most the clients its groups are.
 
-	-- re-derives a delegator's effective words as own intersect every parent's effective words, storing them
-	-- (absent when every input is absent, leaving the store when the last edge goes) and returning whether they
-	-- changed. always a fresh top-down derivation, never an in-place AND: intersection can't restore bits a
-	-- widening edit must grant back.
+	-- whether two sparse word tables hold the same words; zero words are always omitted, so equal restrictions
+	-- compare equal.
+	local function masks_equal(a: ShardMasks, b: ShardMasks): boolean
+		for shard, word in a do
+			if b[shard] ~= word then
+				return false
+			end
+		end
+		for shard in b do
+			if a[shard] == nil then
+				return false
+			end
+		end
+		return true
+	end
+
+	-- narrows derived in place by other, dropping the words that zero (clearing the current key mid-iteration
+	-- is safe)
+	local function intersect_masks(derived: ShardMasks, other: ShardMasks)
+		for shard, word in derived do
+			local narrowed = bit32.band(word, other[shard] or 0)
+			if narrowed ~= 0 then
+				derived[shard] = narrowed
+			else
+				derived[shard] = nil
+			end
+		end
+	end
+
+	-- re-derives a delegator's self words as own intersect every parent's exported words, storing them (absent
+	-- when every input is absent, leaving the store when the last edge goes) and returning whether they changed.
+	-- always a fresh top-down derivation, never an in-place AND: intersection can't restore bits a widening edit
+	-- must grant back.
 	local function recompute_effective(entity: Entity): boolean
 		local old = effective_masks[entity]
 		local parents = delegation_parents[entity]
@@ -1487,30 +1544,21 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local entity_masks = allow_masks[entity]
 		local own = if entity_masks then entity_masks[Existence] else nil
 
-		-- copied, never aliased: own words are edited in place by the grant loop and sweeps, parents' effective
+		-- copied, never aliased: own words are edited in place by the grant loop and sweeps, parents' exported
 		-- words by later recomputes
 		local derived: ShardMasks? = nil
 		if own ~= nil then
 			derived = table.clone(own)
 		end
 		for _, parent in parents do
-			local parent_masks = entity_gate_masks(parent)
+			local parent_masks = exported_gate_masks(parent)
 			if parent_masks == nil then
 				continue
 			end
 			if derived == nil then
 				derived = table.clone(parent_masks)
 			else
-				-- zero words are omitted, so equal restrictions compare equal below (clearing the current key
-				-- mid-iteration is safe)
-				for shard, word in derived do
-					local narrowed = bit32.band(word, parent_masks[shard] or 0)
-					if narrowed ~= 0 then
-						derived[shard] = narrowed
-					else
-						derived[shard] = nil
-					end
-				end
+				intersect_masks(derived, parent_masks)
 			end
 		end
 		if derived == nil then
@@ -1522,53 +1570,84 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if old == nil then
 			return true
 		end
-		for shard, word in derived do
-			if old[shard] ~= word then
-				return true
-			end
-		end
-		for shard in old do
-			if (derived :: ShardMasks)[shard] == nil then
-				return true
-			end
-		end
-		return false
+		return not masks_equal(old, derived)
 	end
 
-	-- fans an effective-word change out over the delegating descendants: each child re-derives against all its
-	-- parents, and an unchanged child prunes its branch -- a descendant needs refreshing only if some parent's
-	-- words changed, and that parent, being un-pruned, fans out to it itself. this is what keeps a group edit
-	-- cheaper than editing every member. diamonds re-derive once per arrival: an early arrival may read a
-	-- sibling branch stale, but the last arrival reads everything fresh, and intermediate restages are
-	-- idempotent, so the walk converges at the cost of duplicate work proportional to the diamond's width.
+	-- re-derives an entity's exported words as its self gate intersect its ExportsPrivacy filter's words,
+	-- storing them exactly while the filter is cached (absent, delegators read the self gate through
+	-- exported_gate_masks' fallthrough), and returning whether what delegators inherit changed. runs after the
+	-- self gate is current; self_changed is the caller's knowledge of it (recompute_effective's result, or true
+	-- for an edit of the own filter): with no filter it is the answer outright, and with one it decides whether
+	-- the previous self gate can still stand in for what delegators read before. a fresh or dropped filter
+	-- compares the new words against that reading, so an export that doesn't narrow the gate fans out nothing.
+	local function recompute_exported(entity: Entity, self_changed: boolean): boolean
+		local old = exported_masks[entity]
+		local entity_masks = allow_masks[entity]
+		local exported_own = if entity_masks then entity_masks[Exported] else nil
+		if exported_own == nil and old == nil then
+			-- the common case on every fan-out: no filter now or before, so nothing to derive or compare
+			return self_changed
+		end
+		local self = entity_gate_masks(entity)
+		if exported_own == nil then
+			exported_masks[entity] = nil
+			return self_changed or self == nil or not masks_equal(old :: ShardMasks, self)
+		end
+
+		-- copied, never aliased: the filter's words are edited in place by the grant loop and sweeps, the self
+		-- words by later recomputes
+		local derived = table.clone(exported_own)
+		if self ~= nil then
+			intersect_masks(derived, self)
+		end
+		exported_masks[entity] = derived
+
+		if old ~= nil then
+			return not masks_equal(old, derived)
+		end
+		return self_changed or self == nil or not masks_equal(self, derived)
+	end
+
+	-- fans an exported-word change out over the delegating descendants: each child re-derives both gates against
+	-- all its parents, restaging when its self gate changed, and a child whose exported gate is unchanged prunes
+	-- its branch -- a descendant needs refreshing only if some parent's exported words changed, and that parent,
+	-- being un-pruned, fans out to it itself. this is what keeps a group edit cheaper than editing every member.
+	-- diamonds re-derive once per arrival: an early arrival may read a sibling branch stale, but the last arrival
+	-- reads everything fresh, and intermediate restages are idempotent, so the walk converges at the cost of
+	-- duplicate work proportional to the diamond's width.
 	local function refresh_descendants(node: Entity)
 		local children = delegation_children[node]
 		if children == nil then
 			return
 		end
 		for child in children do
-			if recompute_effective(child) then
+			local self_changed = recompute_effective(child)
+			local exported_changed = recompute_exported(child, self_changed)
+			if self_changed then
 				restage_entity(child)
+			end
+			if exported_changed then
 				refresh_descendants(child)
 			end
 		end
 	end
 
-	-- re-derives one delegator during a store-wide refresh (a joiner's slot grant), resolving every parent
+	-- re-derives one entity's gates during a store-wide refresh (a joiner's slot grant), resolving every parent
 	-- first; refreshed bounds the walk, and the cycle guards keep delegation acyclic, so parents always finish
-	-- before their delegators read them.
-	local function refresh_delegator(entity: Entity, parents: { [number]: Entity }, refreshed: { [Entity]: true })
+	-- before their delegators read them. a non-delegating exporter re-derives only its exported words.
+	local function refresh_gates(entity: Entity, refreshed: { [Entity]: true })
 		if refreshed[entity] ~= nil then
 			return
 		end
 		refreshed[entity] = true
-		for _, parent in parents do
-			local grandparents = delegation_parents[parent]
-			if grandparents ~= nil then
-				refresh_delegator(parent, grandparents, refreshed)
+		local parents = delegation_parents[entity]
+		if parents ~= nil then
+			for _, parent in parents do
+				refresh_gates(parent, refreshed)
 			end
+			recompute_effective(entity)
 		end
-		recompute_effective(entity)
+		recompute_exported(entity, false)
 	end
 
 	-- delegation_children maintenance, keyed by the full group entity so the fan-out and the parents mirror
@@ -1643,8 +1722,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		parents[dense(group)] = group
 		index_delegation_child(group, entity)
-		if recompute_effective(entity) then
+		local self_changed = recompute_effective(entity)
+		local exported_changed = recompute_exported(entity, self_changed)
+		if self_changed then
 			restage_entity(entity)
+		end
+		if exported_changed then
 			refresh_descendants(entity)
 		end
 	end
@@ -1671,8 +1754,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		deindex_delegation_child(group, entity)
 		-- the re-derivation against the remaining edges widens (or clears) the stored words; unchanged words --
 		-- a redundant edge removed, or a gate that never restricted -- skip the restage entirely
-		if recompute_effective(entity) then
+		local self_changed = recompute_effective(entity)
+		local exported_changed = recompute_exported(entity, self_changed)
+		if self_changed then
 			restage_entity(entity)
+		end
+		if exported_changed then
 			refresh_descendants(entity)
 		end
 	end
@@ -1814,14 +1901,20 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- the entity-level filter changed: re-derive the entity's own effective words when it delegates, restage the
-	-- whole entity, and fan out over its descendants.
+	-- the entity-level filter changed: re-derive both gates, restage the whole entity unless it delegates and
+	-- its self gate provably stayed put, and fan out over its descendants unless its exported gate did.
 	local function refresh_entity_gate(entity: Entity)
+		local self_changed = true
 		if delegation_parents[entity] ~= nil then
-			recompute_effective(entity)
+			self_changed = recompute_effective(entity)
 		end
-		restage_entity(entity)
-		refresh_descendants(entity)
+		local exported_changed = recompute_exported(entity, self_changed)
+		if self_changed then
+			restage_entity(entity)
+		end
+		if exported_changed then
+			refresh_descendants(entity)
+		end
 	end
 
 	-- set_cached_privacy behind a revert guard: sanitize_privacy's errors fire from inside the set hook, after
@@ -1849,11 +1942,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- pruned empty is removed outright, admitting its named clients the moment they join. both are the same
 	-- ordering bug: clients must be registered through add_client before a filter names them, and before
 	-- construction no client can be, so the catch-up warns for every populated pre-construction filter. only
-	-- user sets warn; remove_client's departure prune never runs through sanitization.
-	local function warn_pruned_clients(entity: Entity, filter: Privacy, sanitized: Privacy?)
+	-- user sets warn; remove_client's departure prune never runs through sanitization. name is the filter
+	-- component's, for the message.
+	local function warn_pruned_clients(entity: Entity, filter: Privacy, sanitized: Privacy?, name: string)
 		if sanitized == nil then
 			warn(
-				`a Private blacklist named only untracked clients! it was removed outright, since it restricted nobody -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
+				`the {name} blacklist named only untracked clients! it was removed outright, since it restricted nobody -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
 					entity,
 					world
 				)})`
@@ -1868,20 +1962,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			pruned -= 1
 		end
 		warn(
-			`a Private filter named {pruned} untracked client(s)! they were pruned from it, since filters only carry tracked clients -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
+			`the {name} filter named {pruned} untracked client(s)! they were pruned from it, since filters only carry tracked clients -- register clients through add_client before a filter names them; no client can be tracked before duplecs.server(world) constructs. ({id_to_string(
 				entity,
 				world
 			)})`
 		)
 	end
 
-	-- handles both the added and changed hooks (identical work): cache under the paired component (or Existence
-	-- for an unpaired Private), then restage the governed cells -- the packet diff turns each mask change into
-	-- sends and removals, so no old-vs-new diffing here. an entity-level filter restages entity-wide and fans
-	-- out over delegating descendants. a sanitization that pruned is written back over the value (so value and
-	-- cache stay one table) and warned about; a blacklist that sanitized to nothing is removed outright, its
-	-- removed hook clearing whatever it replaced. mutating here is fine: added hooks fire after the archetype
-	-- move and changed hooks involve none.
+	-- the body shared by the Private and ExportsPrivacy set hooks (added and changed alike): caches the value
+	-- under key and returns whether a filter is now cached, leaving the restage to the caller. a sanitization
+	-- that pruned is written back over the value (so value and cache stay one table) and warned about; a
+	-- blacklist that sanitized to nothing is removed outright, its removed hook clearing whatever it replaced,
+	-- and false is returned. name is the component's, for the messages. mutating here is fine: added hooks fire
+	-- after the archetype move and changed hooks involve none.
 	--
 	-- a nil value is normalized first: absence already means unrestricted, so a present nil has no third state
 	-- to name -- world:add(entity, Private) and world:set(entity, Private, nil) both land here meaning "block
@@ -1889,11 +1982,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- failing closed. it warns rather than errors because the resulting state is what the call meant: the
 	-- warning is about the spelling, and about the sibling form it can't catch -- jecs's add returns early on an
 	-- entity already carrying a filter and fires no hook (see jecs.md).
-	local function on_private_set(entity: Entity, id: Id, privacy: Privacy?)
+	local function cache_filter_value(entity: Entity, key: Component, id: Id, privacy: Privacy?, name: string): boolean
 		local filter: Privacy
 		if privacy == nil then
 			warn(
-				`Private filters cannot have a nil value! it now blocks every client, as an empty filter -- set one explicitly, since world:add leaves an existing filter untouched instead. ({id_to_string(
+				`{name} filters cannot have a nil value! it now blocks every client, as an empty filter -- set one explicitly, since world:add leaves an existing filter untouched instead. ({id_to_string(
 					entity,
 					world
 				)})`
@@ -1910,32 +2003,34 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if type(filter) == "table" and table.isfrozen(filter) ~= true then
 			table.freeze(filter)
 		end
+		local sanitized = set_cached_privacy_reverting(entity, key, id, filter)
+		if sanitized == nil then
+			warn_pruned_clients(entity, filter, nil, name)
+			world:remove(entity, id)
+			return false
+		end
+		if sanitized ~= filter then
+			warn_pruned_clients(entity, filter, sanitized, name)
+			write_filter_value(entity, id, sanitized)
+		end
+		return true
+	end
+
+	-- handles both the added and changed hooks (identical work): cache under the paired component (or Existence
+	-- for an unpaired Private), then restage the governed cells -- the packet diff turns each mask change into
+	-- sends and removals, so no old-vs-new diffing here. an entity-level filter restages entity-wide and fans
+	-- out over delegating descendants.
+	local function on_private_set(entity: Entity, id: Id, privacy: Privacy?)
 		if id == Private then
-			local sanitized = set_cached_privacy_reverting(entity, Existence, id, filter)
-			if sanitized == nil then
-				warn_pruned_clients(entity, filter, nil)
-				world:remove(entity, id)
-				return
+			if cache_filter_value(entity, Existence, id, privacy, "Private") then
+				refresh_entity_gate(entity)
 			end
-			if sanitized ~= filter then
-				warn_pruned_clients(entity, filter, sanitized)
-				write_filter_value(entity, id, sanitized)
-			end
-			refresh_entity_gate(entity)
 			return
 		end
 		local key = jecs.pair_second(world, id)
-		local sanitized = set_cached_privacy_reverting(entity, key, id, filter)
-		if sanitized == nil then
-			warn_pruned_clients(entity, filter, nil)
-			world:remove(entity, id)
-			return
+		if cache_filter_value(entity, key, id, privacy, "Private") then
+			restage_privacy_cells(entity, key)
 		end
-		if sanitized ~= filter then
-			warn_pruned_clients(entity, filter, sanitized)
-			write_filter_value(entity, id, sanitized)
-		end
-		restage_privacy_cells(entity, key)
 	end
 
 	local function on_private_removed(entity: Entity, id: Id)
@@ -1947,6 +2042,32 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local key = jecs.pair_second(world, id)
 		clear_cached_privacy(entity, key)
 		restage_privacy_cells(entity, key)
+	end
+
+	-- ExportsPrivacy's set hooks: the filter caches under Exported like any other, but it gates nothing on the
+	-- entity itself, so only the exported words re-derive and only the delegating descendants restage. a paired
+	-- add is rejected like an unpaired InheritsPrivacy (the export is entity-level only): the guard removes the
+	-- pair -- which the removed hook ignores, nothing being cached under it -- and errors.
+	local function on_exports_set(entity: Entity, id: Id, privacy: Privacy?)
+		if id ~= ExportsPrivacy then
+			world:remove(entity, id)
+			fail(`ExportsPrivacy is not meant to be paired! ({id_to_string(entity, world)})`)
+		end
+		if cache_filter_value(entity, Exported, id, privacy, "ExportsPrivacy") then
+			if recompute_exported(entity, false) then
+				refresh_descendants(entity)
+			end
+		end
+	end
+
+	local function on_exports_removed(entity: Entity, id: Id)
+		if id ~= ExportsPrivacy then
+			return
+		end
+		clear_cached_privacy(entity, Exported)
+		if recompute_exported(entity, false) then
+			refresh_descendants(entity)
+		end
 	end
 
 	-- PRIVACY EDITING
@@ -2027,6 +2148,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		edit_privacy(entity, component, pair(Private, component), client, allowed)
 	end
 
+	-- edits one client's standing in the entity's ExportsPrivacy filter, the gate narrowing what its
+	-- InheritsPrivacy delegators inherit below the entity's own. the same rules as the other two: a fresh
+	-- disallow starts a blacklist, which can only narrow here since the own gate still applies.
+	local function edit_exported_privacy(entity: Entity, client: Client, allowed: boolean)
+		edit_privacy(entity, Exported, ExportsPrivacy, client, allowed)
+	end
+
 	-- SERDES
 
 	-- the per-world serdes store (see shared.luau / serdes.luau) validates registrations itself, pre-registered
@@ -2061,7 +2189,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 				local pruned = table.clone(filter)
 				pruned[client] = nil
-				local id = if key == Existence then Private else pair(Private, key)
+				local id: Id
+				if key == Existence then
+					id = Private
+				elseif key == Exported then
+					id = ExportsPrivacy
+				else
+					id = pair(Private, key)
+				end
 				if next(pruned) == nil and privacy_is_blacklist(filter) then
 					-- removing the value clears exactly (entity, key) from the caches via the removed hook: the current keys
 					-- of both loops, which stay safe to remove mid-iteration
@@ -2227,6 +2362,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			for _, masks in effective_masks do
 				sweep_masks_word(masks, shard, clear)
 			end
+			for _, masks in exported_masks do
+				sweep_masks_word(masks, shard, clear)
+			end
 		end
 
 		-- allocates the lowest free (shard, bit) for a pending client -- opening a new shard when every existing one
@@ -2281,12 +2419,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 			end
 
-			-- effective words derive from the own words just refreshed, so re-derive every delegator's, parents first.
-			-- no restage: the joiner's visibility ships via their full packet, and no other client's bits moved.
-			if next(delegation_parents) ~= nil then
+			-- the derived words (every delegator's self gate, every exporter's exported gate) derive from the own
+			-- words just refreshed, so re-derive them all, parents first. no restage: the joiner's visibility ships
+			-- via their full packet, and no other client's bits moved. the exporter walk only rewrites existing keys
+			-- (a store entry exists exactly while its filter is cached), so iterating the store is safe.
+			if next(delegation_parents) ~= nil or next(exported_masks) ~= nil then
 				local refreshed = {} :: { [Entity]: true }
-				for entity, parents in delegation_parents do
-					refresh_delegator(entity, parents, refreshed)
+				for entity in delegation_parents do
+					refresh_gates(entity, refreshed)
+				end
+				for entity in exported_masks do
+					refresh_gates(entity, refreshed)
 				end
 			end
 		end
@@ -2623,9 +2766,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				end
 			end
 
-			-- the derived effective words transfer the same way (bit moves distribute over intersection), their store
-			-- being one level flat
+			-- the derived words transfer the same way (bit moves distribute over intersection), their stores being
+			-- one level flat
 			for _, masks in effective_masks do
+				transfer_masks_word(masks)
+			end
+			for _, masks in exported_masks do
 				transfer_masks_word(masks)
 			end
 
@@ -4038,9 +4184,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	local function catch_up()
-		-- filters and delegation first, since everything below reads the gates they establish; Private precedes
-		-- InheritsPrivacy so each replayed edge derives against own words already cached (the reverse order
-		-- converges but pays a wasted derivation per edge)
+		-- filters and delegation first, since everything below reads the gates they establish; Private and
+		-- ExportsPrivacy precede InheritsPrivacy so each replayed edge derives against words already cached (the
+		-- reverse order converges but pays a wasted derivation per edge)
 		local private_holders = collect_holders(Private)
 		local private_subjects, private_pair_ids = collect_pair_holders(Private)
 		for _, entity in private_holders do
@@ -4049,6 +4195,16 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		for index, entity in private_subjects do
 			local id = private_pair_ids[index]
 			on_private_set(entity, id, world:get(entity, id))
+		end
+
+		local exports_holders = collect_holders(ExportsPrivacy)
+		local exports_subjects, exports_pair_ids = collect_pair_holders(ExportsPrivacy)
+		for _, entity in exports_holders do
+			on_exports_set(entity, ExportsPrivacy, world:get(entity, ExportsPrivacy))
+		end
+		for index, entity in exports_subjects do
+			-- always the paired misuse; the handler removes the pair and errors
+			on_exports_set(entity, exports_pair_ids[index], nil)
 		end
 
 		local inherits_holders = collect_holders(InheritsPrivacy)
@@ -4105,6 +4261,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		hooks.changed(world, Private, on_private_set)
 		hooks.removed(world, Private, on_private_removed)
 
+		hooks.added(world, ExportsPrivacy, on_exports_set)
+		hooks.changed(world, ExportsPrivacy, on_exports_set)
+		hooks.removed(world, ExportsPrivacy, on_exports_removed)
+
 		hooks.added(world, InheritsPrivacy, on_inherits_added)
 		hooks.removed(world, InheritsPrivacy, on_inherits_removed)
 
@@ -4143,6 +4303,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		get_clients_last_seeing = get_clients_last_seeing,
 		edit_entity_privacy = edit_entity_privacy,
 		edit_component_privacy = edit_component_privacy,
+		edit_exported_privacy = edit_exported_privacy,
 
 		-- misc
 		force_replicate = force_replicate,
@@ -4157,6 +4318,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		NetworkedUnreliable = NetworkedUnreliable,
 		Private = Private,
 		InheritsPrivacy = InheritsPrivacy,
+		ExportsPrivacy = ExportsPrivacy,
 		Serdes = Serdes,
 
 		-- debug introspection (unstable, for tests and diagnostics)

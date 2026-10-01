@@ -1,6 +1,6 @@
 # Visibility Inheritance
 
-Many entities can share one entity-level [visibility filter](005-visibility-filters.md), and `InheritsPrivacy` is the component that points them at it: `pair(InheritsPrivacy, group)` makes an entity inherit `group`'s unpaired `Private` filter on top of its own — a client must pass both — so a single filter edit on the group updates every entity inheriting from it at once. Inheritance chains, too: a group may itself inherit from wider groups, so one edit near the top of a hierarchy reaches everything below it. Exact contracts live in the spec's [`InheritsPrivacy`](../spec.md#inheritsprivacy) section.
+Many entities can share one entity-level [visibility filter](005-visibility-filters.md), and `InheritsPrivacy` is the component that points them at it: `pair(InheritsPrivacy, group)` makes an entity inherit `group`'s unpaired `Private` filter on top of its own — a client must pass both — so a single filter edit on the group updates every entity inheriting from it at once. Inheritance chains, too: a group may itself inherit from wider groups, so one edit near the top of a hierarchy reaches everything below it. A group can also hand its inheritors *less* than it sees itself, with `ExportsPrivacy`. Exact contracts live in the spec's [`InheritsPrivacy`](../spec.md#inheritsprivacy) and [`ExportsPrivacy`](../spec.md#exportsprivacy) sections.
 
 ## Multi-entity objects
 
@@ -73,12 +73,58 @@ world:add(unit, pair(net.InheritsPrivacy, region_interest_group)) -- who is near
 -- visible only to clients both groups admit
 ```
 
+## Containers more visible than their contents
+
+Sometimes the group should stay visible to more clients than what inherits from it: a chest everyone can see, whose item entities should reach only the player who opened it — or an enemy base shown to everyone as a map marker, whose contents replicate only to players nearby. `ExportsPrivacy` is a second filter on the group that narrows what its inheritors receive *below* the group's own visibility, while the group itself is unaffected:
+
+```lua
+-- server
+local chest = world:entity()
+world:add(chest, net.Replicated) -- visible to everyone: no Private filter
+
+-- the chest's contents inherit from it, but receive only what the chest exports
+world:set(chest, net.ExportsPrivacy, {}) -- hidden from everyone, until someone opens the chest
+
+local function spawn_item(kind)
+	local item = world:entity()
+	world:set(item, Item, kind)
+	world:add(item, pair(net.InheritsPrivacy, chest))
+	world:add(item, net.Replicated)
+	return item
+end
+
+-- a player opens the chest: they alone receive its items
+net.edit_exported_privacy(chest, opener, true)
+
+-- and later, closing it takes the items away again
+net.edit_exported_privacy(chest, opener, false)
+```
+
+The export filter follows every rule a `Private` filter does — an empty table hides every inheritor, a populated one is a whitelist or blacklist, `edit_exported_privacy` toggles membership exactly like `edit_entity_privacy` — and absent, inheritors simply receive the group's own gate as always. An export can only ever *narrow*: an inheritor is visible to at most the clients its group is, so hiding the chest from a client hides its items too, and the fog of war that swallows the base marker swallows the base's contents with it. Exports chain the same way inherited filters do: an entity's inheritors receive what it inherited, narrowed by its own export.
+
+Editing an export touches only the inheritors whose visibility actually changed — the chest's own cells never re-send — so it is the right tool for frequent open/close toggles on a container.
+
+## Widening instead: the gate-entity pattern
+
+Occasionally the opposite shape comes up: contents that should be visible to clients who *cannot* see the container. Inheritance never widens, so no filter on the container can express that — but nothing requires an inheritor to point at the container. Point it at a separate **gate entity** instead: an ordinary entity holding the filter, which is never `Replicated` itself, parented to the container so it dies with it:
+
+```lua
+-- server
+local gate = world:entity()
+world:add(gate, pair(jecs.ChildOf, container)) -- deleting the container deletes the gate (and, through it, the contents)
+world:set(gate, net.Private, { [scout] = true })
+
+world:add(content, pair(net.InheritsPrivacy, gate))
+```
+
+The contents now follow the gate's filter, independent of the container's. The same pattern gives an entity several independently-edited gates at once — one gate entity per rule, each pointed at by whichever entities the rule should cover — and it costs nothing over pointing at the container directly. One thing to keep in mind when contents can be seen where their container is not: a networked pair aimed at the container (a `ChildOf`, say) is never sent to a client who cannot see its target, so such a client receives the content entity without that pair.
+
 ## Semantics to keep in mind
 
-- **Everything narrows.** The inherited gates apply on top of the entity's own unpaired `Private` (and each other), so a client must pass all of them. Inheriting can never *widen* what an entity's own filter allows — there is no privacy hazard in pointing at one more group. An *empty* unpaired `Private` filter on any group above an entity blocks every entity below it.
+- **Everything narrows.** The inherited gates apply on top of the entity's own unpaired `Private` (and each other), so a client must pass all of them. Inheriting can never *widen* what an entity's own filter allows — there is no privacy hazard in pointing at one more group. An *empty* unpaired `Private` filter on any group above an entity blocks every entity below it, and so does an empty `ExportsPrivacy` filter.
 - **Inheritance reaches all the way up.** An entity's effective gate applies every filter on every path of groups above it — the convoy example above, where a squad edit reaches the wheels through two levels. Those paths can branch (a group may itself inherit from several wider groups) but they can never loop: an add that would close a cycle removes the pair and errors, as does adding `InheritsPrivacy` unpaired.
-- **Only the entity-level gate inherits.** `pair(Private, component)` filters always stay local to their entity.
-- **Removing a pair widens safely.** Dropping `pair(InheritsPrivacy, group)` re-derives the entity's gate from its remaining filters; newly-visible clients receive current state through the ordinary visibility diff.
+- **Only the entity-level gate inherits.** `pair(Private, component)` filters always stay local to their entity, and `ExportsPrivacy` is entity-level only (pairing it errors).
+- **Removing a pair widens safely.** Dropping `pair(InheritsPrivacy, group)` re-derives the entity's gate from its remaining filters; newly-visible clients receive current state through the ordinary visibility diff. Removing an `ExportsPrivacy` filter widens its inheritors the same way.
 
 ## Deletion cascades
 

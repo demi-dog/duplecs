@@ -5986,33 +5986,60 @@ test(
 		s.world:set(s.defs.Health, s.net.Serdes, buffer_string_serdes)
 		c.world:set(c.defs.Health, c.net.Serdes, client_tracking_serdes)
 
-		-- a normally-reconciled entity, mapped up front
-		local mapped = s.world:entity()
-		s.world:add(mapped, s.net.Replicated)
-		s.world:set(mapped, s.defs.Health, "initial-mapped-value")
-		env.sync(env.player_a)
-		local le_mapped = c.net.get_client_entity(mapped)
-		expect(le_mapped ~= nil, "the mapped entity has a client entity before the alignment frame")
-		table.clear(client_decode_calls) -- only the alignment frame's decode calls matter below
+		-- a section lists a frame's changed values in the order the staging table, keyed by entity id, iterates
+		-- them -- an order the module never pins, which shifts with the ids alone (one more entity minted at
+		-- construction flips it). the skip is only exercised when the unmapped entity's value precedes the mapped
+		-- one's, so each attempt mints a fresh pair -- the previous attempt's deleted first, so recycled ids under
+		-- a new generation hash elsewhere -- until a drained frame carries them in that order, and the
+		-- assertions below run against that attempt's frame
+		local mapped, unmapped, le_mapped, packet
+		for _ = 1, 8 do
+			if mapped ~= nil then
+				s.world:delete(mapped)
+				s.world:delete(unmapped)
+				env.sync(env.player_a)
+			end
 
-		-- an entity that becomes visible and gets a value in a frame that is
-		-- drained but never reconciled on the client -- standing in for a
-		-- dropped packet -- so the server's per-client state advances (this
-		-- entity is no longer announced as newly-replicated) while the client
-		-- never learns of it
-		local unmapped = s.world:entity()
-		s.world:add(unmapped, s.net.Replicated)
-		s.world:set(unmapped, s.defs.Health, "initial-unmapped-value")
-		env.frame() -- drained and discarded
+			-- a normally-reconciled entity, mapped up front
+			mapped = s.world:entity()
+			s.world:add(mapped, s.net.Replicated)
+			s.world:set(mapped, s.defs.Health, "initial-mapped-value")
+			env.sync(env.player_a)
+			le_mapped = c.net.get_client_entity(mapped)
+			expect(le_mapped ~= nil, "the mapped entity has a client entity before the alignment frame")
+			table.clear(client_decode_calls) -- only the alignment frame's decode calls matter below
 
-		expect_equal(c.net.get_client_entity(unmapped), nil, "precondition: the dropped-packet entity has no mapping")
+			-- an entity that becomes visible and gets a value in a frame that is
+			-- drained but never reconciled on the client -- standing in for a
+			-- dropped packet -- so the server's per-client state advances (this
+			-- entity is no longer announced as newly-replicated) while the client
+			-- never learns of it
+			unmapped = s.world:entity()
+			s.world:add(unmapped, s.net.Replicated)
+			s.world:set(unmapped, s.defs.Health, "initial-unmapped-value")
+			env.frame() -- drained and discarded
 
-		-- both cells change in the same frame, the unmapped entity staged
-		-- first so its skipped value precedes the mapped entity's in the
-		-- section's ids list
-		s.world:set(unmapped, s.defs.Health, "second-unmapped-value")
-		s.world:set(mapped, s.defs.Health, "second-mapped-value")
-		local packet = env.sync(env.player_a)
+			expect_equal(
+				c.net.get_client_entity(unmapped),
+				nil,
+				"precondition: the dropped-packet entity has no mapping"
+			)
+
+			-- both cells change in the same frame, drained before the client
+			-- reconciles it so an attempt in the wrong order is discarded unseen
+			s.world:set(unmapped, s.defs.Health, "second-unmapped-value")
+			s.world:set(mapped, s.defs.Health, "second-mapped-value")
+			local candidate = env.packet_for(env.frame(), env.player_a)
+			local candidate_data = candidate.components[s.defs.Health]
+			if candidate_data ~= nil and candidate_data.values ~= nil then
+				if candidate_data.values[1] == "second-unmapped-value" then
+					packet = candidate
+					break
+				end
+			end
+		end
+		expect(packet ~= nil, "no attempt carried the unmapped entity's value ahead of the mapped entity's")
+		env.apply(packet)
 
 		local data = packet.components[s.defs.Health]
 		expect(
@@ -6020,7 +6047,7 @@ test(
 				and data.values ~= nil
 				and data.values[1] == "second-unmapped-value"
 				and data.values[2] == "second-mapped-value",
-			"the wire carries both values in staging order, decoded here via the server's own hooks"
+			"the wire carries the skipped value ahead of the mapped one, decoded here via the server's own hooks"
 		)
 
 		expect_equal(c.net.get_client_entity(unmapped), nil, "the unmapped entity still has no client mapping")
@@ -9282,6 +9309,940 @@ test("a delegated member gated by a group whitelist survives a shard-compacting 
 	env.apply(env.packet_for(snapshot2, env.player_a))
 	expect_equal(sc.world:get(le, sc.defs.Health), 20, "the migrated straggler still receives the delegated change")
 	expect_equal(env.client.net.get_client_entity(member), nil, "player A stays excluded after the move")
+end)
+
+-- ExportsPrivacy: an entity-level filter narrowing what an entity hands its InheritsPrivacy delegators, below the
+-- entity's own gate. every entity has two gates -- the self gate it passes itself (its own unpaired Private
+-- intersected with every parent's exported gate) and the exported gate its delegators inherit (the self gate
+-- intersected with its ExportsPrivacy filter's words, or the self gate unchanged while it holds none) -- so an
+-- export narrows the entities below an entity without moving the entity's own visibility, and can never widen
+-- past it. the value follows Private's rules exactly: an empty filter blocks every delegator, a populated one is
+-- a whitelist or blacklist by polarity, a nil value warns into an empty one, malformed values error and revert,
+-- untracked clients are pruned with a warning, and departures prune. the tests below cover the derivation
+-- (narrowing, the empty block, the never-widen bound, chains, several parents), those value rules,
+-- edit_exported_privacy, departures, late joiners, slot reuse and compaction, and the packet-level guarantees an
+-- export carries: editing it ships nothing for the exporter itself, and a change that leaves the exported gate
+-- where it was ships nothing to any delegator. raw generate_packets() maps carry the absence assertions, since
+-- the harness's frame() hands back a blank packet for a player with none.
+
+test("an ExportsPrivacy whitelist narrows a group's delegator without moving the group itself", function(env)
+	-- end-to-end via packet reconciliation: the group, open to everyone, still reaches both clients, while the
+	-- member delegating to it reaches only the client the export names.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.defs.Health, 50)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 42)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+
+	expect_equal(s.net.is_entity_visible(group, env.player_a), true, "A sees the group")
+	expect_equal(s.net.is_entity_visible(group, env.player_b), true, "and so does B: the export never gates the group")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A is admitted to the member by the export")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "B is narrowed out of the member by it")
+
+	local lg_b = c2.net.get_client_entity(group)
+	expect(lg_b ~= nil and c2.world:contains(lg_b), "B's client creates the group")
+	expect_equal(c2.world:get(lg_b, c2.defs.Health), 50, "with its Health")
+	local le_a = c.net.get_client_entity(member)
+	expect(le_a ~= nil and c.world:contains(le_a), "A's client creates the member")
+	expect_equal(c.world:get(le_a, c.defs.Health), 42, "with its Health")
+	expect_equal(c2.net.get_client_entity(member), nil, "B's client never creates the member")
+end)
+
+test("an empty ExportsPrivacy blocks every delegator while the group stays visible", function(env)
+	-- present-empty on the export mirrors present-empty on Private, one level down: the group is as visible as
+	-- its own gates allow -- here, to everyone -- and nothing below it reaches anyone.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.ExportsPrivacy, {}) -- present-empty: blocks every delegator
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	-- the group itself anchors both packets as real deliveries, so the member's absence cannot read off the
+	-- blank-packet fallback
+	local snapshot = env.frame()
+	local packet_a = env.packet_for(snapshot, env.player_a)
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	expect(table.find(packet_a.replicated, group) ~= nil, "A receives the group: the empty export leaves it open")
+	expect(table.find(packet_b.replicated, group) ~= nil, "and so does B")
+	expect_equal(table.find(packet_a.replicated, member), nil, "A's packet never creates the member")
+	expect_equal(table.find(packet_b.replicated, member), nil, "nor does B's")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), false, "A is blocked by the empty export")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and so is B")
+
+	-- control: the block is the export's doing rather than a member gated some other way
+	s.world:remove(group, s.net.ExportsPrivacy)
+	env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A reopens once the export is dropped")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), true, "and so does B")
+end)
+
+test("an ExportsPrivacy blacklist narrows out only the clients it names", function(env)
+	-- the blacklist sanitizes to allow-words like a Private one, so every client it does not name is admitted.
+	-- the third client is what tells a blacklist apart from a whitelist naming A: with two clients they read
+	-- the same.
+	local s = env.server
+	local c3 = env.make_client()
+	local player_c = fake_player("ExportBlacklistThird")
+	env.join(player_c, c3)
+
+	local group = s.world:entity() -- a pure gate: never replicated itself
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_b] = false })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 3)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A, unnamed, is admitted by the blacklist")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "B, named, is narrowed out")
+	expect_equal(s.net.is_entity_visible(member, player_c), true, "the third client, unnamed, is admitted too")
+
+	env.apply(env.packet_for(snapshot, player_c), c3)
+	local le_c = c3.net.get_client_entity(member)
+	expect(le_c ~= nil and c3.world:contains(le_c), "the third client's packet creates the member")
+	expect_equal(c3.world:get(le_c, c3.defs.Health), 3, "with its Health")
+	expect_equal(
+		table.find(env.packet_for(snapshot, env.player_b).replicated, member),
+		nil,
+		"B's packet never creates the member"
+	)
+end)
+
+test("an export never widens a delegator past the group's own gate", function(env)
+	-- the exported gate is the group's self gate intersected with the export, so naming a client the group's own
+	-- filter excludes admits nobody -- until the group's own gate widens to them, when the export's standing for
+	-- that client takes effect with no edit of its own.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:set(group, s.net.Private, { [env.player_a] = true })
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 14)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A passes the group's gate and its export")
+	expect_equal(
+		s.net.is_entity_visible(member, env.player_b),
+		false,
+		"B, named by the export alone, is not admitted: an export only narrows"
+	)
+	expect(c.net.get_client_entity(member) ~= nil, "A's client holds the member")
+	expect_equal(c2.net.get_client_entity(member), nil, "B's client never creates it")
+
+	s.net.edit_entity_privacy(group, env.player_b, true)
+	local packet_b = env.packet_for(env.frame(), env.player_b)
+	expect_equal(packet_b.replicated[1], member, "widening the group's own gate admits B through the standing export")
+	env.apply(packet_b, c2)
+	local le_b = c2.net.get_client_entity(member)
+	expect(le_b ~= nil and c2.world:contains(le_b), "B's client creates the member")
+	expect_equal(c2.world:get(le_b, c2.defs.Health), 14, "with its Health")
+end)
+
+test("an export carries down a delegation chain, and a mid-level export narrows the rest of it", function(env)
+	-- mid holds no filter of its own, so it and the leaf below it both inherit exactly the root's export; mid's
+	-- own export then narrows the leaf further without moving mid. the third client is what makes the root's
+	-- export observable: an export naming every allocated client narrows nobody. every level is Replicated, so
+	-- each one's gate is read directly rather than inferred from the leaf's.
+	local s = env.server
+	local player_c = fake_player("ExportChainThird")
+	s.net.add_client(player_c)
+	env.frame()
+	expect(s.net._client_shard(player_c) ~= nil, "the third client really did get a slot")
+
+	local root = s.world:entity()
+	s.world:add(root, s.net.Replicated)
+	s.world:set(root, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = true })
+	local mid = s.world:entity()
+	s.world:add(mid, s.net.Replicated)
+	s.world:add(mid, pair(s.net.InheritsPrivacy, root))
+	local leaf = s.world:entity()
+	s.world:add(leaf, s.net.Replicated)
+	s.world:add(leaf, pair(s.net.InheritsPrivacy, mid))
+
+	env.frame()
+	expect_equal(s.net.is_entity_visible(root, player_c), true, "the root itself stays open to the third client")
+	expect_equal(s.net.is_entity_visible(mid, env.player_a), true, "mid inherits A's standing in the root's export")
+	expect_equal(s.net.is_entity_visible(mid, env.player_b), true, "and B's")
+	expect_equal(s.net.is_entity_visible(mid, player_c), false, "and the third client's exclusion")
+	expect_equal(s.net.is_entity_visible(leaf, env.player_a), true, "the leaf inherits the root's export through mid")
+	expect_equal(s.net.is_entity_visible(leaf, env.player_b), true, "B included")
+	expect_equal(s.net.is_entity_visible(leaf, player_c), false, "and the third client excluded")
+
+	s.world:set(mid, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local snapshot = env.frame()
+	expect_equal(s.net.is_entity_visible(leaf, env.player_a), true, "A passes both exports")
+	expect_equal(s.net.is_entity_visible(leaf, env.player_b), false, "mid's export narrows B out of the leaf")
+	expect_equal(s.net.is_entity_visible(leaf, player_c), false, "the third client stays out")
+	expect_equal(s.net.is_entity_visible(mid, env.player_b), true, "while mid itself stays visible to B")
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	expect_equal(#packet_b.unreplicated, 1, "B loses exactly one entity")
+	expect_equal(packet_b.unreplicated[1], leaf, "and it is the leaf")
+end)
+
+test("a member delegating to two groups intersects one group's export with the other's own gate", function(env)
+	-- every parent contributes its exported gate, whether that comes from an export or from the group's own
+	-- filter: group_a exports {A, C} and group_b gates itself to {A, B}, so only A passes both. each extra client
+	-- fails exactly one of the two, so honouring either edge alone admits someone who must stay out.
+	local s, c = env.server, env.client
+	local c3 = env.make_client()
+	local player_c = fake_player("ExportMultiThird")
+	env.join(player_c, c3)
+
+	local group_a = s.world:entity()
+	s.world:add(group_a, s.net.Replicated) -- open itself, so it anchors every client's packet below
+	s.world:set(group_a, s.net.ExportsPrivacy, { [env.player_a] = true, [player_c] = true })
+	local group_b = s.world:entity()
+	s.world:set(group_b, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 7)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group_a))
+	s.world:add(member, pair(s.net.InheritsPrivacy, group_b))
+
+	local snapshot = env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A passes group_a's export and group_b's gate")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "B is narrowed out by group_a's export")
+	expect_equal(s.net.is_entity_visible(member, player_c), false, "the third client is narrowed out by group_b")
+
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	local packet_c = env.packet_for(snapshot, player_c)
+	expect(table.find(packet_b.replicated, group_a) ~= nil, "B's packet is real, not the blank fallback")
+	expect(table.find(packet_c.replicated, group_a) ~= nil, "and so is the third client's")
+	expect_equal(table.find(packet_b.replicated, member), nil, "B's packet never creates the member")
+	expect_equal(table.find(packet_c.replicated, member), nil, "nor does the third client's")
+	env.apply(env.packet_for(snapshot, env.player_a))
+	local le_a = c.net.get_client_entity(member)
+	expect(le_a ~= nil and c.world:contains(le_a), "A's client creates the member")
+	expect_equal(c.world:get(le_a, c.defs.Health), 7, "with its Health")
+end)
+
+test("setting an ExportsPrivacy ships the delegators' deletions and nothing for the group's own cells", function(env)
+	-- the export sits below the group's own gate, so setting it re-derives only what the delegators inherit: B's
+	-- packet deletes the member and carries nothing else at all -- the group's existence and cells stay exactly
+	-- as B holds them -- and A, still admitted everywhere, receives no packet.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.defs.Health, 30)
+	s.world:add(group, s.defs.Burning)
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 31)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local lg_b = c2.net.get_client_entity(group)
+	local le_b = c2.net.get_client_entity(member)
+	expect(lg_b ~= nil and c2.world:contains(lg_b), "B holds the group before the export")
+	expect(le_b ~= nil and c2.world:contains(le_b), "and the member")
+
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "A, admitted by the export, receives no packet at all")
+	expect(packets[env.player_b] ~= nil, "B receives a packet")
+	local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 1, "B's packet deletes exactly one entity")
+	expect_equal(decoded_b.unreplicated[1], member, "and it is the member")
+	expect_equal(#decoded_b.replicated, 0, "B's packet creates nothing")
+	expect_equal(#decoded_b.sections, 0, "B's packet carries no cell at all: the group's own cells were never touched")
+
+	env.apply(decoded_b, c2)
+	expect_equal(c2.world:contains(le_b), false, "B's client drops the member")
+	expect_equal(c2.world:contains(lg_b), true, "and keeps the group")
+	expect_equal(c2.world:get(lg_b, c2.defs.Health), 30, "with its Health")
+	expect_equal(c2.world:has(lg_b, c2.defs.Burning), true, "and its tag")
+	expect(c.net.get_client_entity(member) ~= nil, "A's client keeps the member")
+end)
+
+test("an export that does not narrow below the group's own gate ships nothing at all", function(env)
+	-- the group already gates itself to A, so an export naming A and B hands the member exactly what it inherited
+	-- before: the exported words compare equal, and neither client receives a packet.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 12)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "precondition: A sees the member")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "precondition: B does not")
+
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = true })
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "A receives no packet")
+	expect_equal(packets[env.player_b], nil, "and neither does B, whom the export names but cannot admit")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A keeps the member")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and B stays out")
+end)
+
+test("an own-filter edit that leaves the exported gate unchanged ships nothing to the delegators", function(env)
+	-- the export already excludes B, so dropping B from the group's own filter changes the group's gate but not
+	-- what the member inherits: B's packet deletes the group and carries nothing about the member, and A, whose
+	-- standing moved nowhere, receives no packet.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 22)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local lg_b = c2.net.get_client_entity(group)
+	expect(lg_b ~= nil and c2.world:contains(lg_b), "B holds the group before the edit")
+	expect_equal(c2.net.get_client_entity(member), nil, "but never the member, which the export keeps from B")
+
+	s.net.edit_entity_privacy(group, env.player_b, false)
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "A, untouched by the edit, receives no packet")
+	expect(packets[env.player_b] ~= nil, "B receives a packet")
+	local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 1, "B's packet deletes exactly one entity")
+	expect_equal(decoded_b.unreplicated[1], group, "and it is the group")
+	expect_equal(#decoded_b.replicated, 0, "B's packet creates nothing")
+	expect_equal(#decoded_b.sections, 0, "and carries no cell: nothing about the member shipped")
+
+	env.apply(decoded_b, c2)
+	expect_equal(c2.world:contains(lg_b), false, "B's client drops the group")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A keeps the member")
+	expect(c.net.get_client_entity(member) ~= nil, "on its client too")
+end)
+
+test("removing an ExportsPrivacy widens the delegators back, shipping nothing for the group", function(env)
+	-- the member's value moves while B cannot see it, so the widening has to carry the current value, and it has
+	-- to be the whole packet: B's creation of the member and the member's own cell, with the group, which B
+	-- already holds, never mentioned.
+	local s = env.server
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.defs.Health, 60)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 61)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local lg_b = c2.net.get_client_entity(group)
+	expect(lg_b ~= nil and c2.world:contains(lg_b), "B holds the group while the export excludes it")
+	expect_equal(c2.net.get_client_entity(member), nil, "but not the member")
+
+	s.world:set(member, s.defs.Health, 62)
+	env.apply(env.packet_for(env.frame(), env.player_a))
+
+	s.world:remove(group, s.net.ExportsPrivacy)
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "A, admitted all along, receives no packet")
+	expect(packets[env.player_b] ~= nil, "B receives a packet")
+	local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+	expect_equal(#decoded_b.replicated, 1, "B's packet creates exactly one entity")
+	expect_equal(decoded_b.replicated[1], member, "and it is the member")
+	expect_equal(#decoded_b.unreplicated, 0, "B's packet deletes nothing")
+	expect_equal(#decoded_b.sections, 1, "B's packet carries exactly one section")
+	local data = decoded_b.components[s.defs.Health]
+	expect(
+		data ~= nil and data.ids ~= nil and #data.ids == 1 and data.ids[1] == member,
+		"the one cell is the member's Health, nothing of the group's"
+	)
+	expect(data.values ~= nil and data.values[1] == 62, "carrying the member's current value")
+
+	env.apply(decoded_b, c2)
+	local le_b = c2.net.get_client_entity(member)
+	expect(le_b ~= nil and c2.world:contains(le_b), "B's client creates the member")
+	expect_equal(c2.world:get(le_b, c2.defs.Health), 62, "with the current Health")
+	expect_equal(c2.world:get(lg_b, c2.defs.Health), 60, "and the group B already held is untouched")
+end)
+
+test("a valueless ExportsPrivacy add warns and blocks every delegator, leaving the group visible", function(env)
+	-- the nil normalization rides the same path as Private's: world:add with no value means "block", so the
+	-- export lands as an empty filter and the member reaches nobody, while the group reaches everyone.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	expected_warning("ExportsPrivacy filters cannot have a nil value!")
+	s.world:add(group, s.net.ExportsPrivacy) -- valueless: normalized
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), true, "the valueless export stays on the group")
+	local filter = s.world:get(group, s.net.ExportsPrivacy)
+	expect(filter ~= nil and next(filter) == nil, "carrying an empty filter in place of the nil")
+	expect_equal(table.isfrozen(filter), true, "the normalized filter is frozen like any cached one")
+
+	-- the group anchors both packets as real deliveries
+	local snapshot = env.frame()
+	local packet_a = env.packet_for(snapshot, env.player_a)
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	expect(table.find(packet_a.replicated, group) ~= nil, "A receives the group")
+	expect(table.find(packet_b.replicated, group) ~= nil, "and so does B")
+	expect_equal(table.find(packet_a.replicated, member), nil, "A never receives the member")
+	expect_equal(table.find(packet_b.replicated, member), nil, "nor does B")
+end)
+
+test("a nil value over an ExportsPrivacy empties it, hiding the delegators it admitted", function(env)
+	local s, c = env.server, env.client
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 4)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	env.apply(env.packet_for(env.frame(), env.player_a))
+	local le_a = c.net.get_client_entity(member)
+	expect(le_a ~= nil and c.world:contains(le_a), "A's client holds the member before the edit")
+
+	expected_warning("ExportsPrivacy filters cannot have a nil value!")
+	s.world:set(group, s.net.ExportsPrivacy, nil)
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), true, "the export was emptied, not removed")
+	local filter = s.world:get(group, s.net.ExportsPrivacy)
+	expect(filter ~= nil and next(filter) == nil, "carrying an empty filter")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), false, "so A loses the member")
+	expect_equal(s.net.is_entity_visible(group, env.player_a), true, "while keeping the group")
+
+	local packet_a = env.packet_for(env.frame(), env.player_a)
+	expect_equal(#packet_a.unreplicated, 1, "A is told to delete exactly one entity")
+	expect_equal(packet_a.unreplicated[1], member, "the member")
+	env.apply(packet_a)
+	expect_equal(c.world:contains(le_a), false, "A's client drops the member")
+end)
+
+test("guard: a paired ExportsPrivacy errors and the pair is removed", function(env)
+	-- the export is entity-level only, like delegation's own gate. the guard's undo has to take the pair and
+	-- nothing else: the group's real export keeps narrowing its delegator afterwards, whichever form -- valueless
+	-- add or valued set -- the misuse took.
+	local s = env.server
+	local target = s.world:entity()
+	local group = s.world:entity()
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	expect_error(function()
+		s.world:add(group, pair(s.net.ExportsPrivacy, target))
+	end, "adding ExportsPrivacy paired", "ExportsPrivacy is not meant to be paired!")
+	expect_equal(s.world:has(group, pair(s.net.ExportsPrivacy, target)), false, "the added pair was removed")
+
+	expect_error(function()
+		s.world:set(group, pair(s.net.ExportsPrivacy, target), { [env.player_b] = true })
+	end, "setting ExportsPrivacy paired", "ExportsPrivacy is not meant to be paired!")
+	expect_equal(s.world:has(group, pair(s.net.ExportsPrivacy, target)), false, "the set pair was removed")
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), true, "the real, unpaired export survives")
+
+	env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "the surviving export still admits A")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and still narrows B out")
+end)
+
+test("guard: a mixed-polarity ExportsPrivacy errors, undoes the add, and leaves the delegators open", function(env)
+	local s = env.server
+	local group = s.world:entity()
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	expect_error(function()
+		s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = false })
+	end, "a mixed-polarity ExportsPrivacy with no previous filter", "cannot mix allowed")
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), false, "the export removed by the guard before erroring")
+
+	local snapshot = env.frame()
+	expect_equal(env.packet_for(snapshot, env.player_a).replicated[1], member, "A sees the member, unnarrowed")
+	expect_equal(env.packet_for(snapshot, env.player_b).replicated[1], member, "and so does B")
+end)
+
+test("guard: a mixed-polarity ExportsPrivacy reverts to the previous filter with no spurious delta", function(env)
+	local s = env.server
+	local group = s.world:entity()
+	local whitelist = { [env.player_a] = true }
+	s.world:set(group, s.net.ExportsPrivacy, whitelist)
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 1)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+
+	expect_error(function()
+		s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = false })
+	end, "a mixed-polarity ExportsPrivacy with a previous filter", "cannot mix allowed")
+	expect_equal(s.world:get(group, s.net.ExportsPrivacy), whitelist, "the previous filter is restored by reference")
+
+	-- the revert re-derives the exported words, but they land back where they were, so no delegator restages
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "no spurious packet for A")
+	expect_equal(packets[env.player_b], nil, "B still narrowed out, no churn either way")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A stays admitted by the reverted export")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and B stays narrowed out by it")
+end)
+
+test(
+	"guard: a non-table ExportsPrivacy value errors and reverts to the previous filter, which still narrows",
+	function(env)
+		local s = env.server
+		local group = s.world:entity()
+		local whitelist = { [env.player_a] = true }
+		s.world:set(group, s.net.ExportsPrivacy, whitelist)
+		local member = s.world:entity()
+		s.world:add(member, s.net.Replicated)
+		s.world:add(member, pair(s.net.InheritsPrivacy, group))
+		env.frame()
+
+		expect_error(function()
+			s.world:set(group, s.net.ExportsPrivacy, "everyone" :: any)
+		end, "a non-table ExportsPrivacy value with a previous filter", "must be tables keyed by client")
+		expect_equal(
+			s.world:get(group, s.net.ExportsPrivacy),
+			whitelist,
+			"the previous filter is restored by reference"
+		)
+
+		env.frame()
+		expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A stays admitted by the reverted export")
+		expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and B stays narrowed out by it")
+	end
+)
+
+test("an ExportsPrivacy value is frozen, and one naming an untracked client is stored pruned of them", function(env)
+	local s = env.server
+	local stranger = fake_player("ExportStranger")
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated) -- anchors the stranger's later full packet as a real one
+	local clean = { [env.player_a] = true }
+	s.world:set(group, s.net.ExportsPrivacy, clean)
+	expect_equal(s.world:get(group, s.net.ExportsPrivacy), clean, "a filter with nothing to prune is stored as passed")
+	expect_equal(table.isfrozen(clean), true, "and frozen in place")
+
+	local named = { [env.player_a] = true, [stranger] = true }
+	expected_warning("ExportsPrivacy filter named 1 untracked client(s)! they were pruned from it")
+	s.world:set(group, s.net.ExportsPrivacy, named)
+	local stored = s.world:get(group, s.net.ExportsPrivacy)
+	expect(stored ~= named, "the pruned copy replaced the table that was passed")
+	expect_equal(stored[env.player_a], true, "the tracked client keeps their standing")
+	expect_equal(stored[stranger], nil, "the never-tracked client is pruned out of the value")
+	expect_equal(table.isfrozen(stored), true, "the pruned value is frozen like any cached filter")
+
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "the pruned export still admits A")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "and still narrows B out")
+
+	-- joining later cannot restore a standing the export no longer holds
+	local c2 = env.make_client()
+	local packet = env.join(stranger, c2)
+	expect(table.find(packet.replicated, group) ~= nil, "the stranger's full packet carries the group")
+	expect_equal(table.find(packet.replicated, member), nil, "but not the member: the pruned client joins narrowed out")
+end)
+
+test("an ExportsPrivacy blacklist naming only untracked clients is removed, widening what it replaced", function(env)
+	-- the blacklist sanitizes to nobody, so it is removed outright from inside the triggering set -- and its
+	-- removed hook clears the whitelist it replaced, so the member widens back to the group's own gate rather
+	-- than staying narrowed by a filter the group no longer holds.
+	local s = env.server
+	local departed = fake_player("ExportDeparted")
+	s.net.add_client(departed)
+	env.frame() -- allocate then depart, so the blacklist below names a dead slot
+	s.net.remove_client(departed)
+
+	local group = s.world:entity()
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 9)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "precondition: the whitelist narrows B out")
+
+	expected_warning("ExportsPrivacy blacklist named only untracked clients! it was removed outright")
+	s.world:set(group, s.net.ExportsPrivacy, { [departed] = false })
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), false, "the blacklist was removed by the set")
+
+	local packet_b = env.packet_for(env.frame(), env.player_b)
+	expect_equal(packet_b.replicated[1], member, "B receives the member, the replaced whitelist cleared")
+	local data_b = packet_b.components[s.defs.Health]
+	expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 9, "with its Health")
+
+	-- the removal took the cached filter with it: admitting a client is the ordinary no-filter no-op
+	expected_warning("cannot allow a client without a whitelist")
+	s.net.edit_exported_privacy(group, env.player_a, true)
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), false, "the refused admission left no export behind")
+end)
+
+test("edit_exported_privacy on a whitelist admits and drops delegators, an emptied one blocking them all", function(env)
+	local s = env.server
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 5)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	expect_equal(c2.net.get_client_entity(member), nil, "B is narrowed out before the edit")
+
+	s.net.edit_exported_privacy(group, env.player_b, true)
+	expect_equal(s.world:get(group, s.net.ExportsPrivacy)[env.player_b], true, "the edit names B in the export")
+	-- the edit lands on the export alone: the group's own gate and the member's stay untouched
+	expect_equal(s.world:has(group, s.net.Private), false, "the group gains no filter of its own")
+	expect_equal(s.world:has(member, s.net.Private), false, "and neither does the member")
+	local packet_b = env.packet_for(env.frame(), env.player_b)
+	expect_equal(#packet_b.replicated, 1, "B receives exactly one creation, the group already held")
+	expect_equal(packet_b.replicated[1], member, "the member's")
+	env.apply(packet_b, c2)
+	local le_b = c2.net.get_client_entity(member)
+	expect_equal(c2.world:get(le_b, c2.defs.Health), 5, "B's client gains the member's Health")
+
+	s.net.edit_exported_privacy(group, env.player_a, false)
+	s.net.edit_exported_privacy(group, env.player_b, false)
+	local drained = s.world:get(group, s.net.ExportsPrivacy)
+	expect(drained ~= nil and next(drained) == nil, "the drained whitelist stays, as an empty table")
+	local snapshot2 = env.frame()
+	expect_equal(env.packet_for(snapshot2, env.player_a).unreplicated[1], member, "A is told to drop the member")
+	expect_equal(env.packet_for(snapshot2, env.player_b).unreplicated[1], member, "and so is B")
+	expect_equal(s.net.is_entity_visible(group, env.player_a), true, "the group stays visible to A")
+	expect_equal(s.net.is_entity_visible(group, env.player_b), true, "and to B")
+end)
+
+test("edit_exported_privacy with no export starts a blacklist, and un-naming its last client removes it", function(env)
+	-- the start can only narrow: no export admits everyone the group's own gate admits, so a disallow carves one
+	-- client out of that, and the un-name that empties the blacklist drops it rather than leaving an empty table,
+	-- which would block every delegator.
+	local s = env.server
+	local c2 = env.make_client()
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 6)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local le_b = c2.net.get_client_entity(member)
+	expect(le_b ~= nil and c2.world:contains(le_b), "B holds the member with no export configured")
+
+	s.net.edit_exported_privacy(group, env.player_b, false)
+	local started = s.world:get(group, s.net.ExportsPrivacy)
+	expect(started ~= nil and started[env.player_b] == false, "the disallow started a blacklist naming B")
+	expect_equal(table.isfrozen(started), true, "frozen like any cached filter")
+	local snapshot2 = env.frame()
+	local packet_b = env.packet_for(snapshot2, env.player_b)
+	expect_equal(#packet_b.unreplicated, 1, "B is told to delete exactly one entity")
+	expect_equal(packet_b.unreplicated[1], member, "the member, not the group")
+	expect_equal(#env.packet_for(snapshot2, env.player_a).unreplicated, 0, "A, unnamed, keeps the member")
+	env.apply(packet_b, c2)
+	expect_equal(c2.world:contains(le_b), false, "B's client drops the member")
+
+	s.net.edit_exported_privacy(group, env.player_b, true)
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), false, "un-naming the last client removed the export")
+	local packet_b2 = env.packet_for(env.frame(), env.player_b)
+	expect_equal(packet_b2.replicated[1], member, "B receives the member again")
+	env.apply(packet_b2, c2)
+	expect_equal(
+		c2.world:get(c2.net.get_client_entity(member), c2.defs.Health),
+		6,
+		"B's client regains the member's Health"
+	)
+end)
+
+test("a departing client is pruned from an ExportsPrivacy whitelist, which keeps blocking the delegators", function(env)
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated) -- anchors the rejoiner's full packet as a real one
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	-- anchor the grant before the departure: an export that admitted nobody would satisfy everything below
+	local packets = env.frame()
+	expect(table.find(packets[env.player_b].replicated, member) ~= nil, "B sees the member")
+	expect_equal(table.find(packets[env.player_a].replicated, member), nil, "A does not: the export names B alone")
+
+	s.net.remove_client(env.player_b)
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), true, "the whitelist stays on the group")
+	local pruned = s.world:get(group, s.net.ExportsPrivacy)
+	expect_equal(pruned[env.player_b], nil, "the departed client is pruned from the stored value")
+	expect_equal(next(pruned), nil, "leaving an empty table")
+	expect_equal(table.isfrozen(pruned), true, "frozen like any cached filter")
+
+	local c2 = env.make_client()
+	local packet_b = env.join(env.player_b, c2)
+	expect(table.find(packet_b.replicated, group) ~= nil, "the rejoiner receives the group")
+	expect_equal(table.find(packet_b.replicated, member), nil, "but not the member: the empty export blocks it")
+end)
+
+test("an ExportsPrivacy blacklist naming only the departing client is removed on departure", function(env)
+	-- an empty table left behind would read as a whitelist blocking every delegator, so the removal is what keeps
+	-- the client who never left admitted; the rejoiner, no longer named, is admitted too.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_b] = false })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 16)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local packets = env.frame()
+	expect(table.find(packets[env.player_a].replicated, member) ~= nil, "A sees the member")
+	expect_equal(table.find(packets[env.player_b].replicated, member), nil, "B is narrowed out")
+
+	s.net.remove_client(env.player_b)
+	expect_equal(s.world:has(group, s.net.ExportsPrivacy), false, "the emptied blacklist was removed from the group")
+	local packet_a = env.packet_for(env.frame(), env.player_a)
+	expect_equal(#packet_a.unreplicated, 0, "A is never told to drop the member")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A stays admitted")
+
+	local c2 = env.make_client()
+	local packet_b = env.join(env.player_b, c2)
+	expect(table.find(packet_b.replicated, member) ~= nil, "the rejoiner, no longer named, receives the member")
+	env.apply(packet_b, c2)
+	local le_b = c2.net.get_client_entity(member)
+	expect_equal(c2.world:get(le_b, c2.defs.Health), 16, "with its Health")
+end)
+
+test("a client joining later is admitted to a root exporter's delegators by its ExportsPrivacy blacklist", function(env)
+	-- the joiner's bit enters the blacklist's allow words at slot allocation, and the exported words derive from
+	-- them, so the join has to re-derive every exporter's -- a root group delegating to nothing included, which no
+	-- walk over the delegators' own derivations would refresh -- before the full packet reads the member's gate.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.defs.Health, 70)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = false })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 71)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+
+	local c3 = env.make_client()
+	local player_c = fake_player("ExportJoiner")
+	local packet_c = env.join(player_c, c3)
+	expect(table.find(packet_c.replicated, group) ~= nil, "the joiner's full packet carries the group")
+	expect(table.find(packet_c.replicated, member) ~= nil, "and the member, the blacklist not naming them")
+	local le_c = c3.net.get_client_entity(member)
+	expect(le_c ~= nil and c3.world:contains(le_c), "the joiner's client creates the member")
+	expect_equal(c3.world:get(le_c, c3.defs.Health), 71, "with its Health")
+	expect_equal(s.net.is_entity_visible(member, player_c), true, "the joiner passes the export")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), false, "while A, named, stays narrowed out")
+	expect_equal(s.net.is_entity_visible(member, env.player_b), true, "and B stays admitted")
+end)
+
+test("a client joining later is admitted through a mid-chain exporter's ExportsPrivacy blacklist", function(env)
+	-- mid both inherits and exports, so the join re-derives its self gate from the root first and its exported
+	-- gate from that, both against the joiner's freshly granted bits, before the leaf below reads either.
+	local s = env.server
+	local root = s.world:entity()
+	s.world:set(root, s.net.Private, { [env.player_a] = false })
+	local mid = s.world:entity()
+	s.world:add(mid, s.net.Replicated)
+	s.world:add(mid, pair(s.net.InheritsPrivacy, root))
+	s.world:set(mid, s.net.ExportsPrivacy, { [env.player_b] = false })
+	local leaf = s.world:entity()
+	s.world:add(leaf, s.net.Replicated)
+	s.world:set(leaf, s.defs.Health, 81)
+	s.world:add(leaf, pair(s.net.InheritsPrivacy, mid))
+	env.frame()
+
+	local c3 = env.make_client()
+	local player_c = fake_player("ExportChainJoiner")
+	local packet_c = env.join(player_c, c3)
+	expect(table.find(packet_c.replicated, mid) ~= nil, "the joiner's full packet carries mid")
+	expect(table.find(packet_c.replicated, leaf) ~= nil, "and the leaf, past both blacklists")
+	local le_c = c3.net.get_client_entity(leaf)
+	expect(le_c ~= nil and c3.world:contains(le_c), "the joiner's client creates the leaf")
+	expect_equal(c3.world:get(le_c, c3.defs.Health), 81, "with its Health")
+
+	expect_equal(s.net.is_entity_visible(leaf, env.player_a), false, "A is narrowed out of the leaf by the root")
+	expect_equal(s.net.is_entity_visible(leaf, env.player_b), false, "B by mid's export")
+	expect_equal(s.net.is_entity_visible(mid, env.player_b), true, "which never gates mid itself")
+	expect_equal(s.net.is_entity_visible(mid, env.player_a), false, "while the root's own gate does")
+end)
+
+test("a delegator added after a join inherits the joiner's standing in an export that had no delegators", function(env)
+	-- the join re-derives every exporter's words, not only those a delegator's derivation reaches as a parent: an
+	-- export with nothing below it at the join is read the moment a first delegator arrives, and has to carry the
+	-- joiner's freshly granted bit by then.
+	local s, c = env.server, env.client
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_a] = false })
+	env.frame()
+
+	local c3 = env.make_client()
+	local player_c = fake_player("ExportChildlessJoiner")
+	local packet_c = env.join(player_c, c3)
+	expect(table.find(packet_c.replicated, group) ~= nil, "the joiner's full packet carries the group")
+
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 91)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	local snapshot = env.frame()
+	local packet_c2 = env.packet_for(snapshot, player_c)
+	expect_equal(packet_c2.replicated[1], member, "the joiner, unnamed by the blacklist, receives the new delegator")
+	env.apply(packet_c2, c3)
+	local le_c = c3.net.get_client_entity(member)
+	expect_equal(c3.world:get(le_c, c3.defs.Health), 91, "with its Health")
+	expect_equal(env.packet_for(snapshot, env.player_b).replicated[1], member, "B, unnamed too, receives it as well")
+	env.apply(env.packet_for(snapshot, env.player_a))
+	expect_equal(c.net.get_client_entity(member), nil, "while A, named, never does")
+end)
+
+test("recycling a client slot clears a stale exported grant", function(env)
+	-- a newcomer reusing a freed bit does not inherit the prior occupant's admission through the export: the
+	-- freed-slot sweep clears the stale bit, and the join re-derives the exported words from the swept ones.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:set(group, s.net.ExportsPrivacy, { [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	-- an ungated entity anchors the newcomer's full packet as a real delivery
+	local open = s.world:entity()
+	s.world:add(open, s.net.Replicated)
+
+	-- anchor the grant before the recycle: an export that admitted nobody would satisfy everything below
+	local packets = env.frame()
+	expect(table.find(packets[env.player_b].replicated, member) ~= nil, "B sees the member through the export")
+	expect_equal(table.find(packets[env.player_a].replicated, member), nil, "A does not")
+
+	-- B leaves, then a fresh player reuses B's freed bit
+	s.net.remove_client(env.player_b)
+	local c2 = env.make_client()
+	local player_c = fake_player("ExportRecycler")
+	local packet_c = env.join(player_c, c2)
+	expect(table.find(packet_c.replicated, open) ~= nil, "the newcomer's full packet is real")
+	expect_equal(table.find(packet_c.replicated, member), nil, "the newcomer does not inherit B's exported admission")
+	expect_equal(s.net.is_entity_visible(member, player_c), false, "and the server agrees")
+end)
+
+test("a delegator narrowed by an export survives a shard-compacting move", function(env)
+	-- the exported words transfer with the rest when the straggler migrates; a fresh delegation edge after the
+	-- move re-derives the member from the group's stored exported words without re-deriving the group, so a word
+	-- left behind in the old shard would drop the straggler right there.
+	local s = env.server
+	local fillers = join_named_fillers(env, 30) -- shard 1 holds its full 32 (A, B, and 30 fillers)
+
+	local straggler = fake_player("ExportStraggler")
+	local sc = env.make_client()
+	env.join(straggler, sc) -- opens shard 2 as its sole occupant (33 live clients)
+
+	local group = s.world:entity()
+	s.world:set(group, s.net.ExportsPrivacy, { [straggler] = true })
+	local spare = s.world:entity() -- unrestricted: its edge narrows nobody
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 10)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, straggler), sc)
+	env.apply(env.packet_for(snapshot, env.player_a))
+	local le = sc.net.get_client_entity(member)
+	expect(le ~= nil, "the straggler sees the narrowed member before the shrink")
+	expect_equal(env.client.net.get_client_entity(member), nil, "player A never sees it")
+
+	-- drop 10 of shard 1's fillers, leaving 23 live clients, and trigger the reclaim: the straggler migrates down
+	-- into shard 1
+	for i = 1, 10 do
+		s.net.remove_client(fillers[i])
+	end
+	s.net.generate_packets()
+	expect_equal(s.net._client_shard(straggler), 1, "the straggler migrates down into shard 1")
+
+	s.world:add(member, pair(s.net.InheritsPrivacy, spare))
+	s.world:set(member, s.defs.Health, 20)
+	local snapshot2 = env.frame()
+	local packet_s = env.packet_for(snapshot2, straggler)
+	expect_equal(#packet_s.unreplicated, 0, "the re-derivation after the move keeps the straggler admitted")
+	env.apply(packet_s, sc)
+	env.apply(env.packet_for(snapshot2, env.player_a))
+	expect_equal(sc.world:get(le, sc.defs.Health), 20, "the migrated straggler still receives the member's change")
+	expect_equal(env.client.net.get_client_entity(member), nil, "player A stays excluded after the move")
+end)
+
+test("a departed client's exported grant never passes to a straggler compacted into their slot", function(env)
+	-- a departure prunes the export's whitelist but, like every departure, leaves the departed bit in the stored
+	-- words; when compaction moves a straggler into that very slot, the sweep has to clear the exported words
+	-- along with the own ones, or the next derivation reading them admits the straggler. no join follows the
+	-- move, so nothing else re-derives the exported words from the swept own ones first.
+	local s = env.server
+	local fillers = join_named_fillers(env, 30) -- shard 1 holds its full 32 (A, B, and 30 fillers)
+
+	local straggler = fake_player("ExportSlotHeir")
+	local sc = env.make_client()
+	env.join(straggler, sc) -- opens shard 2 as its sole occupant (33 live clients)
+
+	-- pending clients take their slots in hash order rather than join order, so which filler holds the lowest
+	-- filler slot -- the one lowest-first assignment hands the straggler -- is unknown: naming every filler makes
+	-- whichever slot it inherits one the export granted
+	local every_filler = {}
+	for _, filler in fillers do
+		every_filler[filler] = true
+	end
+	local group = s.world:entity()
+	s.world:set(group, s.net.ExportsPrivacy, every_filler)
+	local spare = s.world:entity() -- unrestricted: its edge narrows nobody
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+
+	-- anchor the grant before the departures: an export that admitted nobody would satisfy everything below
+	local snapshot = env.frame()
+	expect_equal(env.packet_for(snapshot, fillers[1]).replicated[1], member, "a named filler sees the member")
+	expect_equal(s.net.is_entity_visible(member, straggler), false, "the straggler does not")
+
+	-- every filler departs, leaving 3 live clients, and the reclaim moves the straggler into a freed filler slot
+	for _, filler in fillers do
+		s.net.remove_client(filler)
+	end
+	s.net.generate_packets()
+	expect_equal(s.net._client_shard(straggler), 1, "the straggler migrates down into shard 1")
+
+	-- a fresh edge re-derives the member from the group's stored exported words without re-deriving the group
+	s.world:add(member, pair(s.net.InheritsPrivacy, spare))
+	expect_equal(s.net.is_entity_visible(member, straggler), false, "the straggler inherits no stale grant")
+	local packets = s.net.generate_packets()
+	expect_equal(packets[straggler], nil, "and receives no packet creating the member")
 end)
 
 -- 21) grouped pair sections
@@ -13631,6 +14592,7 @@ test("the per-world accessors memoize their instance and share one component set
 	expect_equal(server_net.Replicated, components.Replicated, "Replicated comes from the shared set")
 	expect_equal(server_net.Private, components.Private, "Private comes from the shared set")
 	expect_equal(server_net.InheritsPrivacy, components.InheritsPrivacy, "InheritsPrivacy comes from the shared set")
+	expect_equal(server_net.ExportsPrivacy, components.ExportsPrivacy, "ExportsPrivacy comes from the shared set")
 	expect_equal(server_net.Serdes, components.Serdes, "Serdes comes from the shared set")
 
 	-- shared hands back the whole set whichever half constructs; an instance carries only its own side's slice
@@ -13680,6 +14642,48 @@ test("every component in the shared set carries its key as a dotted jecs.Name", 
 	local client_world = jecs.world()
 	duplecs.client(client_world)
 	expect_named(client_world, duplecs.shared(client_world), "client-constructed")
+end)
+
+test("ExportsPrivacy rides the shared set under its dotted name and is inert on a client world", function()
+	-- the walk above covers the name generically; this pins the set's newest server-side entry by hand, along with
+	-- what being server-side means on the other half: a client world holds the component but connects no hook for
+	-- it, so even values a server would refuse land untouched -- unfrozen, unrewritten, and silent (declaring no
+	-- warning is the assertion).
+	local server_world = jecs.world()
+	local server_net = duplecs.server(server_world)
+	local server_components = duplecs.shared(server_world)
+	expect(server_components.ExportsPrivacy ~= nil, "the shared set carries ExportsPrivacy")
+	expect_equal(
+		server_net.ExportsPrivacy,
+		server_components.ExportsPrivacy,
+		"the server instance returns the shared set's id"
+	)
+	expect_equal(
+		server_world:get(server_net.ExportsPrivacy, jecs.Name),
+		"duplecs.ExportsPrivacy",
+		"named in jecs's dotted style"
+	)
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	local components = duplecs.shared(client_world)
+	expect_equal(client_net.ExportsPrivacy, nil, "the client instance omits it with the rest of the server-side slice")
+	expect_equal(client_world:get(components.ExportsPrivacy, jecs.Name), "duplecs.ExportsPrivacy", "named there too")
+
+	local entity = client_world:entity()
+	local mixed = { [fake_player("InertExportA")] = true, [fake_player("InertExportB")] = false }
+	client_world:set(entity, components.ExportsPrivacy, mixed) -- mixed polarity: a server would error
+	expect_equal(client_world:get(entity, components.ExportsPrivacy), mixed, "the value lands as passed")
+	expect_equal(table.isfrozen(mixed), false, "unfrozen: no hook ever saw it")
+
+	local valueless = client_world:entity()
+	client_world:add(valueless, components.ExportsPrivacy) -- valueless: a server would warn and rewrite it
+	expect_equal(client_world:has(valueless, components.ExportsPrivacy), true, "the valueless add lands")
+	expect_equal(client_world:get(valueless, components.ExportsPrivacy), nil, "with no rewrite to an empty filter")
+
+	local target = client_world:entity()
+	client_world:add(entity, pair(components.ExportsPrivacy, target)) -- paired: a server would error
+	expect_equal(client_world:has(entity, pair(components.ExportsPrivacy, target)), true, "the pair stays")
 end)
 
 test("a schema tagged through duplecs.shared before construction replicates like one tagged after", function()
@@ -13963,6 +14967,64 @@ test("a multi-parent delegation DAG built before construction gates and fans out
 	expect(client.net.get_client_entity(sibling_a) ~= nil, "while group_a's member is untouched")
 end)
 
+test("an ExportsPrivacy set before construction narrows its delegators from the construction call", function()
+	-- the replay caches the export before the delegation edges replay against it, so the member's first
+	-- derivation already reads the narrowed gate. the pre-construction export is the empty one for the reason the
+	-- DAG test above gives -- a valued filter would be pruned -- and the post-construction edits below prove the
+	-- replay seeded a live cache rather than leaving a value the caches never saw.
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+	local defs = make_defs(world)
+	world:add(defs.Health, components.Networked)
+
+	local group = world:entity()
+	world:add(group, components.Replicated)
+	world:set(group, defs.Health, 1)
+	local export = {}
+	world:set(group, components.ExportsPrivacy, export)
+	local member = world:entity()
+	world:add(member, components.Replicated)
+	world:set(member, defs.Health, 2)
+	world:add(member, pair(components.InheritsPrivacy, group))
+
+	local net = duplecs.server(world)
+	expect_equal(table.isfrozen(export), true, "the replay froze the export like a live set")
+
+	local player = fake_player("PreExportViewer")
+	net.add_client(player)
+	local server = { world = world, net = net, defs = defs }
+	local client = make_client(server)
+	local function sync()
+		local packets = net.generate_packets()
+		if packets[player] ~= nil then
+			client.net.reconcile_packet(deep_copy(packets[player]))
+		end
+	end
+
+	sync() -- allocates the slot and drains the joiner's full packet
+
+	local le_group = client.net.get_client_entity(group)
+	expect(le_group ~= nil, "the group arrived, the export never gating it, so the full packet was real")
+	expect_equal(client.world:get(le_group, client.defs.Health), 1, "and carried its value")
+	expect_equal(net.is_entity_visible(member, player), false, "the replayed empty export blocks the member")
+	expect_equal(client.net.get_client_entity(member), nil, "so the joiner's full packet never created it")
+
+	-- removing the export widens the member back: the removed hook found the replayed cache entry to clear
+	world:remove(group, components.ExportsPrivacy)
+	expect_equal(net.is_entity_visible(member, player), true, "the member widens back to the group's open gate")
+	sync()
+	local le_member = client.net.get_client_entity(member)
+	expect(le_member ~= nil, "the widened member reached the client")
+	expect_equal(client.world:get(le_member, client.defs.Health), 2, "with its value")
+
+	-- and the editor starts a fresh blacklist on the now-unfiltered group, narrowing the member out again
+	net.edit_exported_privacy(group, player, false)
+	expect_equal(net.is_entity_visible(member, player), false, "the fresh blacklist narrows the joiner out")
+	expect_equal(net.is_entity_visible(group, player), true, "while the group stays visible")
+	sync()
+	expect_equal(client.net.get_client_entity(member), nil, "the member was torn down on the client")
+end)
+
 test("a tracking tag paired before construction designates its target's mode from the construction call", function()
 	-- a paired tracking tag is a target-specific mode designation (see section 33), so the catch-up replays it
 	-- like any other pre-existing schema: the designated target's pairs replicate from the first packet, and
@@ -14132,6 +15194,23 @@ test(
 		expect_equal(surviving, 4, "exactly the edge that closed the cycle was removed, whichever one that was")
 	end
 )
+
+test("guard: a paired ExportsPrivacy added before construction errors from the construction call", function()
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+	local target = world:entity()
+	local entity = world:entity()
+	world:add(entity, pair(components.ExportsPrivacy, target))
+
+	expect_error(function()
+		duplecs.server(world)
+	end, "constructing over a pre-existing ExportsPrivacy pair", "ExportsPrivacy is not meant to be paired")
+	expect_equal(
+		world:has(entity, pair(components.ExportsPrivacy, target)),
+		false,
+		"the pair was removed by the guard before erroring"
+	)
+end)
 
 test("guard: a mixed-polarity Private value set before construction errors from the construction call", function()
 	local world = jecs.world()
@@ -14304,6 +15383,50 @@ test("both pre-construction filter forms are pruned, each warning once, in the c
 	local le_gated = client.net.get_client_entity(gated)
 	expect(le_gated ~= nil, "the paired filter gates only its component, so its entity still replicates")
 	expect_equal(client.world:has(le_gated, client.defs.Health), false, "with the pruned filter blocking the value")
+end)
+
+test("a valued ExportsPrivacy set before construction is pruned to an export blocking every delegator", function()
+	-- the same seam as a valued Private's: the client the export names cannot be tracked yet, so the catch-up
+	-- prunes it, warning from the construction call, and the export left behind blocks every delegator -- while
+	-- the group itself, which no export gates, still replicates.
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+	local defs = make_defs(world)
+	world:add(defs.Health, components.Networked)
+
+	local viewer = fake_player("PreExportPrunedViewer")
+	local group = world:entity()
+	world:add(group, components.Replicated)
+	world:set(group, defs.Health, 3)
+	world:set(group, components.ExportsPrivacy, { [viewer] = true })
+	local member = world:entity()
+	world:add(member, components.Replicated)
+	world:set(member, defs.Health, 4)
+	world:add(member, pair(components.InheritsPrivacy, group))
+
+	expected_warning("ExportsPrivacy filter named 1 untracked client(s)! they were pruned from it")
+	local net = duplecs.server(world)
+	expect_equal(world:has(group, components.ExportsPrivacy), true, "the export itself stays on the group")
+	local pruned = world:get(group, components.ExportsPrivacy)
+	expect_equal(pruned[viewer], nil, "the catch-up pruned the export's own value, not just the cache")
+	expect_equal(next(pruned), nil, "the export pruned of its only client is an empty table")
+	expect_equal(table.isfrozen(pruned), true, "the pruned value is frozen like any cached filter")
+
+	net.add_client(viewer)
+	local packets = net.generate_packets()
+	local server = { world = world, net = net, defs = defs }
+	local client = make_client(server)
+	client.net.reconcile_packet(deep_copy(packets[viewer]))
+
+	local le_group = client.net.get_client_entity(group)
+	expect(le_group ~= nil, "the group arrived, so the full packet was real")
+	expect_equal(client.world:get(le_group, client.defs.Health), 3, "and carried its value")
+	expect_equal(
+		net.is_entity_visible(member, viewer),
+		false,
+		"the server narrows the named-but-pruned client out of the member"
+	)
+	expect_equal(client.net.get_client_entity(member), nil, "the joiner's full packet excludes the member")
 end)
 
 test("valueless Private filters set before construction survive it as empty filters", function()
@@ -14675,7 +15798,7 @@ test("docs/api.md has a heading for every server and client export", function(en
 
 	-- the floors are today's public surfaces exactly, so an export that disappears from an instance fails here
 	-- too rather than quietly shrinking what this test covers; raise them when the surface really grows
-	expect(server_keys >= 23, `only {server_keys} server exports were checked against docs/api.md`)
+	expect(server_keys >= 25, `only {server_keys} server exports were checked against docs/api.md`)
 	expect(client_keys >= 14, `only {client_keys} client exports were checked against docs/api.md`)
 end)
 
@@ -14700,12 +15823,12 @@ test("docs/api.md documents no module-root, server, or client export that no lon
 
 	-- today's count of side-qualified headings exactly: a heading that stops reading as one -- demoted a level,
 	-- reformatted out of its backticks -- fails here instead of leaving this direction with less to check
-	expect(checked >= 38, `only {checked} side-qualified api.md headings were checked against the instances`)
+	expect(checked >= 40, `only {checked} side-qualified api.md headings were checked against the instances`)
 end)
 
 test("the spec's warnings-and-errors appendix quotes every message the sources raise", function()
 	local messages = collect_source_messages()
-	expect(#messages >= 44, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
+	expect(#messages >= 45, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
 
 	-- the entries' quoted messages, not the appendix whole: a message that survives only in an entry's prose
 	-- has no entry of its own, which is exactly the drift this direction exists to catch
@@ -14738,7 +15861,7 @@ end)
 test("the spec's warnings-and-errors appendix quotes no message the sources no longer raise", function()
 	local source_text = read_source_text()
 	local messages = collect_appendix_messages(read_diagnostics_appendix())
-	expect(#messages >= 41, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
+	expect(#messages >= 42, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
 
 	for _, message in messages do
 		local checked = 0
