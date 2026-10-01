@@ -19,7 +19,7 @@ Start with [Getting started](001-getting-started.md) if you're new; the rest are
 ## Controlling who sees what
 
 - **[Visibility filters](005-visibility-filters.md)** — server-only state with a single empty `Private` table, whitelists and blacklists, and editing membership.
-- **[Visibility inheritance](006-visibility-inheritance.md)** — one entity's filter followed by many others: multi-entity objects, squads, combining independent gates, and containers more visible than their contents.
+- **[Visibility inheritance](006-visibility-inheritance.md)** — one entity's filter followed by many others: multi-entity objects, squads, combining independent gates, inheriting through a containment relation like `ChildOf`, and containers more visible than their contents.
 - **[Visibility queries](007-visibility-queries.md)** — gating side-channel sends by the same rules packets follow, enumerating who sees an entity, and debugging filter setups.
 
 ## Values on the wire

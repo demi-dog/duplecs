@@ -1,6 +1,6 @@
 # Visibility Inheritance
 
-Many entities can share one entity-level [visibility filter](005-visibility-filters.md), and `InheritsPrivacy` is the component that points them at it: `pair(InheritsPrivacy, group)` makes an entity inherit `group`'s unpaired `Private` filter on top of its own — a client must pass both — so a single filter edit on the group updates every entity inheriting from it at once. Inheritance chains, too: a group may itself inherit from wider groups, so one edit near the top of a hierarchy reaches everything below it. A group can also hand its inheritors *less* than it sees itself, with `ExportsPrivacy`. Exact contracts live in the spec's [`InheritsPrivacy`](../spec.md#inheritsprivacy) and [`ExportsPrivacy`](../spec.md#exportsprivacy) sections.
+Many entities can share one entity-level [visibility filter](005-visibility-filters.md), and `InheritsPrivacy` is the component that points them at it: `pair(InheritsPrivacy, group)` makes an entity inherit `group`'s unpaired `Private` filter on top of its own — a client must pass both — so a single filter edit on the group updates every entity inheriting from it at once. Inheritance chains, too: a group may itself inherit from wider groups, so one edit near the top of a hierarchy reaches everything below it. When the group is also the entity's container, `InheritsPrivacyThrough` lets the entity inherit through a relationship it already has — `jecs.ChildOf`, say — so there is no second pair to keep in step. And a group can hand its inheritors *less* than it sees itself, with `ExportsPrivacy`. Exact contracts live in the spec's [`InheritsPrivacy`](../spec.md#inheritsprivacy), [`InheritsPrivacyThrough`](../spec.md#inheritsprivacythrough), and [`ExportsPrivacy`](../spec.md#exportsprivacy) sections.
 
 ## Multi-entity objects
 
@@ -73,6 +73,47 @@ world:add(unit, pair(net.InheritsPrivacy, region_interest_group)) -- who is near
 -- visible only to clients both groups admit
 ```
 
+## Containment: inheriting through a relationship
+
+Very often the entity whose filter should be followed is the entity's *container*, and the game already records that relationship — furniture in a room is `ChildOf` the room, an item in a chest is `ChildOf` the chest, the chest is `ChildOf` the vehicle carrying it. A direct `pair(InheritsPrivacy, room)` beside the `ChildOf` pair duplicates the relationship, and the two have to be kept in step by hand: every move is a retarget *plus* a matching inheritance edit, and a forgotten edit is a silent bug — an item picked up from a room but still inheriting from it is deleted along with the room when the room is deleted.
+
+`InheritsPrivacyThrough` removes the duplicate. Added to the inheriting entity as `pair(InheritsPrivacyThrough, relation)`, it makes the entity inherit from the target of every pair of that relation it carries, kept in sync with the relation automatically:
+
+```lua
+-- server
+local room = world:entity()
+world:add(room, net.Replicated)
+world:set(room, net.Private, { [nearby_player] = true })
+
+local item = world:entity()
+world:add(item, pair(net.InheritsPrivacyThrough, jecs.ChildOf)) -- "follow whatever my parent allows"
+world:add(item, pair(jecs.ChildOf, room))                       -- the containment pair is now the privacy edge too
+world:add(item, net.Replicated)
+
+-- picking the item up is one retarget: its visibility follows it to the player's inventory
+world:add(item, pair(jecs.ChildOf, player_inventory))
+
+-- and dropping it in another room is the same one move
+world:add(item, pair(jecs.ChildOf, other_room))
+```
+
+Prefer this over direct `InheritsPrivacy` pairs wherever the two would mirror each other. The pair goes on the entity, not on `ChildOf` itself — `ChildOf` is used for interface and visual hierarchies too, and only the entities that opt in become privacy edges — and it works with any relation the entity already uses, as long as that relation carries `pair(jecs.OnDeleteTarget, jecs.Delete)` the way `ChildOf` does. duplecs refuses a relation without it, with an error explaining why: under the default policy a container's deletion would merely drop the pair, and with it the inherited filter, leaving the contents visible to everyone — a leak. With `Delete`, deleting the room deletes its contents, which is also the natural teardown. A relation of your own just needs to declare it:
+
+```lua
+-- shared
+local StoredIn = world:entity()
+world:add(StoredIn, pair(jecs.OnDeleteTarget, jecs.Delete)) -- required before anything inherits through it
+
+-- server: an item in two containers at once is visible only to clients both admit
+world:add(item, pair(net.InheritsPrivacyThrough, StoredIn))
+world:add(item, pair(StoredIn, crate))
+world:add(item, pair(StoredIn, vault))
+```
+
+Everything else about inheritance carries over unchanged. The chain `room -> chest -> item` works with each level inheriting through `ChildOf`, so one edit on the room reaches the item two levels down. Inheriting through a relation combines with direct pairs and with other relations, every gate intersecting — and a group reached more than one way stays inherited until the last way to it is gone. A container's `ExportsPrivacy` narrows what its contents inherit, exactly as for direct inheritors. And adding the pair to an entity that already has `ChildOf` pairs takes them into account immediately, while removing it drops the inherited filters again.
+
+Reparenting ships only what changed: a client who could see the old parent but not the new one is told to delete the entity, one who sees only the new parent receives it, one who sees both receives just the changed `ChildOf` pair, and one who sees neither receives nothing at all. One thing to keep in mind if you register `removed` hooks of your own on the relation: jecs removes the old pair before adding the new one, so a hook running between the two can see the entity momentarily between parents (through `is_entity_visible`); that moment never reaches a packet.
+
 ## Containers more visible than their contents
 
 Sometimes the group should stay visible to more clients than what inherits from it: a chest everyone can see, whose item entities should reach only the player who opened it — or an enemy base shown to everyone as a map marker, whose contents replicate only to players nearby. `ExportsPrivacy` is a second filter on the group that narrows what its inheritors receive *below* the group's own visibility, while the group itself is unaffected:
@@ -122,13 +163,13 @@ The contents now follow the gate's filter, independent of the container's. The s
 ## Semantics to keep in mind
 
 - **Everything narrows.** The inherited gates apply on top of the entity's own unpaired `Private` (and each other), so a client must pass all of them. Inheriting can never *widen* what an entity's own filter allows — there is no privacy hazard in pointing at one more group. An *empty* unpaired `Private` filter on any group above an entity blocks every entity below it, and so does an empty `ExportsPrivacy` filter.
-- **Inheritance reaches all the way up.** An entity's effective gate applies every filter on every path of groups above it — the convoy example above, where a squad edit reaches the wheels through two levels. Those paths can branch (a group may itself inherit from several wider groups) but they can never loop: an add that would close a cycle removes the pair and errors, as does adding `InheritsPrivacy` unpaired.
+- **Inheritance reaches all the way up.** An entity's effective gate applies every filter on every path of groups above it — the convoy example above, where a squad edit reaches the wheels through two levels. Those paths can branch (a group may itself inherit from several wider groups) but they can never loop: an add that would close a cycle removes the pair and errors, as does adding `InheritsPrivacy` or `InheritsPrivacyThrough` unpaired. With `InheritsPrivacyThrough` the pair removed is whichever closed the loop — the inheriting pair when it was added over existing relationship pairs, or the relationship pair itself (a `ChildOf`, say) when parenting or reparenting closed it; a containment cycle that is also a privacy cycle is a bug either way, and the error points at it.
 - **Only the entity-level gate inherits.** `pair(Private, component)` filters always stay local to their entity, and `ExportsPrivacy` is entity-level only (pairing it errors).
-- **Removing a pair widens safely.** Dropping `pair(InheritsPrivacy, group)` re-derives the entity's gate from its remaining filters; newly-visible clients receive current state through the ordinary visibility diff. Removing an `ExportsPrivacy` filter widens its inheritors the same way.
+- **Removing a pair widens safely.** Dropping `pair(InheritsPrivacy, group)` re-derives the entity's gate from its remaining filters; newly-visible clients receive current state through the ordinary visibility diff. Removing an `ExportsPrivacy` filter widens its inheritors the same way, as does removing `pair(InheritsPrivacyThrough, relation)` or one of the relationship pairs it follows.
 
 ## Deletion cascades
 
-`InheritsPrivacy` carries `pair(jecs.OnDeleteTarget, jecs.Delete)`: deleting a group **deletes every entity inheriting from it**, and everything inheriting from those, all the way down — an entity dies when *any* of its groups dies. A group deletion therefore never silently widens anyone's visibility, and for multi-entity objects it is exactly the desired teardown (deleting the hull deletes the turret and wheels).
+`InheritsPrivacy` carries `pair(jecs.OnDeleteTarget, jecs.Delete)`: deleting a group **deletes every entity inheriting from it**, and everything inheriting from those, all the way down — an entity dies when *any* of its groups dies. A group deletion therefore never silently widens anyone's visibility, and for multi-entity objects it is exactly the desired teardown (deleting the hull deletes the turret and wheels). Inheriting through a relationship relies on the relationship carrying the same policy — which is why `InheritsPrivacyThrough` refuses one without it — so deleting a container deletes what inherits through it just the same.
 
 When inheritors should outlive a group — disbanding a squad without despawning its units — remove their pairs *before* deleting it:
 

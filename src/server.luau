@@ -173,6 +173,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local NetworkedUnreliable = components.NetworkedUnreliable
 	local Private = components.Private
 	local InheritsPrivacy = components.InheritsPrivacy
+	local InheritsPrivacyThrough = components.InheritsPrivacyThrough
 	local ExportsPrivacy = components.ExportsPrivacy
 
 	-- the tags' short names for diagnostics (their jecs.Name carries the duplecs. prefix)
@@ -235,6 +236,33 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local pair_id = archetype_types[index]
 			index += 1
 			return jecs.entity_index_get_alive(entity_index :: any, ECS_PAIR_SECOND(pair_id)) :: any
+		end
+	end
+
+	-- each_target's dense-half sibling: the same slice walk, yielding every target's dense id without resolving
+	-- it, so a dead target neither ends the loop nor goes unvisited -- for the mirror teardowns that key by
+	-- dense id and must drop every edge a pair ever stood for (see on_through_removed).
+	local function each_dense_target(entity: Entity, relation: Id): () -> number?
+		local record = entity_index.sparse_array[dense(entity)]
+		local idr = component_index[pair(relation, jecs.Wildcard)]
+		if record == nil or idr == nil then
+			return no_targets :: any
+		end
+		local archetype = record.archetype
+		local start = idr.records[archetype.id]
+		if start == nil then
+			return no_targets :: any
+		end
+		local last = start + idr.counts[archetype.id] - 1
+		local archetype_types = archetype.types
+		local index = start
+		return function(): number?
+			if index > last then
+				return nil
+			end
+			local pair_id = archetype_types[index]
+			index += 1
+			return ECS_PAIR_SECOND(pair_id)
 		end
 	end
 
@@ -316,23 +344,36 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	local privacy_filters = {} :: PrivacyFilterCache
 	local allow_masks = {} :: AllowMaskCache
 
-	-- privacy delegation state (see PRIVACY DELEGATION). delegation_parents mirrors the live
-	-- pair(InheritsPrivacy, group) pairs, entity -> its groups, keyed by the group's dense id with the
-	-- gen-qualified group as value: the removed hook must resolve which edge died from the packed pair id alone
-	-- (the group may already be dead mid-cascade), and a group's death removes its edges before its dense id can
-	-- recycle. like the other mirrors it reads correctly inside a removal hook, when world:target still sees the
-	-- old pair. effective_masks holds derived words for delegating entities only -- own intersect every parent's
-	-- exported, absent when nothing inherited restricts -- while own words stay untouched in allow_masks, whose
-	-- 1:1 mapping to filter membership the grant loop, sweeps, and compaction rely on; entity_gate_masks takes
-	-- effective over own. exported_masks holds the words an entity hands its delegators when it narrows them --
-	-- its gate intersect its ExportsPrivacy filter's words -- present exactly while the filter is cached, and
-	-- exported_gate_masks takes it over the entity's gate. both derived stores are copies the sweeps and
-	-- compaction edit in place like the own words.
+	-- privacy delegation state (see PRIVACY DELEGATION). delegation_parents mirrors the live delegation edges,
+	-- entity -> its groups, keyed by the group's dense id with the gen-qualified group as value: the removed
+	-- hooks must resolve which edge died from a packed pair id alone (the group may already be dead
+	-- mid-cascade), and a group's death removes its edges before its dense id can recycle. like the other
+	-- mirrors it reads correctly inside a removal hook, when world:target still sees the old pair. an edge
+	-- comes from one or more *sources* -- a direct pair(InheritsPrivacy, group), plus one per relation the
+	-- entity inherits through (pair(InheritsPrivacyThrough, relation)) whose pair targets the group -- and
+	-- delegation_edge_sources counts them per edge, so dropping one source never removes an edge another still
+	-- holds; the edge exists exactly while its count does. effective_masks holds derived words for delegating
+	-- entities only -- own intersect every parent's exported, absent when nothing inherited restricts -- while
+	-- own words stay untouched in allow_masks, whose 1:1 mapping to filter membership the grant loop, sweeps,
+	-- and compaction rely on; entity_gate_masks takes effective over own. exported_masks holds the words an
+	-- entity hands its delegators when it narrows them -- its gate intersect its ExportsPrivacy filter's words
+	-- -- present exactly while the filter is cached, and exported_gate_masks takes it over the entity's gate.
+	-- both derived stores are copies the sweeps and compaction edit in place like the own words.
 	local delegation_parents = {} :: { [Entity]: { [number]: Entity } }
+	local delegation_edge_sources = {} :: { [Entity]: { [number]: number } }
 	-- the reverse (group -> its delegators), maintained in lockstep, so the fan-out never queries the world
 	local delegation_children = {} :: { [Entity]: { [Entity]: true } }
 	local effective_masks = {} :: { [Entity]: ShardMasks }
 	local exported_masks = {} :: { [Entity]: ShardMasks }
+
+	-- the relations each entity inherits through, mirroring its live pair(InheritsPrivacyThrough, relation)
+	-- pairs and keyed like delegation_parents (the relation's dense id -> the gen-qualified relation), so the
+	-- removed hook resolves the relation from the packed pair id. through_hooks holds, per relation some entity
+	-- inherits through, the relation's added / removed hook disconnectors and the count of entities using it:
+	-- the hooks connect at the first and disconnect at the last, so one use never taxes every pair of the
+	-- relation world-wide forever.
+	local through_relations = {} :: { [Entity]: { [number]: Component } }
+	local through_hooks = {} :: { [Component]: { users: number, added: () -> (), removed: () -> () } }
 
 	-- client slots: each client gets a (shard, bit) pair so every stored mask is one 32-bit word and mask math
 	-- stays native bit32; shards number from 1 so shard-keyed tables stay in the array part, and shard s holds
@@ -1498,6 +1539,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- self gate intersect the entity's ExportsPrivacy filter's words (exported_masks, exporters only), the self
 	-- gate itself when the entity exports nothing. so an export narrows the entities below an entity without
 	-- touching the entity's own visibility, and a delegator is visible to at most the clients its groups are.
+	--
+	-- edges come from two kinds of pair. pair(InheritsPrivacy, group) is one edge, directly. pair(
+	-- InheritsPrivacyThrough, relation) makes every target of the entity's pairs of that relation a parent too --
+	-- "my gate follows whatever my ChildOf targets allow" -- kept in sync by hooks on the relation itself, so a
+	-- containment move (retargeting the ChildOf) moves the privacy edge with it, with no second pair to keep in
+	-- step by hand. both kinds land in the same mirror and derivation; the only structural addition is the
+	-- per-edge source count, since one group can now arrive through several sources. the relation must carry
+	-- pair(OnDeleteTarget, Delete), like InheritsPrivacy does: under Remove a target's death would drop the pair,
+	-- the edge with it, and so widen the entity -- a leak -- where Delete deletes the entity instead.
 
 	-- whether two sparse word tables hold the same words; zero words are always omitted, so equal restrictions
 	-- compare equal.
@@ -1695,6 +1745,77 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return false
 	end
 
+	-- the tail every edge change shares: re-derive both gates against the current parent set, restage the entity
+	-- when its self gate moved, and fan out when its exported gate did. unchanged words -- a redundant edge, or a
+	-- gate that never restricted -- skip both.
+	local function refresh_delegator(entity: Entity)
+		local self_changed = recompute_effective(entity)
+		local exported_changed = recompute_exported(entity, self_changed)
+		if self_changed then
+			restage_entity(entity)
+		end
+		if exported_changed then
+			refresh_descendants(entity)
+		end
+	end
+
+	-- adds one source to the entity -> group edge, returning whether the edge is new (the first source creates
+	-- it; later ones only count)
+	local function add_delegation_edge(entity: Entity, group: Entity): boolean
+		local dense_group = dense(group)
+		local sources = delegation_edge_sources[entity]
+		if sources == nil then
+			sources = {}
+			delegation_edge_sources[entity] = sources
+		end
+		local count = sources[dense_group]
+		if count ~= nil then
+			sources[dense_group] = count + 1
+			return false
+		end
+		sources[dense_group] = 1
+		local parents = delegation_parents[entity]
+		if parents == nil then
+			parents = {}
+			delegation_parents[entity] = parents
+		end
+		parents[dense_group] = group
+		index_delegation_child(group, entity)
+		return true
+	end
+
+	-- drops one source from the entity -> group edge, returning whether the edge died (its last source gone).
+	-- the group arrives as its dense half: a pair id packs only that, and the group may already be dead
+	-- mid-cascade. a missing edge is tolerated -- it is a guard undoing its own refused add, or a teardown
+	-- (world:delete, world:clear) whose per-component hooks each drop what the others' walks already dropped,
+	-- every edge going either way.
+	local function remove_delegation_edge(entity: Entity, dense_group: number): boolean
+		local sources = delegation_edge_sources[entity]
+		if sources == nil then
+			return false
+		end
+		local count = sources[dense_group]
+		if count == nil then
+			return false
+		end
+		if count > 1 then
+			sources[dense_group] = count - 1
+			return false
+		end
+		sources[dense_group] = nil
+		if next(sources) == nil then
+			delegation_edge_sources[entity] = nil
+		end
+		local parents = delegation_parents[entity] :: { [number]: Entity }
+		local group = parents[dense_group]
+		parents[dense_group] = nil
+		if next(parents) == nil then
+			delegation_parents[entity] = nil
+		end
+		deindex_delegation_child(group, entity)
+		return true
+	end
+
 	-- the guards run before the mirror write, so the removed hook their undo fires recognizes it by the missing
 	-- mirror edge. existing delegation is acyclic, so a new cycle must pass through the new edge, and the
 	-- reachability walk from the group finds it.
@@ -1715,52 +1836,198 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			)
 		end
 
-		local parents = delegation_parents[entity]
-		if parents == nil then
-			parents = {}
-			delegation_parents[entity] = parents
-		end
-		parents[dense(group)] = group
-		index_delegation_child(group, entity)
-		local self_changed = recompute_effective(entity)
-		local exported_changed = recompute_exported(entity, self_changed)
-		if self_changed then
-			restage_entity(entity)
-		end
-		if exported_changed then
-			refresh_descendants(entity)
+		-- an edge the entity already holds through a relation only gains a source: nothing to re-derive
+		if add_delegation_edge(entity, group) then
+			refresh_delegator(entity)
 		end
 	end
 
+	-- the pair id only packs the group's dense half (and the group may already be dead mid-cascade), so the edge
+	-- resolves through the dense-keyed mirror. the re-derivation against the remaining edges widens (or clears)
+	-- the stored words -- unless another source still holds the edge, when nothing moves.
 	local function on_inherits_removed(entity: Entity, id: Id)
 		if id == InheritsPrivacy then
 			return
 		end
-		local parents = delegation_parents[entity]
-		if parents == nil then
+		if remove_delegation_edge(entity, ECS_PAIR_SECOND(id)) then
+			refresh_delegator(entity)
+		end
+	end
+
+	-- the per-relation hooks behind pair(InheritsPrivacyThrough, relation), connected while any entity inherits
+	-- through the relation. they fire for every pair of the relation world-wide, so an entity not inheriting
+	-- through it exits on two lookups; one that does gains or loses the edge to the pair's target. a pair add
+	-- closing a cycle undoes the gameplay pair itself and errors: invasive, but a containment cycle that is also
+	-- a privacy cycle is a programming bug, and the alternatives are worse (erroring without the undo desyncs the
+	-- world from the mirror, ignoring the edge silently widens).
+	local function on_through_relation_added(entity: Entity, id: Id, relation: Component)
+		if id == relation then
 			return
 		end
-		-- the pair id only packs the group's dense half (and the group may already be dead mid-cascade), so the
-		-- edge resolves through the dense-keyed mirror; a missing edge is the cycle guard undoing its own add
-		local dense_group = ECS_PAIR_SECOND(id)
-		local group = parents[dense_group]
-		if group == nil then
+		local relations = through_relations[entity]
+		if relations == nil or relations[dense(relation)] == nil then
 			return
 		end
-		parents[dense_group] = nil
-		if next(parents) == nil then
-			delegation_parents[entity] = nil
+		local target = jecs.pair_second(world, id) :: Entity
+		if (target :: any) == 0 then
+			return
 		end
-		deindex_delegation_child(group, entity)
-		-- the re-derivation against the remaining edges widens (or clears) the stored words; unchanged words --
-		-- a redundant edge removed, or a gate that never restricted -- skip the restage entirely
-		local self_changed = recompute_effective(entity)
-		local exported_changed = recompute_exported(entity, self_changed)
-		if self_changed then
-			restage_entity(entity)
+		if delegation_reaches(target, entity, {}) then
+			world:remove(entity, id)
+			fail(
+				`InheritsPrivacy delegation cannot contain cycles! ({id_to_string(entity, world)} -> {id_to_string(
+					target,
+					world
+				)}, inherited through {id_to_string(relation, world)})`
+			)
 		end
-		if exported_changed then
-			refresh_descendants(entity)
+		if add_delegation_edge(entity, target) then
+			refresh_delegator(entity)
+		end
+	end
+
+	-- the removal fires before the pair leaves the archetype, so the widening restage below still walks the
+	-- departing pair as one of the entity's own cells and would stage it visible again -- after the relation's
+	-- own tracking hook (when the relation is networked) staged its removal. so the cell is forced back to 0
+	-- afterwards, whichever order the two hooks ran in; for an untracked relation that is a no-op.
+	local function on_through_relation_removed(entity: Entity, id: Id, relation: Component)
+		if id == relation then
+			return
+		end
+		local relations = through_relations[entity]
+		if relations == nil or relations[dense(relation)] == nil then
+			return
+		end
+		if remove_delegation_edge(entity, ECS_PAIR_SECOND(id)) then
+			refresh_delegator(entity)
+			stage_removed(id, entity)
+		end
+	end
+
+	local function connect_through_hooks(relation: Component)
+		local state = through_hooks[relation]
+		if state ~= nil then
+			state.users += 1
+			return
+		end
+		-- through hooks.luau: a relation like ChildOf already has pair records when its first use arrives, which
+		-- is exactly the unpaired-hook bug's trigger shape
+		through_hooks[relation] = {
+			users = 1,
+			added = hooks.added(world, relation, function(entity: Entity, id: Id)
+				on_through_relation_added(entity, id, relation)
+			end),
+			removed = hooks.removed(world, relation, function(entity: Entity, id: Id)
+				on_through_relation_removed(entity, id, relation)
+			end),
+		}
+	end
+
+	local function disconnect_through_hooks(relation: Component)
+		local state = through_hooks[relation]
+		if state == nil then
+			return
+		end
+		if state.users > 1 then
+			state.users -= 1
+			return
+		end
+		state.added()
+		state.removed()
+		through_hooks[relation] = nil
+	end
+
+	-- pair(InheritsPrivacyThrough, relation) on an entity: after the guards, replay the entity's existing pairs
+	-- of the relation as edges (live adds arrive through the relation hooks from here on). the cycle check
+	-- covers every existing target before any mirror write, so a refusal has nothing to undo but the pair:
+	-- existing delegation is acyclic, so a new cycle passes through one of the new edges, and that edge's
+	-- target reaches the entity over the existing mirror.
+	local function on_through_added(entity: Entity, id: Id)
+		if id == InheritsPrivacyThrough then
+			world:remove(entity, InheritsPrivacyThrough)
+			fail(`InheritsPrivacyThrough must be paired with a relation! ({id_to_string(entity, world)})`)
+		end
+
+		local dense_relation = ECS_PAIR_SECOND(id)
+		if dense_relation == dense(jecs.Wildcard) then
+			world:remove(entity, id)
+			fail(
+				`InheritsPrivacyThrough must name a concrete relation, not jecs.Wildcard! ({id_to_string(entity, world)})`
+			)
+		end
+
+		local relation = jecs.pair_second(world, id) :: Component
+		if not world:has(relation, pair(jecs.OnDeleteTarget, jecs.Delete)) then
+			world:remove(entity, id)
+			fail(
+				`InheritsPrivacyThrough relations must carry pair(jecs.OnDeleteTarget, jecs.Delete)! without it a target's deletion would only remove the pair, dropping the inherited gate and widening the entity's visibility -- a leak -- where Delete deletes the entity with its target instead, as InheritsPrivacy does. ({id_to_string(
+					entity,
+					world
+				)} -> {id_to_string(relation, world)})`
+			)
+		end
+
+		for target in each_target(entity, relation) do
+			if delegation_reaches(target, entity, {}) then
+				world:remove(entity, id)
+				fail(
+					`InheritsPrivacy delegation cannot contain cycles! ({id_to_string(entity, world)} -> {id_to_string(
+						target,
+						world
+					)}, inherited through {id_to_string(relation, world)})`
+				)
+			end
+		end
+
+		local relations = through_relations[entity]
+		if relations == nil then
+			relations = {}
+			through_relations[entity] = relations
+		end
+		relations[dense_relation] = relation
+		connect_through_hooks(relation)
+
+		local changed = false
+		for target in each_target(entity, relation) do
+			if add_delegation_edge(entity, target) then
+				changed = true
+			end
+		end
+		if changed then
+			refresh_delegator(entity)
+		end
+	end
+
+	-- the mirror resolves the relation from the packed pair id; a missing entry is a guard undoing its own add.
+	-- the edges drop by dense target so a target already dead mid-cascade still loses its edge, and the widening
+	-- is correct: it was asked for.
+	local function on_through_removed(entity: Entity, id: Id)
+		if id == InheritsPrivacyThrough then
+			return
+		end
+		local relations = through_relations[entity]
+		if relations == nil then
+			return
+		end
+		local dense_relation = ECS_PAIR_SECOND(id)
+		local relation = relations[dense_relation]
+		if relation == nil then
+			return
+		end
+		relations[dense_relation] = nil
+		if next(relations) == nil then
+			through_relations[entity] = nil
+		end
+
+		local changed = false
+		for dense_target in each_dense_target(entity, relation) do
+			if remove_delegation_edge(entity, dense_target) then
+				changed = true
+			end
+		end
+		disconnect_through_hooks(relation)
+		if changed then
+			refresh_delegator(entity)
 		end
 	end
 
@@ -4217,6 +4484,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			on_inherits_added(entity, inherits_pair_ids[index])
 		end
 
+		-- through-edges replay after the direct ones, by the same rationale: each replayed relation pair derives
+		-- against edges already in the mirror
+		local through_holders = collect_holders(InheritsPrivacyThrough)
+		local through_subjects, through_pair_ids = collect_pair_holders(InheritsPrivacyThrough)
+		for _, entity in through_holders do
+			-- always the unpaired-add misuse; the handler removes the tag and errors
+			on_through_added(entity, InheritsPrivacyThrough)
+		end
+		for index, entity in through_subjects do
+			on_through_added(entity, through_pair_ids[index])
+		end
+
 		-- the replicated mirror precedes the tracking walks: index_tracked_pair announces a named target only
 		-- while it is unreplicated, which must see pre-existing Replicated tags
 		local replicated_holders = collect_holders(Replicated)
@@ -4268,6 +4547,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		hooks.added(world, InheritsPrivacy, on_inherits_added)
 		hooks.removed(world, InheritsPrivacy, on_inherits_removed)
 
+		hooks.added(world, InheritsPrivacyThrough, on_through_added)
+		hooks.removed(world, InheritsPrivacyThrough, on_through_removed)
+
 		-- seed the named mirror before the catch-up walks, whose announce decisions read it. a plain mirror write:
 		-- nothing is tracked yet, so no announcement or restage is due, and the loop mutates nothing, so the live
 		-- walk is safe. the order against the hook connections above is free -- their structural moves run strictly
@@ -4318,6 +4600,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		NetworkedUnreliable = NetworkedUnreliable,
 		Private = Private,
 		InheritsPrivacy = InheritsPrivacy,
+		InheritsPrivacyThrough = InheritsPrivacyThrough,
 		ExportsPrivacy = ExportsPrivacy,
 		Serdes = Serdes,
 

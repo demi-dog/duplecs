@@ -42,6 +42,7 @@ export type Components = {
 	Replicated: Component<nil>,
 	Private: Component<Privacy>,
 	InheritsPrivacy: Component<nil>,
+	InheritsPrivacyThrough: Component<nil>,
 	ExportsPrivacy: Component<Privacy>,
 	Serdes: Component<Serdes?>,
 	Imported: Component<nil>,
@@ -96,6 +97,8 @@ local function preregister(): Components
 	local InheritsPrivacy = jecs.tag() :: Component<nil>
 	jecs.meta(InheritsPrivacy, pair(jecs.OnDeleteTarget, jecs.Delete) :: any, nil)
 
+	local InheritsPrivacyThrough = jecs.tag() :: Component<nil>
+
 	local ExportsPrivacy = jecs.component() :: Component<Privacy>
 
 	local Imported = jecs.tag() :: Component<nil>
@@ -108,6 +111,7 @@ local function preregister(): Components
 	jecs.meta(Replicated, jecs.Name, "duplecs.Replicated")
 	jecs.meta(Private, jecs.Name, "duplecs.Private")
 	jecs.meta(InheritsPrivacy, jecs.Name, "duplecs.InheritsPrivacy")
+	jecs.meta(InheritsPrivacyThrough, jecs.Name, "duplecs.InheritsPrivacyThrough")
 	jecs.meta(ExportsPrivacy, jecs.Name, "duplecs.ExportsPrivacy")
 	jecs.meta(Serdes, jecs.Name, "duplecs.Serdes")
 	jecs.meta(Imported, jecs.Name, "duplecs.Imported")
@@ -119,6 +123,7 @@ local function preregister(): Components
 		Replicated = Replicated,
 		Private = Private,
 		InheritsPrivacy = InheritsPrivacy,
+		InheritsPrivacyThrough = InheritsPrivacyThrough,
 		ExportsPrivacy = ExportsPrivacy,
 		Serdes = Serdes,
 		Imported = Imported,
@@ -187,6 +192,13 @@ local function get_record(world: World): Record
 		local InheritsPrivacy = world:entity() :: Component<nil>
 		world:add(InheritsPrivacy, pair(jecs.OnDeleteTarget, jecs.Delete))
 
+		-- pair(InheritsPrivacyThrough, relation) on an entity makes its entity-level gate additionally inherit from
+		-- every target of its pairs of that relation, as if each were a pair(InheritsPrivacy, target) edge kept in
+		-- sync with the relation (see PRIVACY DELEGATION in server.luau). no cleanup policy of its own: the
+		-- relation must carry pair(OnDeleteTarget, Delete) itself, which the server half checks at add time, since
+		-- that is what keeps a target's deletion from widening the entity instead of deleting it.
+		local InheritsPrivacyThrough = world:entity() :: Component<nil>
+
 		-- an entity-level ExportsPrivacy filter narrows what the entity's InheritsPrivacy delegators inherit below
 		-- the entity's own gate (see PRIVACY DELEGATION in server.luau); the value follows Private's rules exactly,
 		-- and absence hands delegators the entity's own gate unchanged.
@@ -210,6 +222,7 @@ local function get_record(world: World): Record
 		world:set(Replicated, jecs.Name, "duplecs.Replicated")
 		world:set(Private, jecs.Name, "duplecs.Private")
 		world:set(InheritsPrivacy, jecs.Name, "duplecs.InheritsPrivacy")
+		world:set(InheritsPrivacyThrough, jecs.Name, "duplecs.InheritsPrivacyThrough")
 		world:set(ExportsPrivacy, jecs.Name, "duplecs.ExportsPrivacy")
 		world:set(Serdes, jecs.Name, "duplecs.Serdes")
 		world:set(Imported, jecs.Name, "duplecs.Imported")
@@ -223,6 +236,7 @@ local function get_record(world: World): Record
 			Replicated = Replicated,
 			Private = Private,
 			InheritsPrivacy = InheritsPrivacy,
+			InheritsPrivacyThrough = InheritsPrivacyThrough,
 			ExportsPrivacy = ExportsPrivacy,
 			Serdes = Serdes,
 			Imported = Imported,

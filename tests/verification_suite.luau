@@ -10245,6 +10245,818 @@ test("a departed client's exported grant never passes to a straggler compacted i
 	expect_equal(packets[straggler], nil, "and receives no packet creating the member")
 end)
 
+-- InheritsPrivacyThrough: pair(InheritsPrivacyThrough, relation) on an entity makes every target of its pairs of
+-- that relation a delegation parent, kept in sync by hooks on the relation itself -- so a containment relation
+-- like jecs.ChildOf doubles as the privacy edge, and a retarget moves the gate with the entity. the edges land
+-- in the same mirror as direct pair(InheritsPrivacy, group) edges, with one addition: a per-edge source count,
+-- since a group can arrive directly and through a relation (or through two relations) at once. the tests below
+-- cover the edge lifecycle (adding the pair over existing relation pairs, live relation pair adds and removals,
+-- removing the pair), the exclusive retarget (exactly the old-parent -> new-parent diff, no transient leak),
+-- edges from several sources, deletion through the relation's own cleanup policy, chains and exports through
+-- relation edges, the cycle guard over both edge kinds (undoing the InheritsPrivacyThrough pair or the relation
+-- pair, whichever closed the cycle), the guards (unpaired, jecs.Wildcard, a relation lacking the Delete policy),
+-- the relation hooks' connect/disconnect refcount and their no-op cost on entities not inheriting through the
+-- relation, and joins, departures, and compaction with relation edges in play. construction catch-up coverage
+-- sits with the other pre-construction tests (section 31).
+
+-- a custom containment relation declaring the cleanup policy InheritsPrivacyThrough requires, non-exclusive so
+-- one entity can sit in several containers at once (jecs.ChildOf, exclusive, covers the one-parent shape)
+local function make_contained_relation(env)
+	local StoredIn = env.server.world:entity()
+	env.server.world:add(StoredIn, pair(jecs.OnDeleteTarget, jecs.Delete))
+	return StoredIn
+end
+
+test("pair(InheritsPrivacyThrough, ChildOf) makes an entity inherit its parent's filter end-to-end", function(env)
+	-- the room whitelists A, and the item inherits that through its ChildOf pair alone: no InheritsPrivacy
+	-- pair anywhere. end-to-end via packet reconciliation, with the networked ChildOf pair riding along for the
+	-- client who can see both ends. a plain child without the pair is the control: the relation hooks fire for
+	-- its ChildOf too, and must change nothing about it.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 42)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, room))
+	local plain_child = s.world:entity()
+	s.world:add(plain_child, s.net.Replicated)
+	s.world:set(plain_child, s.defs.Health, 7)
+	s.world:add(plain_child, pair(jecs.ChildOf, room))
+	expect_equal(s.world:has(item, pair(s.net.InheritsPrivacy, room)), false, "no direct delegation pair exists")
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "A passes the room's filter through ChildOf")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "B is narrowed out of the item by it")
+	expect_equal(s.net.is_entity_visible(plain_child, env.player_b), true, "the plain child inherits nothing")
+
+	local le_a = c.net.get_client_entity(item)
+	expect(le_a ~= nil and c.world:contains(le_a), "A's client creates the item")
+	expect_equal(c.world:get(le_a, c.defs.Health), 42, "with its Health")
+	expect_equal(c.world:parent(le_a), c.net.get_client_entity(room), "and its ChildOf pair to the room")
+	expect_equal(c2.net.get_client_entity(item), nil, "B's client never creates the item")
+	local lp_b = c2.net.get_client_entity(plain_child)
+	expect(lp_b ~= nil and c2.world:contains(lp_b), "while B's client creates the plain child")
+	expect_equal(c2.world:get(lp_b, c2.defs.Health), 7, "with its Health")
+	expect_equal(c2.world:parent(lp_b), nil, "and without the pair aimed at a room B cannot see")
+end)
+
+test(
+	"adding InheritsPrivacyThrough over existing ChildOf pairs replays them as edges, and removing it drops them",
+	function(env)
+		-- the item sits in the room before it inherits anything, so the add has to walk the existing pair into an
+		-- edge; the removal widens again -- asked for, so correct -- and both ship exactly the one client's change.
+		local s, c = env.server, env.client
+		local c2 = env.make_client()
+		local room = s.world:entity()
+		s.world:add(room, s.net.Replicated)
+		s.world:set(room, s.net.Private, { [env.player_a] = true })
+		local item = s.world:entity()
+		s.world:add(item, s.net.Replicated)
+		s.world:set(item, s.defs.Health, 5)
+		s.world:add(item, pair(jecs.ChildOf, room))
+
+		local snapshot = env.frame()
+		env.apply(env.packet_for(snapshot, env.player_a))
+		env.apply(env.packet_for(snapshot, env.player_b), c2)
+		local le_b = c2.net.get_client_entity(item)
+		expect(le_b ~= nil and c2.world:contains(le_b), "B holds the item while nothing is inherited")
+
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		expect_equal(s.net.is_entity_visible(item, env.player_b), false, "the existing pair became an edge at once")
+		local packets = s.net.generate_packets()
+		expect_equal(packets[env.player_a], nil, "A, admitted by the room, receives no packet")
+		expect(packets[env.player_b] ~= nil, "B receives a packet")
+		local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+		expect_equal(#decoded_b.unreplicated, 1, "B's packet deletes exactly one entity")
+		expect_equal(decoded_b.unreplicated[1], item, "the item")
+		expect_equal(#decoded_b.sections, 0, "and carries no cell: the room B holds is untouched")
+		env.apply(decoded_b, c2)
+		expect_equal(c2.world:contains(le_b), false, "B's client drops the item")
+
+		s.world:set(item, s.defs.Health, 6) -- moves while B cannot see it, so the widening must carry it
+		env.apply(env.packet_for(env.frame(), env.player_a))
+
+		s.world:remove(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		expect_equal(s.world:has(item, pair(jecs.ChildOf, room)), true, "the ChildOf pair itself is untouched")
+		expect_equal(s.net.is_entity_visible(item, env.player_b), true, "B reopens: the edge went with the pair")
+		local packets2 = s.net.generate_packets()
+		expect_equal(packets2[env.player_a], nil, "A receives no packet for the widening")
+		local decoded_b2 = decode_packet(deep_copy(packets2[env.player_b]))
+		expect_equal(#decoded_b2.replicated, 1, "B's packet creates exactly one entity")
+		expect_equal(decoded_b2.replicated[1], item, "the item")
+		env.apply(decoded_b2, c2)
+		local le_b2 = c2.net.get_client_entity(item)
+		expect(le_b2 ~= nil and c2.world:contains(le_b2), "B's client creates the item again")
+		expect_equal(c2.world:get(le_b2, c2.defs.Health), 6, "with its current Health")
+		expect_equal(c2.world:parent(le_b2), c2.net.get_client_entity(room), "and its ChildOf pair, B seeing the room")
+		expect(c.net.get_client_entity(item) ~= nil, "A's client held the item throughout")
+	end
+)
+
+test(
+	"a ChildOf pair added or removed after InheritsPrivacyThrough moves the edge live, with no stale pair cell",
+	function(env)
+		-- the relation hooks connect at the first InheritsPrivacyThrough use, so a pair added later is an edge the
+		-- moment it lands and a pair removed later drops it. the removal fires before the pair leaves the entity,
+		-- while the widening restage still walks it as one of the item's cells: A's packet must carry exactly one
+		-- removal of the networked pair and never re-send it, and B's creation must come without it.
+		local s, c = env.server, env.client
+		local c2 = env.make_client()
+		local room = s.world:entity()
+		s.world:add(room, s.net.Replicated)
+		s.world:set(room, s.net.Private, { [env.player_a] = true })
+		local item = s.world:entity()
+		s.world:add(item, s.net.Replicated)
+		s.world:set(item, s.defs.Health, 9)
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf)) -- no parent yet: no edge, open to all
+
+		local snapshot = env.frame()
+		env.apply(env.packet_for(snapshot, env.player_a))
+		env.apply(env.packet_for(snapshot, env.player_b), c2)
+		local le_a = c.net.get_client_entity(item)
+		local le_b = c2.net.get_client_entity(item)
+		expect(le_a ~= nil and le_b ~= nil, "both clients hold the parentless item")
+
+		s.world:add(item, pair(jecs.ChildOf, room))
+		expect_equal(s.net.is_entity_visible(item, env.player_b), false, "the live pair add narrows B out")
+		local snapshot2 = env.frame()
+		local packet_a = env.packet_for(snapshot2, env.player_a)
+		expect_equal(#packet_a.unreplicated, 0, "A keeps the item")
+		local childof_a = packet_a.components[pair(jecs.ChildOf, room)]
+		expect(
+			childof_a ~= nil and childof_a.nulled ~= nil and table.find(childof_a.nulled, item) ~= nil,
+			"A receives the new ChildOf pair"
+		)
+		env.apply(packet_a)
+		expect_equal(c.world:parent(le_a), c.net.get_client_entity(room), "A's client parents the item")
+		local packet_b = env.packet_for(snapshot2, env.player_b)
+		expect_equal(packet_b.unreplicated[1], item, "B is told to delete the item")
+		env.apply(packet_b, c2)
+		expect_equal(c2.world:contains(le_b), false, "B's client drops it")
+
+		s.world:remove(item, pair(jecs.ChildOf, room))
+		expect_equal(s.net.is_entity_visible(item, env.player_b), true, "the live pair removal reopens B")
+		local snapshot3 = env.frame()
+		local packet_a2 = env.packet_for(snapshot3, env.player_a)
+		expect_equal(#packet_a2.replicated + #packet_a2.unreplicated, 0, "A's existence view of the item is unchanged")
+		local childof_a2 = packet_a2.components[pair(jecs.ChildOf, room)]
+		expect(
+			childof_a2 ~= nil
+				and childof_a2.removed ~= nil
+				and #childof_a2.removed == 1
+				and childof_a2.removed[1] == item,
+			"A receives exactly one removal of the pair"
+		)
+		expect_equal(childof_a2.nulled, nil, "and no re-send of the departing pair")
+		expect_equal(childof_a2.ids, nil, "in either list")
+		env.apply(packet_a2)
+		expect_equal(c.world:parent(le_a), nil, "A's client unparents the item")
+		local packet_b2 = env.packet_for(snapshot3, env.player_b)
+		expect_equal(packet_b2.replicated[1], item, "B receives the item again")
+		expect_equal(packet_b2.components[pair(jecs.ChildOf, room)], nil, "without the ChildOf cell: the pair is gone")
+		env.apply(packet_b2, c2)
+		local le_b2 = c2.net.get_client_entity(item)
+		expect(le_b2 ~= nil and c2.world:contains(le_b2), "B's client creates the item")
+		expect_equal(c2.world:parent(le_b2), nil, "parentless")
+		expect_equal(c2.world:get(le_b2, c2.defs.Health), 9, "with its Health")
+	end
+)
+
+test("an exclusive retarget ships exactly the old-parent -> new-parent diff, with no transient leak", function(env)
+	-- jecs replaces an exclusive pair by firing the relation's removed hook for the old pair, moving the entity,
+	-- then firing added for the new one, all inside one world:add: the old edge drops (a transient widening) and
+	-- the new one narrows back before anything resolves. four clients pin every outcome: A sees only the old
+	-- room (a delete, nothing else), B only the new one (a create with the item's state), C both (just the
+	-- pair swap, no existence churn), and D neither -- the transient would have admitted D, so D must receive no
+	-- packet at all. a user's own removed hook on ChildOf, registered after the first InheritsPrivacyThrough use
+	-- so it runs after duplecs's, does observe the transient through is_entity_visible, which the spec notes.
+	local s = env.server
+	local c3 = env.make_client()
+	local c4 = env.make_client()
+	local player_c = fake_player("RetargetBoth")
+	local player_d = fake_player("RetargetNeither")
+	env.join(player_c, c3)
+	env.join(player_d, c4)
+
+	local old_room = s.world:entity()
+	s.world:add(old_room, s.net.Replicated)
+	s.world:set(old_room, s.net.Private, { [env.player_a] = true, [player_c] = true })
+	local new_room = s.world:entity()
+	s.world:add(new_room, s.net.Replicated)
+	s.world:set(new_room, s.net.Private, { [env.player_b] = true, [player_c] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 33)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, old_room))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, player_c), c3)
+	env.apply(env.packet_for(snapshot, player_d), c4)
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "precondition: A sees the item in the old room")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "precondition: B does not")
+	expect_equal(s.net.is_entity_visible(item, player_c), true, "precondition: C does")
+	expect_equal(s.net.is_entity_visible(item, player_d), false, "precondition: D does not")
+	local le_c = c3.net.get_client_entity(item)
+	expect(
+		le_c ~= nil and c3.world:parent(le_c) == c3.net.get_client_entity(old_room),
+		"C holds the item under the old room"
+	)
+	expect_equal(c4.net.get_client_entity(item), nil, "D holds nothing of it")
+
+	local observed_during_removal = nil
+	s.world:removed(jecs.ChildOf, function(entity, id)
+		if entity == item then
+			observed_during_removal = s.net.is_entity_visible(item, player_d)
+		end
+	end)
+
+	s.world:add(item, pair(jecs.ChildOf, new_room)) -- the retarget: one call, one pair before and after
+	expect_equal(s.world:parent(item), new_room, "the item now sits in the new room")
+	expect_equal(s.world:has(item, pair(jecs.ChildOf, old_room)), false, "and no longer in the old one")
+	expect_equal(observed_during_removal, true, "the user's removed hook observed the transient widening to D")
+	expect_equal(s.net.is_entity_visible(item, player_d), false, "which the new edge closed again synchronously")
+	expect_equal(s.net.is_entity_visible(item, env.player_a), false, "A loses the item")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "B gains it")
+	expect_equal(s.net.is_entity_visible(item, player_c), true, "C keeps it")
+
+	local packets = s.net.generate_packets()
+	expect_equal(packets[player_d], nil, "D receives no packet at all: the transient never reached the wire")
+
+	local decoded_a = decode_packet(deep_copy(packets[env.player_a]))
+	expect_equal(#decoded_a.unreplicated, 1, "A's packet deletes exactly one entity")
+	expect_equal(decoded_a.unreplicated[1], item, "the item")
+	expect_equal(#decoded_a.replicated, 0, "and creates nothing")
+	expect_equal(#decoded_a.sections, 0, "and carries no cell: the deletion covers the pair")
+
+	local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+	expect_equal(#decoded_b.replicated, 1, "B's packet creates exactly one entity")
+	expect_equal(decoded_b.replicated[1], item, "the item")
+	expect_equal(#decoded_b.unreplicated, 0, "and deletes nothing")
+	local health_b = decoded_b.components[s.defs.Health]
+	expect(health_b ~= nil and health_b.values ~= nil and health_b.values[1] == 33, "with its Health")
+	local childof_b = decoded_b.components[pair(jecs.ChildOf, new_room)]
+	expect(
+		childof_b ~= nil and childof_b.nulled ~= nil and #childof_b.nulled == 1 and childof_b.nulled[1] == item,
+		"and the pair to the new room"
+	)
+	expect_equal(childof_b.removed, nil, "with no removal of a pair B never held")
+	expect_equal(decoded_b.components[pair(jecs.ChildOf, old_room)], nil, "and nothing about the old pair")
+
+	local decoded_c = decode_packet(deep_copy(packets[player_c]))
+	expect_equal(#decoded_c.replicated + #decoded_c.unreplicated, 0, "C's existence view of the item never moves")
+	-- the two pair cells may land in separate sections (their viewer sets differ), so count cells, not sections
+	local cells_c = 0
+	for _ in decoded_c.components do
+		cells_c += 1
+	end
+	expect_equal(cells_c, 2, "C's packet carries exactly two cells, both of the ChildOf pair")
+	local old_c = decoded_c.components[pair(jecs.ChildOf, old_room)]
+	expect(
+		old_c ~= nil and old_c.removed ~= nil and #old_c.removed == 1 and old_c.removed[1] == item,
+		"the old pair's removal"
+	)
+	expect_equal(old_c.nulled, nil, "with no re-send of the old pair")
+	local new_c = decoded_c.components[pair(jecs.ChildOf, new_room)]
+	expect(new_c ~= nil and new_c.nulled ~= nil and #new_c.nulled == 1 and new_c.nulled[1] == item, "and the new pair")
+	env.apply(decoded_c, c3)
+	expect_equal(c3.world:parent(le_c), c3.net.get_client_entity(new_room), "C's client reparents the item")
+end)
+
+test("a group reached both directly and through a relation keeps its edge until the last source goes", function(env)
+	-- the room arrives at the item twice -- pair(InheritsPrivacy, room) and ChildOf under
+	-- InheritsPrivacyThrough -- so the edge counts two sources: dropping either alone changes nothing and ships
+	-- nothing, and only the second drop widens. both orders are exercised, one per item.
+	local s = env.server
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local function spawn()
+		local item = s.world:entity()
+		s.world:add(item, s.net.Replicated)
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		s.world:add(item, pair(jecs.ChildOf, room))
+		s.world:add(item, pair(s.net.InheritsPrivacy, room))
+		return item
+	end
+	local item1 = spawn()
+	local item2 = spawn()
+	env.frame()
+	expect_equal(s.net.is_entity_visible(item1, env.player_b), false, "precondition: B is narrowed out of item1")
+	expect_equal(s.net.is_entity_visible(item2, env.player_b), false, "precondition: and of item2")
+
+	-- item1: the direct pair goes first, then the relation pair
+	s.world:remove(item1, pair(s.net.InheritsPrivacy, room))
+	expect_equal(s.net.is_entity_visible(item1, env.player_b), false, "the relation source still holds item1's edge")
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "nothing ships for A")
+	expect_equal(packets[env.player_b], nil, "nor for B")
+	s.world:remove(item1, pair(jecs.ChildOf, room))
+	expect_equal(s.net.is_entity_visible(item1, env.player_b), true, "the last source gone, item1 widens")
+	expect_equal(env.packet_for(env.frame(), env.player_b).replicated[1], item1, "and B receives it")
+
+	-- item2: the relation pair goes first, then the direct pair
+	s.world:remove(item2, pair(jecs.ChildOf, room))
+	expect_equal(s.net.is_entity_visible(item2, env.player_b), false, "the direct source still holds item2's edge")
+	local packets2 = s.net.generate_packets()
+	expect_equal(packets2[env.player_b], nil, "nothing ships for B")
+	s.world:remove(item2, pair(s.net.InheritsPrivacy, room))
+	expect_equal(s.net.is_entity_visible(item2, env.player_b), true, "the last source gone, item2 widens")
+	expect_equal(env.packet_for(env.frame(), env.player_b).replicated[1], item2, "and B receives it")
+end)
+
+test("deleting a through-parent deletes the entity under the relation's own cleanup policy", function(env)
+	-- ChildOf carries pair(OnDeleteTarget, Delete), which is exactly why InheritsPrivacyThrough accepts it: the
+	-- room's deletion deletes the item rather than orphaning it into a wider gate. both clients are told to
+	-- delete what they held, and nothing is ever created for the client the room excluded.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, room))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local le_a = c.net.get_client_entity(item)
+	expect(le_a ~= nil and c.world:contains(le_a), "A holds the item before the delete")
+	expect_equal(c2.net.get_client_entity(item), nil, "B never did")
+
+	s.world:delete(room)
+	expect_equal(s.world:contains(item), false, "the item died with the room")
+
+	local packets = s.net.generate_packets()
+	local decoded_a = decode_packet(deep_copy(packets[env.player_a]))
+	expect(table.find(decoded_a.unreplicated, item) ~= nil, "A is told to delete the item")
+	expect(table.find(decoded_a.unreplicated, room) ~= nil, "and the room")
+	expect_equal(#decoded_a.replicated, 0, "A's packet creates nothing")
+	expect_equal(
+		packets[env.player_b],
+		nil,
+		"B, who held neither the room nor the item, receives no packet: no widening slipped through the teardown"
+	)
+	env.apply(decoded_a)
+	expect_equal(c.world:contains(le_a), false, "A's client drops the item")
+end)
+
+test("a containment chain through ChildOf gates every level, and a room edit reaches the bottom", function(env)
+	-- room -> chest -> item, each level inheriting through ChildOf. the chest is both a subject (its edge to
+	-- the room) and a target (the item's edge to it), so the item's gate is the room's twice removed; one
+	-- edit on the room reaches the item, and the chest's own filter narrows the item without the room
+	-- knowing. the third client is what makes the room's half observable with the chest also filtering.
+	local s = env.server
+	local c3 = env.make_client()
+	local player_c = fake_player("ChainThird")
+	env.join(player_c, c3)
+
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local chest = s.world:entity()
+	s.world:add(chest, s.net.Replicated)
+	s.world:add(chest, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(chest, pair(jecs.ChildOf, room))
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 1)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, chest))
+
+	env.frame()
+	expect_equal(s.net.is_entity_visible(chest, player_c), false, "the chest inherits the room's filter")
+	expect_equal(s.net.is_entity_visible(item, player_c), false, "and so does the item, through the chest")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "B passes both levels")
+
+	s.world:set(chest, s.net.Private, { [env.player_a] = true })
+	local snapshot = env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "the chest's own filter narrows the item")
+	expect_equal(s.net.is_entity_visible(chest, env.player_b), false, "and the chest")
+	expect_equal(s.net.is_entity_visible(room, env.player_b), true, "while the room is untouched")
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	expect_equal(#packet_b.unreplicated, 2, "B loses exactly two entities")
+	expect(table.find(packet_b.unreplicated, chest) ~= nil, "the chest")
+	expect(table.find(packet_b.unreplicated, item) ~= nil, "and the item")
+
+	s.net.edit_entity_privacy(room, env.player_a, false)
+	local snapshot2 = env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_a), false, "the room edit reaches the item two levels down")
+	local packet_a = env.packet_for(snapshot2, env.player_a)
+	expect_equal(#packet_a.unreplicated, 3, "A loses the room, the chest, and the item")
+	expect(table.find(packet_a.unreplicated, item) ~= nil, "the item among them")
+end)
+
+test("ExportsPrivacy on a through-parent narrows what the entities under it inherit", function(env)
+	-- a room shown to everyone from outside whose contents reach only the players inside: the room exports a
+	-- narrower filter, and the item inheriting through ChildOf receives the exported gate, exactly as a direct
+	-- delegator would. toggling the export moves the item alone.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.defs.Health, 100)
+	s.world:set(room, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 3)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, room))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	expect_equal(s.net.is_entity_visible(room, env.player_b), true, "B sees the room")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "but not the item, narrowed by the export")
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "while A sees both")
+	local lr_b = c2.net.get_client_entity(room)
+	expect(lr_b ~= nil and c2.world:get(lr_b, c2.defs.Health) == 100, "B's client holds the room")
+	expect_equal(c2.net.get_client_entity(item), nil, "and never creates the item")
+	expect(c.net.get_client_entity(item) ~= nil, "A's client holds the item")
+
+	s.net.edit_exported_privacy(room, env.player_b, true)
+	local packet_b = env.packet_for(env.frame(), env.player_b)
+	expect_equal(#packet_b.replicated, 1, "B receives exactly one creation")
+	expect_equal(packet_b.replicated[1], item, "the item")
+	env.apply(packet_b, c2)
+	local le_b = c2.net.get_client_entity(item)
+	expect_equal(c2.world:get(le_b, c2.defs.Health), 3, "with its Health")
+	expect_equal(c2.world:parent(le_b), lr_b, "and its pair to the room")
+end)
+
+test("a non-exclusive relation under InheritsPrivacyThrough intersects every target's gate", function(env)
+	-- a custom containment relation declaring the Delete policy, with an item stored in two containers at once:
+	-- both edges land, and the item is visible only to clients both containers admit. removing one pair widens
+	-- to the other's gate alone.
+	local s = env.server
+	local c3 = env.make_client()
+	local player_c = fake_player("StoredInThird")
+	env.join(player_c, c3)
+	local StoredIn = make_contained_relation(env)
+
+	local crate = s.world:entity()
+	s.world:set(crate, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local vault = s.world:entity()
+	s.world:set(vault, s.net.Private, { [env.player_b] = true, [player_c] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 8)
+	s.world:add(item, pair(StoredIn, crate))
+	s.world:add(item, pair(StoredIn, vault))
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, StoredIn))
+
+	env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_a), false, "A is narrowed out by the vault")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "B passes both containers")
+	expect_equal(s.net.is_entity_visible(item, player_c), false, "the third client is narrowed out by the crate")
+
+	s.world:remove(item, pair(StoredIn, vault))
+	local snapshot = env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "A reopens once the vault edge is gone")
+	expect_equal(s.net.is_entity_visible(item, player_c), false, "while the crate keeps the third client out")
+	expect_equal(env.packet_for(snapshot, env.player_a).replicated[1], item, "A receives the item")
+	env.apply(env.packet_for(snapshot, env.player_a))
+	expect_equal(
+		env.client.world:get(env.client.net.get_client_entity(item), env.client.defs.Health),
+		8,
+		"with its Health"
+	)
+end)
+
+test("guard: a self-targeting relation pair under InheritsPrivacyThrough errors and is removed", function(env)
+	-- the entity being both subject and target of one edge is the one-node cycle; the relation pair is undone
+	-- and the entity stays a clean inheritor afterwards.
+	local s = env.server
+	local StoredIn = make_contained_relation(env)
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:add(e, pair(s.net.InheritsPrivacyThrough, StoredIn))
+	expect_error(function()
+		s.world:add(e, pair(StoredIn, e))
+	end, "a self-targeting relation pair", "cannot contain cycles")
+	expect_equal(s.world:has(e, pair(StoredIn, e)), false, "the relation pair was removed")
+	expect_equal(s.world:has(e, pair(s.net.InheritsPrivacyThrough, StoredIn)), true, "the inheriting pair stays")
+
+	local container = s.world:entity()
+	s.world:set(container, s.net.Private, { [env.player_a] = true })
+	s.world:add(e, pair(StoredIn, container))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(e, env.player_a), true, "the later, valid edge admits A")
+	expect_equal(s.net.is_entity_visible(e, env.player_b), false, "and blocks B")
+end)
+
+test("guard: InheritsPrivacyThrough added over relation pairs that close a cycle removes only that pair", function(env)
+	-- a already sits on b (a plain ChildOf), and b delegates to a directly: making a inherit through ChildOf
+	-- would put b under itself. the guard runs before any mirror write, so the refusal removes the
+	-- InheritsPrivacyThrough pair alone -- the gameplay pair and b's delegation stand, and no half-edge lingers.
+	local s = env.server
+	local b = s.world:entity()
+	s.world:add(b, s.net.Replicated)
+	local a = s.world:entity()
+	s.world:add(a, s.net.Replicated)
+	s.world:add(a, pair(jecs.ChildOf, b))
+	s.world:add(b, pair(s.net.InheritsPrivacy, a))
+
+	expect_error(function()
+		s.world:add(a, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	end, "inheriting through a relation whose pairs close a cycle", "cannot contain cycles")
+	expect_equal(
+		s.world:has(a, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf)),
+		false,
+		"the inheriting pair was removed"
+	)
+	expect_equal(s.world:has(a, pair(jecs.ChildOf, b)), true, "the gameplay pair is untouched")
+	expect_equal(s.world:has(b, pair(s.net.InheritsPrivacy, a)), true, "and so is b's delegation")
+
+	-- no phantom a -> b edge: b's filter must not reach a, while a's still reaches b
+	s.world:set(b, s.net.Private, { [env.player_a] = true })
+	env.frame()
+	expect_equal(s.net.is_entity_visible(a, env.player_b), true, "a inherits nothing from b")
+	s.world:set(a, s.net.Private, {})
+	env.frame()
+	expect_equal(s.net.is_entity_visible(b, env.player_a), false, "b still inherits a's filter")
+	-- and the relation hooks never connected for a refused add: a later ChildOf change on a stays inert
+	s.world:remove(a, pair(jecs.ChildOf, b))
+	expect_equal(
+		s.net.is_entity_visible(a, env.player_a),
+		false,
+		"a's own empty filter still gates it, nothing else moved"
+	)
+end)
+
+test(
+	"guard: a relation pair added under InheritsPrivacyThrough that closes a cycle removes the relation pair",
+	function(env)
+		-- a inherits through ChildOf and b delegates to a: parenting a under b closes the loop, so the gameplay pair
+		-- is what goes -- invasive, but the alternatives desync the mirror from the world or widen silently.
+		local s = env.server
+		local a = s.world:entity()
+		s.world:add(a, s.net.Replicated)
+		s.world:add(a, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		local b = s.world:entity()
+		s.world:add(b, s.net.Replicated)
+		s.world:add(b, pair(s.net.InheritsPrivacy, a))
+
+		expect_error(function()
+			s.world:add(a, pair(jecs.ChildOf, b))
+		end, "a relation pair closing a cycle", "cannot contain cycles")
+		expect_equal(s.world:has(a, pair(jecs.ChildOf, b)), false, "the relation pair was removed")
+		expect_equal(s.world:parent(a), nil, "leaving a parentless")
+		expect_equal(s.world:has(b, pair(s.net.InheritsPrivacy, a)), true, "b's delegation stands")
+
+		-- no phantom a -> b edge
+		s.world:set(b, s.net.Private, {})
+		env.frame()
+		expect_equal(s.net.is_entity_visible(a, env.player_a), true, "b's empty filter never reaches a")
+		expect_equal(s.net.is_entity_visible(b, env.player_a), false, "while it gates b itself")
+	end
+)
+
+test(
+	"guard: an exclusive retarget that closes a cycle removes the new pair, leaving the entity unparented",
+	function(env)
+		-- the old pair is already gone when the new one is refused (jecs swaps exclusive pairs by removing first),
+		-- so the entity ends with no parent at all -- and, its only edge gone, open to every client. the documented
+		-- cost of a containment cycle that is also a privacy cycle.
+		local s = env.server
+		local room = s.world:entity()
+		s.world:set(room, s.net.Private, { [env.player_a] = true })
+		local a = s.world:entity()
+		s.world:add(a, s.net.Replicated)
+		s.world:add(a, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		s.world:add(a, pair(jecs.ChildOf, room))
+		local b = s.world:entity()
+		s.world:add(b, pair(s.net.InheritsPrivacy, a))
+		env.frame()
+		expect_equal(s.net.is_entity_visible(a, env.player_b), false, "precondition: the room gates a")
+
+		expect_error(function()
+			s.world:add(a, pair(jecs.ChildOf, b))
+		end, "a retarget closing a cycle", "cannot contain cycles")
+		expect_equal(s.world:parent(a), nil, "a has no parent: the old pair was swapped out and the new one refused")
+		expect_equal(s.net.is_entity_visible(a, env.player_b), true, "and with no edge left, a is open")
+		expect_equal(env.packet_for(env.frame(), env.player_b).replicated[1], a, "which B receives")
+	end
+)
+
+test("guard: an unpaired InheritsPrivacyThrough errors and the tag is removed", function(env)
+	local s = env.server
+	local room = s.world:entity()
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, room))
+
+	expect_error(function()
+		s.world:add(item, s.net.InheritsPrivacyThrough)
+	end, "adding InheritsPrivacyThrough unpaired", "must be paired with a relation")
+	expect_equal(s.world:has(item, s.net.InheritsPrivacyThrough), false, "the unpaired tag was removed")
+	expect_equal(s.world:has(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf)), true, "the real pair survives")
+	env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "and still gates the item")
+end)
+
+test("guard: InheritsPrivacyThrough paired with jecs.Wildcard errors and the pair is removed", function(env)
+	local s = env.server
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	-- the entity holds no pair of the relation yet, so the wildcard pair genuinely stores and the guard fires
+	expect_error(function()
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.Wildcard))
+	end, "inheriting through jecs.Wildcard", "must name a concrete relation, not jecs.Wildcard")
+	expect_equal(
+		s.world:has(item, pair(s.net.InheritsPrivacyThrough, jecs.Wildcard)),
+		false,
+		"the wildcard pair was removed by the guard before erroring"
+	)
+	expect_equal(s.world:target(item, s.net.InheritsPrivacyThrough, 0), nil, "the refusal left nothing behind")
+end)
+
+test(
+	"guard: inheriting through a relation lacking pair(OnDeleteTarget, Delete) errors and the pair is removed",
+	function(env)
+		-- under the default Remove policy a target's deletion would drop the pair, the edge with it, and so widen the
+		-- entity -- the leak the guard names. Targeting is such a relation; declaring the policy on a relation of
+		-- one's own is what makes it acceptable.
+		local s = env.server
+		local item = s.world:entity()
+		s.world:add(item, s.net.Replicated)
+		local base = s.world:entity()
+		s.world:set(base, s.net.Private, { [env.player_a] = true })
+		s.world:add(item, pair(s.defs.Targeting, base))
+
+		expect_error(
+			function()
+				s.world:add(item, pair(s.net.InheritsPrivacyThrough, s.defs.Targeting))
+			end,
+			"inheriting through a relation without the Delete policy",
+			"must carry pair(jecs.OnDeleteTarget, jecs.Delete)"
+		)
+		expect_equal(
+			s.world:has(item, pair(s.net.InheritsPrivacyThrough, s.defs.Targeting)),
+			false,
+			"the inheriting pair was removed"
+		)
+		expect_equal(s.world:has(item, pair(s.defs.Targeting, base)), true, "the gameplay pair is untouched")
+		env.frame()
+		expect_equal(s.net.is_entity_visible(item, env.player_b), true, "and gates nothing: no edge was made")
+
+		-- the same shape on a relation declaring the policy is accepted
+		local StoredIn = make_contained_relation(env)
+		s.world:add(item, pair(StoredIn, base))
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, StoredIn))
+		env.frame()
+		expect_equal(s.net.is_entity_visible(item, env.player_b), false, "the declared relation gates the item")
+	end
+)
+
+test("the relation hooks connect at the first InheritsPrivacyThrough use and disconnect at the last", function(env)
+	-- jecs keeps each relation's listeners in world.signals; the count there pins the refcount: one added and
+	-- one removed listener join at the first entity inheriting through ChildOf, stay put for the second, survive
+	-- the first entity's pair removal, and leave with the last user's deletion -- after which a fresh use
+	-- reconnects and gates as before.
+	local s = env.server
+	local signals = s.world.signals
+	local added_before = #signals.added[jecs.ChildOf]
+	local removed_before = #signals.removed[jecs.ChildOf]
+	local room = s.world:entity()
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+
+	local first = s.world:entity()
+	s.world:add(first, s.net.Replicated)
+	s.world:add(first, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	expect_equal(#signals.added[jecs.ChildOf], added_before + 1, "the first use connects one added listener")
+	expect_equal(#signals.removed[jecs.ChildOf], removed_before + 1, "and one removed listener")
+
+	local second = s.world:entity()
+	s.world:add(second, s.net.Replicated)
+	s.world:add(second, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(second, pair(jecs.ChildOf, room))
+	expect_equal(#signals.added[jecs.ChildOf], added_before + 1, "the second use connects nothing more")
+	expect_equal(#signals.removed[jecs.ChildOf], removed_before + 1, "on either side")
+
+	s.world:remove(first, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	expect_equal(#signals.added[jecs.ChildOf], added_before + 1, "the hooks stay while another entity uses them")
+	env.frame()
+	expect_equal(s.net.is_entity_visible(second, env.player_b), false, "and keep gating it")
+
+	s.world:delete(second)
+	expect_equal(#signals.added[jecs.ChildOf], added_before, "the last user gone, the added listener leaves")
+	expect_equal(#signals.removed[jecs.ChildOf], removed_before, "and the removed listener")
+
+	local third = s.world:entity()
+	s.world:add(third, s.net.Replicated)
+	s.world:add(third, pair(jecs.ChildOf, room))
+	s.world:add(third, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	expect_equal(#signals.added[jecs.ChildOf], added_before + 1, "a fresh use reconnects")
+	env.frame()
+	expect_equal(s.net.is_entity_visible(third, env.player_b), false, "and gates as before")
+	s.world:remove(third, pair(jecs.ChildOf, room))
+	expect_equal(s.net.is_entity_visible(third, env.player_b), true, "live, through the reconnected hooks")
+end)
+
+test(
+	"a joiner's full packet respects a through-edge, a departed client rejoins unlisted, and a slot recycles clean",
+	function(env)
+		-- the join re-derives every delegator's gate over the shared mirror, so an edge from a relation is read like
+		-- any other; the departure prunes the room's filter like any filter, so the rejoiner starts unlisted; and
+		-- the slot reuse sweeps the stale grant, so the newcomer inherits nothing through the edge.
+		local s = env.server
+		local room = s.world:entity() -- a pure gate: never replicated itself
+		s.world:set(room, s.net.Private, { [env.player_b] = true })
+		local item = s.world:entity()
+		s.world:add(item, s.net.Replicated)
+		s.world:set(item, s.defs.Health, 12)
+		s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		s.world:add(item, pair(jecs.ChildOf, room))
+		-- an ungated entity anchors every full packet below as a real delivery
+		local open = s.world:entity()
+		s.world:add(open, s.net.Replicated)
+		env.frame()
+
+		local pending = fake_player("ThroughJoiner")
+		s.net.add_client(pending)
+		s.net.edit_entity_privacy(room, pending, true) -- named while pending: bitless until the join
+		local c3 = env.make_client()
+		local packet_c = env.frame()[pending]
+		env.apply(packet_c, c3)
+		expect(table.find(packet_c.replicated, open) ~= nil, "the joiner's full packet is real")
+		expect(table.find(packet_c.replicated, item) ~= nil, "and carries the item through the edge")
+		expect_equal(c3.world:get(c3.net.get_client_entity(item), c3.defs.Health), 12, "with its Health")
+
+		s.net.remove_client(env.player_b)
+		expect_equal(
+			s.world:get(room, s.net.Private)[env.player_b],
+			nil,
+			"the departure pruned B from the room's filter"
+		)
+		local c4 = env.make_client()
+		local packet_b = env.join(env.player_b, c4)
+		expect(table.find(packet_b.replicated, open) ~= nil, "the rejoiner's full packet is real")
+		expect_equal(table.find(packet_b.replicated, item), nil, "but carries no item: the rejoiner starts unlisted")
+
+		s.net.remove_client(pending)
+		local c5 = env.make_client()
+		local newcomer = fake_player("ThroughSlotHeir")
+		local packet_n = env.join(newcomer, c5)
+		expect(table.find(packet_n.replicated, open) ~= nil, "the newcomer's full packet is real")
+		expect_equal(table.find(packet_n.replicated, item), nil, "and inherits no stale grant through the edge")
+	end
+)
+
+test("an entity gated through a relation survives a shard-compacting move", function(env)
+	local s = env.server
+	local fillers = join_named_fillers(env, 30) -- shard 1 holds its full 32 (A, B, and 30 fillers)
+
+	local straggler = fake_player("ThroughStraggler")
+	local sc = env.make_client()
+	env.join(straggler, sc) -- opens shard 2 as its sole occupant (33 live clients)
+
+	local room = s.world:entity()
+	s.world:set(room, s.net.Private, { [straggler] = true })
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, s.defs.Health, 10)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(item, pair(jecs.ChildOf, room))
+
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, straggler), sc)
+	env.apply(env.packet_for(snapshot, env.player_a))
+	local le = sc.net.get_client_entity(item)
+	expect(le ~= nil, "the straggler sees the item before the shrink")
+	expect_equal(env.client.net.get_client_entity(item), nil, "player A never does")
+
+	for i = 1, 10 do
+		s.net.remove_client(fillers[i])
+	end
+	s.net.generate_packets()
+	expect_equal(s.net._client_shard(straggler), 1, "the straggler migrates down into shard 1")
+
+	-- a retarget into a room admitting the same client re-derives the item from the moved words
+	local other_room = s.world:entity()
+	s.world:set(other_room, s.net.Private, { [straggler] = true })
+	s.world:add(item, pair(jecs.ChildOf, other_room))
+	s.world:set(item, s.defs.Health, 20)
+	local snapshot2 = env.frame()
+	local packet_s = env.packet_for(snapshot2, straggler)
+	expect_equal(#packet_s.unreplicated, 0, "the move keeps the straggler admitted")
+	env.apply(packet_s, sc)
+	env.apply(env.packet_for(snapshot2, env.player_a))
+	expect_equal(sc.world:get(le, sc.defs.Health), 20, "the migrated straggler still receives the item's change")
+	expect_equal(env.client.net.get_client_entity(item), nil, "player A stays excluded after the move")
+end)
+
 -- 21) grouped pair sections
 
 -- raw section flags for a packet's sections: decode_packet's per-run
@@ -14686,6 +15498,56 @@ test("ExportsPrivacy rides the shared set under its dotted name and is inert on 
 	expect_equal(client_world:has(entity, pair(components.ExportsPrivacy, target)), true, "the pair stays")
 end)
 
+test("InheritsPrivacyThrough rides the shared set under its dotted name and is inert on a client world", function()
+	-- the same pinning for the set's relation entry: the server instance returns the shared id, and a client
+	-- world holds the component but connects no hook for it -- an unpaired add, a pair aimed at a relation
+	-- lacking the Delete policy, and a self-closing containment loop all land untouched and silent.
+	local server_world = jecs.world()
+	local server_net = duplecs.server(server_world)
+	local server_components = duplecs.shared(server_world)
+	expect(server_components.InheritsPrivacyThrough ~= nil, "the shared set carries InheritsPrivacyThrough")
+	expect_equal(
+		server_net.InheritsPrivacyThrough,
+		server_components.InheritsPrivacyThrough,
+		"the server instance returns the shared set's id"
+	)
+	expect_equal(
+		server_world:get(server_net.InheritsPrivacyThrough, jecs.Name),
+		"duplecs.InheritsPrivacyThrough",
+		"named in jecs's dotted style"
+	)
+
+	local client_world = jecs.world()
+	local client_net = duplecs.client(client_world)
+	local components = duplecs.shared(client_world)
+	local defs = make_defs(client_world)
+	expect_equal(
+		client_net.InheritsPrivacyThrough,
+		nil,
+		"the client instance omits it with the rest of the server-side slice"
+	)
+	expect_equal(
+		client_world:get(components.InheritsPrivacyThrough, jecs.Name),
+		"duplecs.InheritsPrivacyThrough",
+		"named there too"
+	)
+
+	local entity = client_world:entity()
+	client_world:add(entity, components.InheritsPrivacyThrough) -- unpaired: a server would error
+	expect_equal(client_world:has(entity, components.InheritsPrivacyThrough), true, "the unpaired tag stays")
+	local base = client_world:entity()
+	client_world:add(entity, pair(defs.Targeting, base))
+	client_world:add(entity, pair(components.InheritsPrivacyThrough, defs.Targeting)) -- Remove policy: a server would error
+	expect_equal(
+		client_world:has(entity, pair(components.InheritsPrivacyThrough, defs.Targeting)),
+		true,
+		"the pair stays"
+	)
+	client_world:add(entity, pair(components.InheritsPrivacyThrough, jecs.ChildOf))
+	client_world:add(entity, pair(jecs.ChildOf, entity)) -- a one-node cycle: a server would error and remove it
+	expect_equal(client_world:parent(entity), entity, "the self-parenting pair stays: no hook ever saw it")
+end)
+
 test("a schema tagged through duplecs.shared before construction replicates like one tagged after", function()
 	-- the whole schema goes in first -- definitions, tracking tags, serdes hooks, gameplay values, privacy,
 	-- delegation, and a relation with a live pair -- and only then is the server half constructed.
@@ -15192,6 +16054,141 @@ test(
 			end
 		end
 		expect_equal(surviving, 4, "exactly the edge that closed the cycle was removed, whichever one that was")
+	end
+)
+
+test("InheritsPrivacyThrough pairs built before construction gate from the construction call and stay live", function()
+	-- the catch-up replays the inheriting pairs after the direct ones, walking each entity's existing relation
+	-- pairs into edges and connecting the relation hooks, so a world assembled before duplecs.server exists --
+	-- room, chest on it, item in the chest, every level inheriting through ChildOf -- resolves the same gate
+	-- at its first frame as one built live, and a retarget afterwards moves the edge through the hooks the
+	-- replay connected. the pre-construction filter is the empty one, since no client can be tracked yet; the
+	-- client-specific edits follow construction.
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+	local defs = make_defs(world)
+	world:add(defs.Health, components.Networked)
+	world:add(jecs.ChildOf, components.Networked)
+
+	local room = world:entity()
+	world:set(room, components.Private, {})
+	local chest = world:entity()
+	world:add(chest, components.Replicated)
+	world:add(chest, pair(jecs.ChildOf, room))
+	world:add(chest, pair(components.InheritsPrivacyThrough, jecs.ChildOf))
+	local item = world:entity()
+	world:add(item, components.Replicated)
+	world:set(item, defs.Health, 1)
+	world:add(item, pair(components.InheritsPrivacyThrough, jecs.ChildOf))
+	world:add(item, pair(jecs.ChildOf, chest))
+	local open = world:entity()
+	world:add(open, components.Replicated)
+	world:set(open, defs.Health, 4)
+
+	local net = duplecs.server(world)
+
+	local player = fake_player("PreThroughViewer")
+	net.add_client(player)
+	local server = { world = world, net = net, defs = defs }
+	local client = make_client(server)
+	local function sync()
+		local packets = net.generate_packets()
+		if packets[player] ~= nil then
+			client.net.reconcile_packet(deep_copy(packets[player]))
+		end
+	end
+
+	sync() -- allocates the slot and drains the joiner's full packet
+	expect(client.net.get_client_entity(open) ~= nil, "the unfiltered entity arrived, so the full packet was real")
+	expect_equal(net.is_entity_visible(chest, player), false, "the room's empty filter reached the chest")
+	expect_equal(net.is_entity_visible(item, player), false, "and the item through it")
+	expect_equal(client.net.get_client_entity(item), nil, "the item never reached the client")
+
+	-- widening the room reaches both levels through the replayed edges
+	world:remove(room, components.Private)
+	expect_equal(net.is_entity_visible(item, player), true, "the item's chain restricts nobody now")
+	sync()
+	local le_item = client.net.get_client_entity(item)
+	expect(le_item ~= nil, "the widened item reached the client")
+	expect_equal(client.world:get(le_item, client.defs.Health), 1, "with its value")
+
+	-- and the hooks the replay connected carry a live retarget: the item moves to a hidden chest
+	local hidden = world:entity()
+	world:set(hidden, components.Private, {})
+	world:add(item, pair(jecs.ChildOf, hidden))
+	expect_equal(net.is_entity_visible(item, player), false, "the retarget moved the item's edge to the hidden chest")
+	expect_equal(net.is_entity_visible(chest, player), true, "while the old chest stays open")
+	sync()
+	expect_equal(client.world:contains(le_item), false, "the item was torn down on the client")
+end)
+
+test("guard: an unpaired InheritsPrivacyThrough added before construction errors from the construction call", function()
+	local world = jecs.world()
+	local components = duplecs.shared(world)
+	local entity = world:entity()
+	world:add(entity, components.InheritsPrivacyThrough)
+
+	expect_error(function()
+		duplecs.server(world)
+	end, "constructing over an unpaired InheritsPrivacyThrough", "must be paired with a relation")
+	expect_equal(
+		world:has(entity, components.InheritsPrivacyThrough),
+		false,
+		"the tag was removed by the guard before erroring"
+	)
+end)
+
+test(
+	"guard: inheriting through a relation lacking the Delete policy before construction errors from the construction call",
+	function()
+		local world = jecs.world()
+		local components = duplecs.shared(world)
+		local defs = make_defs(world)
+		local base = world:entity()
+		local entity = world:entity()
+		world:add(entity, pair(defs.Targeting, base))
+		world:add(entity, pair(components.InheritsPrivacyThrough, defs.Targeting))
+
+		expect_error(
+			function()
+				duplecs.server(world)
+			end,
+			"constructing over an InheritsPrivacyThrough on a Remove-policy relation",
+			"must carry pair(jecs.OnDeleteTarget, jecs.Delete)"
+		)
+		expect_equal(
+			world:has(entity, pair(components.InheritsPrivacyThrough, defs.Targeting)),
+			false,
+			"the inheriting pair was removed by the guard before erroring"
+		)
+		expect_equal(world:has(entity, pair(defs.Targeting, base)), true, "the gameplay pair is untouched")
+	end
+)
+
+test(
+	"guard: a cycle through InheritsPrivacyThrough built before construction errors from the construction call",
+	function()
+		-- a sits on b and b delegates to a directly: with a inheriting through ChildOf the two edges loop. the
+		-- direct edges replay first, so the inheriting pair is the one that closes the cycle, and the one removed --
+		-- the gameplay pair and b's delegation stand.
+		local world = jecs.world()
+		local components = duplecs.shared(world)
+		local a = world:entity()
+		local b = world:entity()
+		world:add(a, pair(jecs.ChildOf, b))
+		world:add(a, pair(components.InheritsPrivacyThrough, jecs.ChildOf))
+		world:add(b, pair(components.InheritsPrivacy, a))
+
+		expect_error(function()
+			duplecs.server(world)
+		end, "constructing over a cycle through InheritsPrivacyThrough", "cannot contain cycles")
+		expect_equal(
+			world:has(a, pair(components.InheritsPrivacyThrough, jecs.ChildOf)),
+			false,
+			"the inheriting pair was removed"
+		)
+		expect_equal(world:has(a, pair(jecs.ChildOf, b)), true, "the gameplay pair stands")
+		expect_equal(world:has(b, pair(components.InheritsPrivacy, a)), true, "and so does the direct delegation")
 	end
 )
 
@@ -15798,7 +16795,7 @@ test("docs/api.md has a heading for every server and client export", function(en
 
 	-- the floors are today's public surfaces exactly, so an export that disappears from an instance fails here
 	-- too rather than quietly shrinking what this test covers; raise them when the surface really grows
-	expect(server_keys >= 25, `only {server_keys} server exports were checked against docs/api.md`)
+	expect(server_keys >= 26, `only {server_keys} server exports were checked against docs/api.md`)
 	expect(client_keys >= 14, `only {client_keys} client exports were checked against docs/api.md`)
 end)
 
@@ -15823,12 +16820,12 @@ test("docs/api.md documents no module-root, server, or client export that no lon
 
 	-- today's count of side-qualified headings exactly: a heading that stops reading as one -- demoted a level,
 	-- reformatted out of its backticks -- fails here instead of leaving this direction with less to check
-	expect(checked >= 40, `only {checked} side-qualified api.md headings were checked against the instances`)
+	expect(checked >= 41, `only {checked} side-qualified api.md headings were checked against the instances`)
 end)
 
 test("the spec's warnings-and-errors appendix quotes every message the sources raise", function()
 	local messages = collect_source_messages()
-	expect(#messages >= 45, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
+	expect(#messages >= 56, `only {#messages} src/ diagnostics were collected: the extractor no longer reads them`)
 
 	-- the entries' quoted messages, not the appendix whole: a message that survives only in an entry's prose
 	-- has no entry of its own, which is exactly the drift this direction exists to catch
@@ -15861,7 +16858,7 @@ end)
 test("the spec's warnings-and-errors appendix quotes no message the sources no longer raise", function()
 	local source_text = read_source_text()
 	local messages = collect_appendix_messages(read_diagnostics_appendix())
-	expect(#messages >= 42, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
+	expect(#messages >= 53, `only {#messages} appendix entries were collected: the extractor no longer reads them`)
 
 	for _, message in messages do
 		local checked = 0
