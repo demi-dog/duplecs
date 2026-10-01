@@ -3679,6 +3679,46 @@ test("whitelists added before Replicated filter from the first packet", function
 	expect_equal(c2.world:has(le_b, c2.defs.Health), false, "B never receives the private value")
 end)
 
+test("a component whitelist edited inside an unreplication window takes effect at the re-replication", function(env)
+	-- unreplicate, swap the component filter, re-replicate, all in one frame. the edit lands while the entity
+	-- is unreplicated, when its cells already stage the 0 they resolve to, so it restages nothing; the
+	-- re-replication's restage then resolves the new filter against what each client was last sent.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 5)
+	s.world:set(e, pair(s.net.Private, s.defs.Health), { [env.player_a] = true })
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+
+	s.world:remove(e, s.net.Replicated)
+	s.world:set(e, pair(s.net.Private, s.defs.Health), { [env.player_b] = true })
+	expect_equal(
+		s.net.is_component_visible(e, s.defs.Health, env.player_b),
+		false,
+		"the edit admits nobody while the entity is unreplicated"
+	)
+	s.world:add(e, s.net.Replicated)
+	expect_equal(s.net.is_component_visible(e, s.defs.Health, env.player_a), false, "A narrowed out at re-replication")
+	expect_equal(s.net.is_component_visible(e, s.defs.Health, env.player_b), true, "B admitted at re-replication")
+
+	local snapshot2 = env.frame()
+	local packet_a = env.packet_for(snapshot2, env.player_a)
+	local packet_b = env.packet_for(snapshot2, env.player_b)
+	expect_equal(#packet_a.unreplicated, 0, "A keeps the entity")
+	expect_equal(#packet_b.replicated, 0, "B already held the entity")
+	local data_a = packet_a.components[s.defs.Health]
+	expect(data_a ~= nil and data_a.removed ~= nil and data_a.removed[1] == e, "A is told to remove Health")
+	local data_b = packet_b.components[s.defs.Health]
+	expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 5, "B receives Health")
+	env.apply(packet_a)
+	env.apply(packet_b, c2)
+	expect_equal(c.world:has(c.net.get_client_entity(e), c.defs.Health), false, "A's client drops Health")
+	expect_equal(c2.world:get(c2.net.get_client_entity(e), c2.defs.Health), 5, "B's client gains Health")
+end)
+
 test("a whitelist grant is delivered exactly once", function(env)
 	local s = env.server
 	local e = s.world:entity()
@@ -5624,6 +5664,148 @@ test("an entity whitelist added before Replicated filters from the first packet"
 	expect_equal(#packet_b.replicated, 0, "B never sees the entity")
 	env.apply(packet_b, c2)
 	expect_equal(c2.net.get_client_entity(e), nil, "B's client never creates it")
+end)
+
+test("an entity filtered before its Replicated tag replicates exactly like one tagged first", function(env)
+	-- filter edits on an unreplicated entity skip its own cells (they stage 0 whatever the gate admits), so an
+	-- entity whose filters land before Replicated -- set, then edited -- relies on the tag's restage alone.
+	-- both build orders must ship the same thing to every client. a third client keeps the entity filter
+	-- from naming every allocated client, which would restrict nobody.
+	local s = env.server
+	local player_c = fake_player("BuildOrderThird")
+	s.net.add_client(player_c)
+	env.frame()
+
+	local tagged_first = s.world:entity()
+	s.world:add(tagged_first, s.net.Replicated)
+	s.world:set(tagged_first, s.defs.Health, 5)
+	s.world:set(tagged_first, s.net.Private, { [env.player_a] = true, [player_c] = true })
+	s.world:set(tagged_first, pair(s.net.Private, s.defs.Health), { [env.player_a] = true })
+
+	local tagged_last = s.world:entity()
+	s.world:set(tagged_last, s.defs.Health, 5)
+	s.world:set(tagged_last, s.net.Private, { [env.player_a] = true })
+	s.net.edit_entity_privacy(tagged_last, player_c, true)
+	s.world:set(tagged_last, pair(s.net.Private, s.defs.Health), { [env.player_a] = true, [player_c] = true })
+	s.net.edit_component_privacy(tagged_last, s.defs.Health, player_c, false)
+	expect_equal(s.net.is_entity_visible(tagged_last, env.player_a), false, "nothing is visible before the tag")
+	s.world:add(tagged_last, s.net.Replicated)
+
+	local snapshot = env.frame()
+	local packet_a = env.packet_for(snapshot, env.player_a)
+	local packet_c = env.packet_for(snapshot, player_c)
+	expect_equal(rawget(snapshot, env.player_b), nil, "B receives no packet at all")
+	local health_a = packet_a.components[s.defs.Health]
+	expect(health_a ~= nil and health_a.ids ~= nil, "A receives a Health section")
+	expect_equal(packet_c.components[s.defs.Health], nil, "C receives no Health section")
+	for _, e in { tagged_first, tagged_last } do
+		expect(table.find(packet_a.replicated, e) ~= nil, "A receives the entity")
+		local row = table.find(health_a.ids, e)
+		expect(row ~= nil and health_a.values[row] == 5, "A receives the entity's Health")
+		expect(table.find(packet_c.replicated, e) ~= nil, "C receives the entity")
+		expect_equal(s.net.is_entity_visible(e, env.player_b), false, "B sits outside the entity filter")
+		expect_equal(s.net.is_component_visible(e, s.defs.Health, player_c), false, "C sits outside the Health filter")
+	end
+end)
+
+test("an entity filter edited inside an unreplication window ships exactly the gate's difference", function(env)
+	-- unreplicate, swap the entity filter, re-replicate, all in one frame: the edit lands while the entity is
+	-- unreplicated, so it restages nothing of the entity's own, and the re-replication resolves the new gate
+	-- against what each client was last sent -- a deletion for the client it drops, a creation for the one it
+	-- admits.
+	local s, c = env.server, env.client
+	local c2 = env.make_client()
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 5)
+	s.world:set(e, s.net.Private, { [env.player_a] = true })
+	local snapshot = env.frame()
+	env.apply(env.packet_for(snapshot, env.player_a))
+	env.apply(env.packet_for(snapshot, env.player_b), c2)
+	local le_a = c.net.get_client_entity(e)
+	expect(le_a ~= nil, "A holds the entity before the window")
+
+	s.world:remove(e, s.net.Replicated)
+	s.world:set(e, s.net.Private, { [env.player_b] = true })
+	expect_equal(s.net.is_entity_visible(e, env.player_b), false, "the edit admits nobody while unreplicated")
+	s.world:add(e, s.net.Replicated)
+	expect_equal(s.net.is_entity_visible(e, env.player_a), false, "A narrowed out at re-replication")
+	expect_equal(s.net.is_entity_visible(e, env.player_b), true, "B admitted at re-replication")
+	local seeing = {}
+	for client in s.net.get_clients_seeing(e) do
+		table.insert(seeing, client)
+	end
+	expect(#seeing == 1 and seeing[1] == env.player_b, "only B is seeing the entity")
+
+	local snapshot2 = env.frame()
+	local packet_a = env.packet_for(snapshot2, env.player_a)
+	local packet_b = env.packet_for(snapshot2, env.player_b)
+	expect(#packet_a.unreplicated == 1 and packet_a.unreplicated[1] == e, "A is told to delete the entity")
+	expect(#packet_b.replicated == 1 and packet_b.replicated[1] == e, "B is told to create the entity")
+	local data_b = packet_b.components[s.defs.Health]
+	expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 5, "B receives Health with the creation")
+	env.apply(packet_a)
+	env.apply(packet_b, c2)
+	expect_equal(c.world:contains(le_a), false, "A's client deletes the entity")
+	expect_equal(c2.world:get(c2.net.get_client_entity(e), c2.defs.Health), 5, "B's client creates it with Health")
+end)
+
+test("a value set and a widening entity filter inside an unreplication window reach each client once", function(env)
+	-- the value-staging half of the window: the set lands while the cell's last words still name A (they stand
+	-- until the next frame resolves the unreplication's zeros), so it stages the value; the widening edit
+	-- restages nothing while the entity is unreplicated; the re-replication restores A's mask and admits B. A,
+	-- the continuing viewer, receives the new value exactly once; B receives it with the creation.
+	local s = env.server
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 5)
+	s.world:set(e, s.net.Private, { [env.player_a] = true })
+	env.frame()
+
+	s.world:remove(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 6)
+	s.world:set(e, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	s.world:add(e, s.net.Replicated)
+
+	local snapshot = env.frame()
+	local packet_a = env.packet_for(snapshot, env.player_a)
+	local packet_b = env.packet_for(snapshot, env.player_b)
+	expect_equal(#packet_a.replicated, 0, "A is not re-created")
+	expect_equal(#packet_a.unreplicated, 0, "A is not told to delete")
+	local data_a = packet_a.components[s.defs.Health]
+	expect(data_a ~= nil and data_a.values ~= nil and data_a.values[1] == 6, "A receives the new value")
+	expect_equal(#data_a.values, 1, "exactly once")
+	expect(#packet_b.replicated == 1 and packet_b.replicated[1] == e, "B is told to create the entity")
+	local data_b = packet_b.components[s.defs.Health]
+	expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 6, "B receives the new value")
+end)
+
+test("an entity filter edited while unreplicated across frames applies at its re-replication", function(env)
+	-- the cross-frame order: the unreplication's zeros resolve first, the edit lands on a fully unreplicated
+	-- entity and ships nothing, and the later re-replication creates the entity for exactly the new gate.
+	local s = env.server
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 5)
+	s.world:set(e, s.net.Private, { [env.player_a] = true })
+	env.frame()
+
+	s.world:remove(e, s.net.Replicated)
+	local snapshot = env.frame()
+	expect_equal(env.packet_for(snapshot, env.player_a).unreplicated[1], e, "A is told to delete the entity")
+
+	s.world:set(e, s.net.Private, { [env.player_b] = true })
+	local quiet = env.frame()
+	expect_equal(rawget(quiet, env.player_a), nil, "the edit ships nothing to A")
+	expect_equal(rawget(quiet, env.player_b), nil, "the edit ships nothing to B")
+
+	s.world:add(e, s.net.Replicated)
+	local snapshot2 = env.frame()
+	expect_equal(rawget(snapshot2, env.player_a), nil, "A receives nothing at the re-replication")
+	local packet_b = env.packet_for(snapshot2, env.player_b)
+	expect(#packet_b.replicated == 1 and packet_b.replicated[1] == e, "B is told to create the entity")
+	local data_b = packet_b.components[s.defs.Health]
+	expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 5, "B receives Health with the creation")
 end)
 
 test("adding an entity whitelist to a public entity revokes it from excluded players", function(env)
@@ -11218,6 +11400,146 @@ test("a multi-parent DAG built before the first frame derives correct visibility
 		nil,
 		"C's first full packet excludes the leaf: group_a narrows it out"
 	)
+end)
+
+test("members delegating before their Replicated tag inherit exactly what a member tagged first does", function(env)
+	-- delegation edits on an unreplicated entity skip its own cells (they stage 0 whatever the derived gate),
+	-- so members built before their tag -- a direct edge, an edge through ChildOf, and a chain through another
+	-- member still untagged when the edge lands -- rely on the tag's restage alone, and must match a member
+	-- tagged first, both at spawn and when a later export edit fans out over all of them. a third client keeps
+	-- the group's filter from naming every allocated client.
+	local s = env.server
+	local player_c = fake_player("DelegationBuildThird")
+	s.net.add_client(player_c)
+	env.frame()
+
+	local group = s.world:entity()
+	s.world:set(group, s.net.Private, { [env.player_a] = true, [player_c] = true })
+	s.world:set(group, s.net.ExportsPrivacy, { [player_c] = false })
+
+	local tagged_first = s.world:entity()
+	s.world:add(tagged_first, s.net.Replicated)
+	s.world:set(tagged_first, s.defs.Health, 3)
+	s.world:add(tagged_first, pair(s.net.InheritsPrivacy, group))
+
+	local tagged_last = s.world:entity()
+	s.world:set(tagged_last, s.defs.Health, 3)
+	s.world:add(tagged_last, pair(s.net.InheritsPrivacy, group))
+
+	local through = s.world:entity()
+	s.world:set(through, s.defs.Health, 3)
+	s.world:add(through, pair(jecs.ChildOf, group))
+	s.world:add(through, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(through, s.net.Replicated)
+
+	local chained = s.world:entity()
+	s.world:set(chained, s.defs.Health, 3)
+	s.world:add(chained, pair(s.net.InheritsPrivacy, tagged_last))
+	s.world:add(chained, s.net.Replicated)
+	s.world:add(tagged_last, s.net.Replicated)
+
+	local members = { tagged_first, tagged_last, through, chained }
+	local snapshot = env.frame()
+	local packet_a = env.packet_for(snapshot, env.player_a)
+	local health_a = packet_a.components[s.defs.Health]
+	expect(health_a ~= nil and health_a.ids ~= nil, "A receives a Health section")
+	expect_equal(rawget(snapshot, env.player_b), nil, "B, outside the group's filter, receives nothing")
+	expect_equal(rawget(snapshot, player_c), nil, "C, outside the group's export, receives nothing")
+	for _, member in members do
+		expect(table.find(packet_a.replicated, member) ~= nil, "A receives the member")
+		local row = table.find(health_a.ids, member)
+		expect(row ~= nil and health_a.values[row] == 3, "A receives the member's Health")
+	end
+
+	-- un-naming C empties the export's blacklist, removing it: C is admitted below the group
+	s.net.edit_exported_privacy(group, player_c, true)
+	local snapshot2 = env.frame()
+	expect_equal(rawget(snapshot2, env.player_a), nil, "A, already admitted, sees no churn")
+	local packet_c = env.packet_for(snapshot2, player_c)
+	local health_c = packet_c.components[s.defs.Health]
+	expect(health_c ~= nil and health_c.ids ~= nil, "C receives a Health section")
+	expect_equal(#packet_c.replicated, #members, "C receives exactly the members")
+	for _, member in members do
+		expect(table.find(packet_c.replicated, member) ~= nil, "C receives the member")
+		local row = table.find(health_c.ids, member)
+		expect(row ~= nil and health_c.values[row] == 3, "C receives the member's Health")
+		expect_equal(s.net.is_entity_visible(member, env.player_b), false, "B stays outside every member's gate")
+	end
+	expect_equal(s.net._check_gates(), nil, "the stored gates match a full re-derivation")
+end)
+
+test(
+	"a member unreplicated, regated through its group, and re-replicated in one frame ships the new gate",
+	function(env)
+		-- the group edit fans out to the member while it is unreplicated, when its own cells already stage 0 and
+		-- restage nothing; the member's re-replication then resolves the new derived gate against what each client
+		-- was last sent.
+		local s, c = env.server, env.client
+		local c2 = env.make_client()
+		local group = s.world:entity()
+		s.world:set(group, s.net.Private, { [env.player_a] = true })
+		local member = s.world:entity()
+		s.world:add(member, s.net.Replicated)
+		s.world:set(member, s.defs.Health, 4)
+		s.world:add(member, pair(s.net.InheritsPrivacy, group))
+		local snapshot = env.frame()
+		env.apply(env.packet_for(snapshot, env.player_a))
+		env.apply(env.packet_for(snapshot, env.player_b), c2)
+		local le_a = c.net.get_client_entity(member)
+		expect(le_a ~= nil, "A holds the member before the window")
+
+		s.world:remove(member, s.net.Replicated)
+		s.net.edit_entity_privacy(group, env.player_b, true)
+		s.net.edit_entity_privacy(group, env.player_a, false)
+		expect_equal(s.net.is_entity_visible(member, env.player_b), false, "the edit admits nobody while unreplicated")
+		s.world:add(member, s.net.Replicated)
+		expect_equal(s.net.is_entity_visible(member, env.player_a), false, "A narrowed out at re-replication")
+		expect_equal(s.net.is_entity_visible(member, env.player_b), true, "B admitted at re-replication")
+
+		local snapshot2 = env.frame()
+		local packet_a = env.packet_for(snapshot2, env.player_a)
+		local packet_b = env.packet_for(snapshot2, env.player_b)
+		expect(#packet_a.unreplicated == 1 and packet_a.unreplicated[1] == member, "A is told to delete the member")
+		expect(#packet_b.replicated == 1 and packet_b.replicated[1] == member, "B is told to create the member")
+		local data_b = packet_b.components[s.defs.Health]
+		expect(data_b ~= nil and data_b.values ~= nil and data_b.values[1] == 4, "B receives Health with the creation")
+		env.apply(packet_a)
+		env.apply(packet_b, c2)
+		expect_equal(c.world:contains(le_a), false, "A's client deletes the member")
+		expect_equal(c2.world:get(c2.net.get_client_entity(member), c2.defs.Health), 4, "B's client creates the member")
+	end
+)
+
+test("a group unreplicated and edited in one frame still regates its replicated delegators", function(env)
+	-- the group's edit lands while it is unreplicated: its own existence and cells skip the restage (they stage
+	-- 0 whatever its gate admits), but the fan-out over its delegators runs regardless, so a replicated member
+	-- narrows the moment the edit lands, and the group's re-replication resolves its own new gate.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:set(member, s.defs.Health, 4)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group))
+	local snapshot = env.frame()
+	expect(table.find(env.packet_for(snapshot, env.player_b).replicated, member) ~= nil, "B holds the member")
+
+	s.world:remove(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true })
+	expect_equal(s.net.is_entity_visible(member, env.player_b), false, "the fan-out narrows the member at once")
+	expect_equal(s.net.is_entity_visible(member, env.player_a), true, "A stays admitted below the group")
+	expect_equal(s.net.is_entity_visible(group, env.player_a), false, "the unreplicated group is visible to nobody")
+	s.world:add(group, s.net.Replicated)
+	expect_equal(s.net.is_entity_visible(group, env.player_a), true, "A sees the group again at re-replication")
+	expect_equal(s.net.is_entity_visible(group, env.player_b), false, "B is narrowed out of the group too")
+
+	local snapshot2 = env.frame()
+	expect_equal(rawget(snapshot2, env.player_a), nil, "A, admitted throughout, receives nothing")
+	local packet_b = env.packet_for(snapshot2, env.player_b)
+	expect_equal(#packet_b.unreplicated, 2, "B is told to delete exactly the group and the member")
+	expect(table.find(packet_b.unreplicated, group) ~= nil, "B deletes the group")
+	expect(table.find(packet_b.unreplicated, member) ~= nil, "B deletes the member")
 end)
 
 test("a joiner's full packet respects delegation, then is admitted by a group edit", function(env)

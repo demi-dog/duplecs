@@ -1751,6 +1751,26 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		restage_pairs_targeting(entity)
 	end
 
+	-- the restage behind a change of the entity's gate -- an edit of its entity-level filter, or a delegation
+	-- re-derivation -- rather than of its replicability, which the Replicated hooks restage in full. an
+	-- unreplicated entity's existence and own cells resolve 0 whatever its gate admits, and they already stage
+	-- 0: next ?? last is current visibility, so on_replicated_removed's restage zeroed every one of them (its
+	-- last words stand until the next generate_packets resolves the zeros), and every staging since resolved 0
+	-- as well. restaging them would rewrite the same words, so it is skipped -- one full restage per filter
+	-- or delegation edit on an entity built before its Replicated tag. only visibility is in play: a gate
+	-- change stages no value, so the unreplicate -> edit -> re-replicate window, where a skipped value stage
+	-- would be lost, can't arise here -- the re-replicate's own restage resolves the new gate in full. pairs
+	-- targeting the entity still restage: an unreplicated target's gate never narrows them (cell_vis_masks
+	-- reads only a replicated target's), but the walk is also where a bucket a dead previous tenant left
+	-- retires (see stale_pairs), and it costs nothing for an entity no tracked pair targets.
+	local function restage_gate_change(entity: Entity)
+		if replicated_entities[dense(entity)] == nil then
+			restage_pairs_targeting(entity)
+			return
+		end
+		restage_entity(entity)
+	end
+
 	local function on_replicated_added(entity: Entity, id: Id)
 		if id ~= Replicated then
 			world:remove(entity, id)
@@ -2003,7 +2023,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			local self_changed = recompute_effective(child)
 			local exported_changed = recompute_exported(child, self_changed)
 			if self_changed then
-				restage_entity(child)
+				restage_gate_change(child)
 			end
 			if exported_changed then
 				refresh_descendants(child)
@@ -2222,7 +2242,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local self_changed = recompute_effective(entity)
 		local exported_changed = recompute_exported(entity, self_changed)
 		if self_changed then
-			restage_entity(entity)
+			restage_gate_change(entity)
 		end
 		if exported_changed then
 			refresh_descendants(entity)
@@ -2682,8 +2702,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- PRIVACY HOOKS
 
 	-- a filter on (entity, key) governs the unpaired cell and every pair using key as the relation on entity.
-	-- pairs removed earlier this frame need no restage: their staged 0 already removes them.
+	-- pairs removed earlier this frame need no restage: their staged 0 already removes them. neither do an
+	-- unreplicated entity's cells, which already stage the 0 they resolve to (see restage_gate_change).
 	local function restage_privacy_cells(entity: Entity, key: Component)
+		if replicated_entities[dense(entity)] == nil then
+			return
+		end
 		if world:has(entity, key) then
 			stage_visibility(key, entity)
 		end
@@ -2703,7 +2727,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		local exported_changed = recompute_exported(entity, self_changed)
 		if self_changed then
-			restage_entity(entity)
+			restage_gate_change(entity)
 		end
 		if exported_changed then
 			refresh_descendants(entity)
