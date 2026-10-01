@@ -2011,9 +2011,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	-- re-derives one entity's gates during a store-wide refresh (a joiner's slot grant), resolving every parent
-	-- first; refreshed bounds the walk, and the cycle guards keep delegation acyclic, so parents always finish
-	-- before their delegators read them. a non-delegating exporter re-derives only its exported words.
+	-- re-derives one entity's gates during a store-wide refresh, resolving every parent first; refreshed bounds
+	-- the walk, and the cycle guards keep delegation acyclic, so parents always finish before their delegators
+	-- read them. a non-delegating exporter re-derives only its exported words. joins used to run this over every
+	-- delegator and exporter; they now grant incrementally (grant_derived_bit), and this survives as the
+	-- reference the debug check compares them against (check_gates).
 	local function refresh_gates(entity: Entity, refreshed: { [Entity]: true })
 		if refreshed[entity] ~= nil then
 			return
@@ -2027,6 +2029,143 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			recompute_effective(entity)
 		end
 		recompute_exported(entity, false)
+	end
+
+	-- whether a derivation input admits a client's bit: absent words restrict nothing
+	local function admits_bit(masks: ShardMasks?, shard: number, bit: VisibilityMask): boolean
+		return masks == nil or bit32.band(masks[shard] or 0, bit) ~= 0
+	end
+
+	-- the join's incremental counterpart of recompute_effective / recompute_exported, for the one bit a joiner's
+	-- slot grant added (see allocate_client): sets the bit in the entity's derived words wherever their
+	-- derivation now admits it, reading the inputs exactly as the recomputes do -- own words, every parent's
+	-- exported words or a dead parent's frozen ones, then the exported filter over the self gate. returns
+	-- whether the gate its delegators read gained the bit here, so each entity carries it down at most once.
+	-- the bit is only ever set, never cleared: no stored word holds it before the grant, and grants only widen.
+	local function grant_derived_bit(entity: Entity, shard: number, bit: VisibilityMask): boolean
+		local entity_masks = allow_masks[entity]
+		local self_gained = false
+		local effective = effective_masks[entity]
+		local parents = delegation_parents[entity]
+		if effective ~= nil and parents ~= nil and bit32.band(effective[shard] or 0, bit) == 0 then
+			local admitted = admits_bit(if entity_masks then entity_masks[Existence] else nil, shard, bit)
+			if admitted then
+				for _, parent in parents do
+					local parent_masks: ShardMasks? = dead_parent_masks[parent]
+					if parent_masks == nil then
+						parent_masks = exported_gate_masks(parent)
+					end
+					if not admits_bit(parent_masks, shard, bit) then
+						admitted = false
+						break
+					end
+				end
+			end
+			if admitted then
+				effective[shard] = bit32.bor(effective[shard] or 0, bit)
+				self_gained = true
+			end
+		end
+
+		local exported = exported_masks[entity]
+		if exported == nil then
+			return self_gained
+		end
+		if bit32.band(exported[shard] or 0, bit) ~= 0 then
+			-- carried down already, when the bit first landed here
+			return false
+		end
+		local exported_own = if entity_masks then entity_masks[Exported] else nil
+		if
+			exported_own ~= nil
+			and bit32.band(exported_own[shard] or 0, bit) ~= 0
+			and admits_bit(entity_gate_masks(entity), shard, bit)
+		then
+			exported[shard] = bit32.bor(exported[shard] or 0, bit)
+			return true
+		end
+		return false
+	end
+
+	-- carries a joiner's bit down from node, whose exported gate just gained it: each delegator takes the bit
+	-- wherever its own derivation now admits it, and one whose exported gate gains it carries on below. a
+	-- delegator under several parents takes it only once every parent's exported words hold it, so an arrival
+	-- from one parent before another has gained the bit grants nothing -- and the later parent's own arrival,
+	-- reading every input fresh, does. so the walk visits only delegators directly under a gate that gained the
+	-- bit, each once per such parent.
+	local function grant_descendants_bit(node: Entity, shard: number, bit: VisibilityMask)
+		local children = delegation_children[node]
+		if children == nil then
+			return
+		end
+		for child in children do
+			if grant_derived_bit(child, shard, bit) then
+				grant_descendants_bit(child, shard, bit)
+			end
+		end
+	end
+
+	-- debug introspection: re-derives every delegator's and exporter's gates from scratch with the full refresh
+	-- and compares the result with the stored words, which joins grant incrementally, restoring the stored words
+	-- afterwards so the check changes nothing. returns the first mismatch, described, or nil when every stored
+	-- word matches its derivation. for tests and fuzzing; walks the whole delegation store.
+	local function check_gates(): string?
+		local function describe_masks(masks: ShardMasks?): string
+			if masks == nil then
+				return "none"
+			end
+			local words = {} :: { string }
+			for shard, word in masks do
+				table.insert(words, `{shard}:{string.format("%08x", word)}`)
+			end
+			table.sort(words)
+			return `[{table.concat(words, " ")}]`
+		end
+
+		local function compare_store(
+			label: string,
+			stored: { [Entity]: ShardMasks },
+			derived: { [Entity]: ShardMasks }
+		): string?
+			for entity, masks in stored do
+				local expected = derived[entity]
+				if expected == nil or not masks_equal(masks, expected) then
+					return `{label} words of {id_to_string(entity, world)} are {describe_masks(masks)}, derived {describe_masks(
+						expected
+					)}`
+				end
+			end
+			for entity, expected in derived do
+				if stored[entity] == nil then
+					return `{label} words of {id_to_string(entity, world)} are none, derived {describe_masks(expected)}`
+				end
+			end
+			return nil
+		end
+
+		-- the recomputes replace each entry with a fresh table rather than mutating it, so shallow copies keep the
+		-- stored words intact for the comparison and the restore
+		local stored_effective = table.clone(effective_masks)
+		local stored_exported = table.clone(exported_masks)
+		local refreshed = {} :: { [Entity]: true }
+		for entity in delegation_parents do
+			refresh_gates(entity, refreshed)
+		end
+		for entity in stored_exported do
+			refresh_gates(entity, refreshed)
+		end
+		local derived_effective = table.clone(effective_masks)
+		local derived_exported = table.clone(exported_masks)
+		table.clear(effective_masks)
+		for entity, masks in stored_effective do
+			effective_masks[entity] = masks
+		end
+		table.clear(exported_masks)
+		for entity, masks in stored_exported do
+			exported_masks[entity] = masks
+		end
+		return compare_store("effective", stored_effective, derived_effective)
+			or compare_store("exported", stored_exported, derived_exported)
 	end
 
 	-- delegation_children maintenance, keyed by the full group entity so the fan-out and the parents mirror
@@ -3145,6 +3284,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			end
 		end
 
+		-- the entities whose entity-level or exported filter admitted the joiner being allocated, collected by the
+		-- grant loop while derived words exist and drained by the pass after it
+		local granted_gates = {} :: { Entity }
+
 		-- allocates the lowest free (shard, bit) for a pending client -- opening a new shard when every existing one
 		-- is full, so allocation never fails -- sweeps a reused slot's stale bits from the persistent masks (so the
 		-- joiner starts blank and full_packet rebuilds from scratch), and grants the client's bit to cached filters
@@ -3181,9 +3324,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- grant the bit to filters admitting this client: whitelists that named them while pending (their bit
 			-- didn't exist yet), and blacklists that don't name them -- this keeps blacklists' snapshot-derived allow
 			-- words fresh as the population grows. allow_masks mirrors privacy_filters' keys, so the masks table
-			-- always exists.
+			-- always exists. an entity-level or exported filter granting the bit is noted for the pass below, which
+			-- only has work while derived words exist.
+			local has_derived = next(delegation_parents) ~= nil or next(exported_masks) ~= nil
+			local granted_count = 0
 			for entity, component_filters in privacy_filters do
 				local entity_masks = allow_masks[entity]
+				local gate_granted = false
 				for privacy_key, filter in component_filters do
 					local admitted = filter[client]
 					if admitted == nil then
@@ -3193,21 +3340,39 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					if admitted then
 						local masks = entity_masks[privacy_key]
 						masks[shard] = bit32.bor(masks[shard] or 0, bit)
+						if privacy_key == Existence or privacy_key == Exported then
+							gate_granted = true
+						end
 					end
+				end
+				if gate_granted and has_derived then
+					granted_count += 1
+					granted_gates[granted_count] = entity
 				end
 			end
 
 			-- the derived words (every delegator's self gate, every exporter's exported gate) derive from the own
-			-- words just refreshed, so re-derive them all, parents first. no restage: the joiner's visibility ships
-			-- via their full packet, and no other client's bits moved. the exporter walk only rewrites existing keys
-			-- (a store entry exists exactly while its filter is cached), so iterating the store is safe.
-			if next(delegation_parents) ~= nil or next(exported_masks) ~= nil then
-				local refreshed = {} :: { [Entity]: true }
-				for entity in delegation_parents do
-					refresh_gates(entity, refreshed)
+			-- words, and only the joiner's bit can have moved in them: every edit keeps them current for every other
+			-- bit, and this one was swept from every store or never set. so rather than re-deriving every store, the
+			-- bit spreads from exactly the gates that granted it down the delegation subtrees under them, set in place
+			-- wherever a derivation now admits it (grant_derived_bit) -- the words a full re-derivation produces,
+			-- which check_gates compares against, at a cost bounded by the delegators under gates admitting the
+			-- joiner rather than by the store. it runs after the whole grant loop, since a derivation reads the
+			-- entity's own words too. a delegator left behind by its group's deletion reads that group's frozen
+			-- words, which are never granted, so wherever the group restricted anything it admits no joiner. no
+			-- restage: the joiner's visibility ships via their full packet, and no other client's bits moved.
+			for i = 1, granted_count do
+				local entity = granted_gates[i]
+				granted_gates[i] = nil
+				local gained: boolean
+				if effective_masks[entity] == nil and exported_masks[entity] == nil then
+					-- no derived words, so the gate its delegators read is the own filter the grant just widened
+					gained = true
+				else
+					gained = grant_derived_bit(entity, shard, bit)
 				end
-				for entity in exported_masks do
-					refresh_gates(entity, refreshed)
+				if gained then
+					grant_descendants_bit(entity, shard, bit)
 				end
 			end
 		end
@@ -5227,6 +5392,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 		-- debug introspection (unstable, for tests and diagnostics)
 		_client_shard = client_shard,
+		_check_gates = check_gates,
 	}
 end
 

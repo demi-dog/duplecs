@@ -44,10 +44,11 @@
 --     restage cost), and own (one bystander's standing toggled in the group's own blacklist, which narrows
 --     nothing the export doesn't already, so it fans out to no member -- the reference for what an edit costs
 --     without the descendant restage).
---   join   -- (e) add_client plus the generate_packets that allocates the slot (re-deriving every delegator's
---     and exporter's gates, plus the per-filter grant loop) and builds the joiner's full packet, swept over
---     the background delegator count with one DEFAULT_N group also live; the joiner is in no export and opens
---     no sub-container, so their packet holds the group gates, containers, and sub-containers only.
+--   join   -- (e) add_client plus the generate_packets that allocates the slot (the per-filter grant loop,
+--     carrying the joiner's bit down the delegation subtrees under the filters admitting them) and builds the
+--     joiner's full packet, swept over the background delegator count with one DEFAULT_N group also live; the
+--     joiner is in no export and opens no sub-container, so their packet holds the group gates, containers,
+--     and sub-containers only.
 --
 -- Rows a-d sweep the group size at DEFAULT_P and the client count at DEFAULT_N, so the P=DEFAULT_P
 -- N=DEFAULT_N row appears in both sweeps as a per-run noise gauge; they run against DEFAULT_BACKGROUND
