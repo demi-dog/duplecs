@@ -34,7 +34,7 @@ When a new in-range jecs version releases: bump `tests/setup.luau`'s tag, run th
   - `src/inspect.luau` — the debug packet inspector behind both halves' `describe_packet` / `describe_chunk`: the public wrapper over `wire.luau`'s header readers, each half passing in how it resolves wire ids, names, and serdes hooks.
   - `src/types.luau`, `src/wire.luau`, `src/serdes.luau`, `src/hooks.luau`, `src/diagnostics.luau` — the shared types, the wire format (the layouts and every function that encodes or decodes their bytes), the serdes store, the hook-registration wrappers every `world:added`/`changed`/`removed` in the tree goes through (a workaround for a jecs 0.11.0 bug, removable as cleanup once it is fixed upstream — the file header states the bug and the repair), and the diagnostics helpers (the `[duplecs]` message prefix, id rendering for warn/error messages, and the per-instance injectable warn hook).
 - `tests/setup.luau` — fetches the pinned jecs release directly into `roblox_packages/`.
-- `tests/verification_suite.luau` — the verification suite. (539 tests)
+- `tests/verification_suite.luau` — the verification suite. (545 tests)
 - `tests/benchmarks/bench_*.luau` — various benchmarks testing duplecs directly.
 - `docs/guides/` — the user-facing guides: a getting-started setup guide plus per-feature guides with code examples, indexed from `docs/guides/README.md`.
 - `docs/api.md` — the public minimal API listing: every notable export with a short description.

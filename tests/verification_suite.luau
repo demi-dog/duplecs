@@ -10865,7 +10865,7 @@ test("a delegator its group's deletion left behind keeps the group's last gate, 
 	-- the delegator should have died with its group, and dropping its edge instead would widen it to its own
 	-- gate. so it keeps the gate the group exported when it died, frozen: never granting a client that joins
 	-- afterwards, unmoved by edits of the entity reusing the group's id (which jecs, reading the leftover pair
-	-- by id, now names as its group), and re-derived to the same answer by a join or an edit of its own --
+	-- by id, now names as its group), and re-derived to the same answer by an edit of its own --
 	-- until the leftover pair is removed, the widening that always was.
 	local s = env.server
 	local group, delegator = strand_delegator(env)
@@ -11258,10 +11258,10 @@ end)
 test("a pending client joining across a multi-parent delegation is granted the intersected gate", function(env)
 	-- exercises allocate_client's delegation-aware pass over more than one
 	-- parent: both group filters name the pending joiner while they're still
-	-- bitless, and refresh_delegator must re-derive the entity's effective
-	-- words from both freshly-granted parents before full_packet resolves the
-	-- joiner's first snapshot. A and B each pass exactly one of the two groups,
-	-- so both must stay out.
+	-- bitless, and the join must carry the joiner's bit from both freshly-granted
+	-- parents into the entity's effective words -- only once both hold it --
+	-- before full_packet resolves the joiner's first snapshot. A and B each pass
+	-- exactly one of the two groups, so both must stay out.
 	local s = env.server
 	local pending = fake_player("DelegationPending")
 	s.net.add_client(pending)
@@ -11294,6 +11294,554 @@ test("a pending client joining across a multi-parent delegation is granted the i
 	expect(table.find(packets[env.player_b].replicated, open) ~= nil, "B's packet is a real delivery")
 	expect_equal(table.find(packets[env.player_a].replicated, member), nil, "A's packet excludes the member")
 	expect_equal(table.find(packets[env.player_b].replicated, member), nil, "B's packet excludes the member")
+end)
+
+-- the join grant: a joiner's slot grant carries their bit from exactly the filters admitting them down the
+-- delegation subtrees below, rather than re-deriving every delegator's and exporter's gates. _check_gates
+-- re-derives every gate from scratch and compares it with the stored words (nil when they agree), so the
+-- tests below pin both the outcomes and that equivalence, across the shapes the grant has to get right:
+-- chains, diamonds with branches of different depths, exports narrowing below a gate, relation edges, a
+-- delegator its group's deletion left behind, several joiners in one frame, and joins on both sides of a
+-- shard boundary.
+
+-- asserts each row's visibility to a client, as the server reads it and as the client's packet this frame
+-- shipped it -- a joiner's full packet, or a delta creating entities spawned this frame. rows are
+-- { entity, label, visible }.
+local function expect_joined_visibility(s, packet, client, rows)
+	for _, row in rows do
+		local entity, label, visible = row[1], row[2], row[3]
+		expect_equal(
+			s.net.is_entity_visible(entity, client),
+			visible,
+			`{client.Name} {if visible then "sees" else "does not see"} {label}`
+		)
+		expect_equal(
+			table.find(packet.replicated, entity) ~= nil,
+			visible,
+			`{client.Name}'s packet {if visible then "creates" else "omits"} {label}`
+		)
+	end
+end
+
+local function replicated_entity(s)
+	local entity = s.world:entity()
+	s.world:add(entity, s.net.Replicated)
+	return entity
+end
+
+test("a join grants joiners exactly a full re-derivation's gates through chains, diamonds, and exports", function(env)
+	-- two joiners in one frame, the first named by a whitelist while pending. the open root's blacklist admits
+	-- both; mid passes them on and exports past B; the diamond also needs the named root, which admits j1 only;
+	-- the narrow export admits neither below it; a delegator's own whitelist narrows to j2; a relation edge
+	-- follows mid like a direct one; and an export admitting j2 still passes on only what its exporter's own
+	-- gate admits, which excludes j2. A and B, already allocated, must keep exactly their standing.
+	local s = env.server
+	local j1 = fake_player("GrantJoiner1")
+	local j2 = fake_player("GrantJoiner2")
+	s.net.add_client(j1)
+	s.net.add_client(j2)
+
+	local open_root = replicated_entity(s)
+	s.world:set(open_root, s.net.Private, { [env.player_a] = false })
+	local named_root = s.world:entity() -- a pure gate: never replicated itself
+	s.world:set(named_root, s.net.Private, { [env.player_a] = true, [j1] = true })
+	local mid = replicated_entity(s)
+	s.world:add(mid, pair(s.net.InheritsPrivacy, open_root))
+	s.world:set(mid, s.net.ExportsPrivacy, { [env.player_b] = false })
+	local chain_leaf = replicated_entity(s)
+	s.world:add(chain_leaf, pair(s.net.InheritsPrivacy, mid))
+	local diamond = replicated_entity(s)
+	s.world:add(diamond, pair(s.net.InheritsPrivacy, mid))
+	s.world:add(diamond, pair(s.net.InheritsPrivacy, named_root))
+	local below_diamond = replicated_entity(s)
+	s.world:add(below_diamond, pair(s.net.InheritsPrivacy, diamond))
+	local narrow = replicated_entity(s)
+	s.world:add(narrow, pair(s.net.InheritsPrivacy, open_root))
+	s.world:set(narrow, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local narrowed_leaf = replicated_entity(s)
+	s.world:add(narrowed_leaf, pair(s.net.InheritsPrivacy, narrow))
+	local own_named = replicated_entity(s)
+	s.world:add(own_named, pair(s.net.InheritsPrivacy, open_root))
+	s.world:set(own_named, s.net.Private, { [env.player_b] = true, [j2] = true })
+	local through_item = replicated_entity(s)
+	s.world:add(through_item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(through_item, pair(jecs.ChildOf, mid))
+	local gated_exporter = replicated_entity(s)
+	s.world:add(gated_exporter, pair(s.net.InheritsPrivacy, named_root))
+	s.world:set(gated_exporter, s.net.ExportsPrivacy, { [env.player_a] = false })
+	local gated_export_leaf = replicated_entity(s)
+	s.world:add(gated_export_leaf, pair(s.net.InheritsPrivacy, gated_exporter))
+	local open = replicated_entity(s) -- ungated: every packet below is a real delivery
+
+	local packets = env.frame()
+	expect_equal(s.net._check_gates(), nil, "every stored gate matches a full re-derivation")
+
+	local function rows(open_root_v, mid_v, chain_v, diamond_v, narrow_v, own_v, through_v, gated_v, gated_leaf_v)
+		return {
+			{ open_root, "the open root", open_root_v },
+			{ mid, "mid", mid_v },
+			{ chain_leaf, "the chain leaf", chain_v },
+			{ diamond, "the diamond", diamond_v },
+			{ below_diamond, "the diamond's delegator", diamond_v },
+			{ narrow, "the narrowing exporter", narrow_v },
+			{ narrowed_leaf, "the leaf under the narrowing export", false },
+			{ own_named, "the delegator narrowed by its own whitelist", own_v },
+			{ through_item, "the item inheriting through ChildOf", through_v },
+			{ gated_exporter, "the exporter under the named root", gated_v },
+			{ gated_export_leaf, "the leaf under that exporter", gated_leaf_v },
+			{ open, "the ungated entity", true },
+		}
+	end
+	expect_joined_visibility(s, packets[j1], j1, rows(true, true, true, true, true, false, true, true, true))
+	expect_joined_visibility(s, packets[j2], j2, rows(true, true, true, false, true, true, true, false, false))
+	expect_joined_visibility(
+		s,
+		packets[env.player_a],
+		env.player_a,
+		rows(false, false, false, false, false, false, false, true, false)
+	)
+	expect_joined_visibility(
+		s,
+		packets[env.player_b],
+		env.player_b,
+		rows(true, true, false, false, true, true, false, false, false)
+	)
+end)
+
+test("a delegator gains a joiner only once every parent has, however deep each parent's branch", function(env)
+	-- the bit reaches a delegator once per parent gaining it, in no fixed order: the bottom's short edge (to the
+	-- named root, granted directly) can arrive before its three-level branch has the bit, and must grant nothing
+	-- until the long branch arrives too. the two roots admit the joiner through different filters -- a blacklist
+	-- not naming them and a whitelist naming them while pending -- and a sibling under a root that never admits
+	-- them gains nothing, however its other branch fares.
+	local s = env.server
+	local joiner = fake_player("DeepDiamondJoiner")
+	s.net.add_client(joiner)
+
+	local open_root = s.world:entity()
+	s.world:set(open_root, s.net.Private, { [env.player_a] = false })
+	local named_root = s.world:entity()
+	s.world:set(named_root, s.net.Private, { [env.player_a] = true, [joiner] = true })
+	local closed_root = s.world:entity()
+	s.world:set(closed_root, s.net.Private, { [env.player_a] = true })
+	local branch = open_root
+	for _ = 1, 3 do
+		local level = s.world:entity()
+		s.world:add(level, pair(s.net.InheritsPrivacy, branch))
+		branch = level
+	end
+	local bottom = replicated_entity(s)
+	s.world:add(bottom, pair(s.net.InheritsPrivacy, branch))
+	s.world:add(bottom, pair(s.net.InheritsPrivacy, named_root))
+	local below = replicated_entity(s)
+	s.world:add(below, pair(s.net.InheritsPrivacy, bottom))
+	local sibling = replicated_entity(s)
+	s.world:add(sibling, pair(s.net.InheritsPrivacy, branch))
+	s.world:add(sibling, pair(s.net.InheritsPrivacy, closed_root))
+	local triple = replicated_entity(s)
+	s.world:add(triple, pair(s.net.InheritsPrivacy, open_root))
+	s.world:add(triple, pair(s.net.InheritsPrivacy, named_root))
+	s.world:add(triple, pair(s.net.InheritsPrivacy, bottom))
+	local open = replicated_entity(s)
+
+	local packets = env.frame()
+	expect_equal(s.net._check_gates(), nil, "every stored gate matches a full re-derivation")
+	expect_joined_visibility(s, packets[joiner], joiner, {
+		{ bottom, "the bottom, admitted along both branches", true },
+		{ below, "the bottom's delegator", true },
+		{ sibling, "the sibling under the closed root", false },
+		{ triple, "the delegator under both roots and the bottom", true },
+		{ open, "the ungated entity", true },
+	})
+	for _, player in { env.player_a, env.player_b } do
+		expect_joined_visibility(s, packets[player], player, {
+			{ bottom, "the bottom", false },
+			{ below, "the bottom's delegator", false },
+			{ sibling, "the sibling", false },
+			{ triple, "the triple-parented delegator", false },
+			{ open, "the ungated entity", true },
+		})
+	end
+end)
+
+test("a joiner a delegator's live parent admits still never passes the frozen gate its dead group left", function(env)
+	-- the dead group admitted only A, and froze that: a joiner the delegator's other, live parent admits gains
+	-- the bit everywhere that parent reaches -- the sibling is the positive control -- but never past the frozen
+	-- words, at the delegator or anywhere below it.
+	local s = env.server
+	local open_group = s.world:entity()
+	s.world:set(open_group, s.net.Private, { [env.player_b] = false })
+	local sibling = replicated_entity(s)
+	s.world:add(sibling, pair(s.net.InheritsPrivacy, open_group))
+	local group, delegator = strand_delegator(env)
+	-- the group's id goes to an inert tenant, so no entity below reads the leftover edge as aimed at itself
+	mint_recycled(s.world, group)
+	s.world:add(delegator, pair(s.net.InheritsPrivacy, open_group))
+	local below = replicated_entity(s)
+	s.world:add(below, pair(s.net.InheritsPrivacy, delegator))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "precondition: A passes both gates")
+	expect_equal(s.net.is_entity_visible(below, env.player_a), true, "precondition: and so the delegator's delegator")
+
+	local joiner = fake_player("FrozenGateJoiner")
+	s.net.add_client(joiner)
+	local packets = env.frame()
+	expect_equal(s.net._check_gates(), nil, "every stored gate matches a full re-derivation")
+	expect_joined_visibility(s, packets[joiner], joiner, {
+		{ sibling, "the live group's other delegator", true },
+		{ delegator, "the left-behind delegator", false },
+		{ below, "the left-behind delegator's delegator", false },
+	})
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "A still sees the delegator")
+	expect_equal(s.net.is_entity_visible(below, env.player_a), true, "and its delegator")
+end)
+
+test("a delegator left behind by a group that restricted nothing admits a joiner its live parent admits", function(env)
+	-- a group restricting nothing exports no words to freeze, so the delegator its deletion leaves behind is
+	-- gated by its other parents alone -- joiners included, exactly as re-deriving it from scratch reads it.
+	-- strand_delegator's shape, minus the group's filter.
+	local s = env.server
+	local open_group = s.world:entity()
+	s.world:set(open_group, s.net.Private, { [env.player_b] = false })
+	local group = replicated_entity(s)
+	local member = replicated_entity(s)
+	local delegator = replicated_entity(s)
+	s.world:set(delegator, pair(s.defs.Likes, member), 1)
+	s.world:add(delegator, pair(s.net.InheritsPrivacy, group))
+	s.world:add(member, pair(jecs.ChildOf, group))
+	env.frame()
+	s.world:delete(group)
+	expect_cascade_miss(s.world, delegator, pair(s.net.InheritsPrivacy, group))
+	-- the group's id goes to an inert tenant, so no entity below reads the leftover edge as aimed at itself
+	mint_recycled(s.world, group)
+	s.world:add(delegator, pair(s.net.InheritsPrivacy, open_group))
+	local below = replicated_entity(s)
+	s.world:add(below, pair(s.net.InheritsPrivacy, delegator))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "precondition: the live group narrows B out")
+
+	local joiner = fake_player("UnfrozenGateJoiner")
+	s.net.add_client(joiner)
+	local packets = env.frame()
+	expect_equal(s.net._check_gates(), nil, "every stored gate matches a full re-derivation")
+	expect_joined_visibility(s, packets[joiner], joiner, {
+		{ delegator, "the left-behind delegator", true },
+		{ below, "the left-behind delegator's delegator", true },
+	})
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "A still sees the delegator")
+	expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "while B still does not")
+end)
+
+test("joiners straddling a shard boundary in one frame are granted their delegated gates in both shards", function(env)
+	-- the bit a join grants lives in the joiner's own shard's words, so a frame whose two joiners straddle a
+	-- shard boundary grants them in different shards, one of them opening its shard; checked at the 32- and
+	-- 64-client boundaries, then with one joiner reusing a departed client's slot -- granted from the swept
+	-- words -- while the other lands in the top shard. each round's pair splits on the named root, which names
+	-- one of them while pending; every earlier client keeps its standing throughout.
+	local s = env.server
+	local fillers = join_named_fillers(env, 29) -- 31 live clients: the next two straddle slot 32
+
+	local open_root = s.world:entity()
+	s.world:set(open_root, s.net.Private, { [env.player_a] = false })
+	local named_root = s.world:entity()
+	s.world:set(named_root, s.net.Private, { [env.player_a] = true })
+	local mid = replicated_entity(s)
+	s.world:add(mid, pair(s.net.InheritsPrivacy, open_root))
+	s.world:set(mid, s.net.ExportsPrivacy, { [env.player_b] = false })
+	local leaf = replicated_entity(s)
+	s.world:add(leaf, pair(s.net.InheritsPrivacy, mid))
+	local diamond = replicated_entity(s)
+	s.world:add(diamond, pair(s.net.InheritsPrivacy, mid))
+	s.world:add(diamond, pair(s.net.InheritsPrivacy, named_root))
+	local open = replicated_entity(s)
+	env.frame()
+
+	local function standing(leaf_v, diamond_v)
+		return {
+			{ mid, "mid", true },
+			{ leaf, "the leaf", leaf_v },
+			{ diamond, "the diamond", diamond_v },
+			{ open, "the ungated entity", true },
+		}
+	end
+	local joined = {}
+	local function join_round(label, expected_shards)
+		local named = fake_player(`{label}Named`)
+		local unnamed = fake_player(`{label}Unnamed`)
+		s.net.add_client(named)
+		s.net.add_client(unnamed)
+		s.net.edit_entity_privacy(named_root, named, true) -- named while pending: bitless until the join
+		local packets = env.frame()
+		local shards = { s.net._client_shard(named), s.net._client_shard(unnamed) }
+		table.sort(shards)
+		expect(
+			shards[1] == expected_shards[1] and shards[2] == expected_shards[2],
+			`precondition: {label}'s joiners land in shards {expected_shards[1]} and {expected_shards[2]}, not {shards[1]} and {shards[2]}`
+		)
+		expect_equal(s.net._check_gates(), nil, `{label}: every stored gate matches a full re-derivation`)
+		expect_joined_visibility(s, packets[named], named, standing(true, true))
+		expect_joined_visibility(s, packets[unnamed], unnamed, standing(true, false))
+		table.insert(joined, { named, true })
+		table.insert(joined, { unnamed, false })
+	end
+
+	join_round("Straddle32", { 1, 2 })
+	join_named_fillers(env, 30) -- 63 live clients: the next two straddle slot 64
+	join_round("Straddle64", { 2, 3 })
+	s.net.remove_client(fillers[1]) -- frees a slot in shard 1
+	env.frame()
+	join_round("Reuse", { 1, 3 })
+
+	for _, entry in joined do
+		local client, named = entry[1], entry[2]
+		expect_equal(s.net.is_entity_visible(leaf, client), true, `{client.Name} still sees the leaf`)
+		expect_equal(s.net.is_entity_visible(diamond, client), named, `{client.Name} keeps its diamond standing`)
+	end
+	expect_equal(s.net.is_entity_visible(mid, env.player_a), false, "A never sees mid")
+	expect_equal(s.net.is_entity_visible(leaf, env.player_b), false, "B never passes mid's export")
+	expect_equal(s.net._check_gates(), nil, "every stored gate still matches a full re-derivation")
+end)
+
+test("seeded random delegation DAGs grant every joiner exactly what a from-scratch derivation admits", function(env)
+	-- a deterministic random walk over the shapes the join grant must get right: multi-parent DAGs, chains,
+	-- exports narrowing below a gate, relation edges, whitelists naming pending joiners and blacklists not
+	-- naming them, several joiners per frame across the 32- and 64-client boundaries, and departures freeing
+	-- slots for reuse. every frame is checked two ways: _check_gates against the full re-derivation, and every
+	-- client's visibility of every entity -- each joiner's full packet included -- against a model derived here
+	-- from the filters and edges alone. no deletions: delegators left behind by one have their own tests above.
+	local s = env.server
+	local state = 0x2545f491
+	local function rand(n: number): number
+		state = bit32.bxor(state, bit32.lshift(state, 13))
+		state = bit32.bxor(state, bit32.rshift(state, 17))
+		state = bit32.bxor(state, bit32.lshift(state, 5))
+		return state % n + 1
+	end
+
+	-- the model: per entity its own and exported filters (nil when unset), direct parents, ChildOf parent, and
+	-- whether it inherits through ChildOf. entities only ever delegate to earlier ones, so no edge closes a
+	-- cycle.
+	local entities = {}
+	local own_filters = {}
+	local exported_filters = {}
+	local inherits = {}
+	local child_of = {}
+	local through = {}
+	local replicated = {}
+	local clients = { env.player_a, env.player_b }
+	local pending = {}
+	local serial = 0
+
+	local function admits(filter, client)
+		if filter == nil then
+			return true
+		end
+		local _, sample = next(filter)
+		if sample == false then
+			return filter[client] == nil
+		end
+		return filter[client] == true
+	end
+
+	-- a memoized reader of whether client passes an entity's self gate: its own filter and, for every parent,
+	-- that parent's self gate and exported filter
+	local function gate_reader(client)
+		local memo = {}
+		local function passes(entity)
+			local cached = memo[entity]
+			if cached ~= nil then
+				return cached
+			end
+			local result = admits(own_filters[entity], client)
+			if result then
+				local parents = table.clone(inherits[entity])
+				if through[entity] and child_of[entity] ~= nil then
+					parents[child_of[entity]] = true
+				end
+				for parent in parents do
+					if not passes(parent) or not admits(exported_filters[parent], client) then
+						result = false
+						break
+					end
+				end
+			end
+			memo[entity] = result
+			return result
+		end
+		return passes
+	end
+
+	local function random_filter()
+		local pool = table.clone(clients)
+		for _, client in pending do
+			table.insert(pool, client)
+		end
+		if rand(6) == 1 then
+			return {}
+		end
+		local member_value = rand(2) == 1
+		local filter = {}
+		for _ = 1, rand(4) do
+			filter[pool[rand(#pool)]] = member_value
+		end
+		return filter
+	end
+
+	local function set_filter(entity, which)
+		local store = if which == "own" then own_filters else exported_filters
+		local component = if which == "own" then s.net.Private else s.net.ExportsPrivacy
+		if rand(4) == 1 then
+			store[entity] = nil
+			s.world:remove(entity, component)
+		else
+			local filter = random_filter()
+			store[entity] = filter
+			s.world:set(entity, component, table.clone(filter))
+		end
+	end
+
+	local function spawn()
+		local entity = s.world:entity()
+		local index = #entities + 1
+		entities[index] = entity
+		inherits[entity] = {}
+		if rand(7) > 1 then
+			replicated[entity] = true
+			s.world:add(entity, s.net.Replicated)
+		end
+		if rand(3) == 1 then
+			set_filter(entity, "own")
+		end
+		if rand(4) == 1 then
+			set_filter(entity, "exported")
+		end
+		if index > 1 then
+			for _ = 1, rand(3) - 1 do
+				local parent = entities[rand(index - 1)]
+				inherits[entity][parent] = true
+				s.world:add(entity, pair(s.net.InheritsPrivacy, parent))
+			end
+			if rand(3) == 1 then
+				local parent = entities[rand(index - 1)]
+				child_of[entity] = parent
+				s.world:add(entity, pair(jecs.ChildOf, parent))
+				if rand(2) == 1 then
+					through[entity] = true
+					s.world:add(entity, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+				end
+			end
+		end
+	end
+
+	local function mutate()
+		local roll = rand(6)
+		if roll == 1 or #entities < 2 then
+			spawn()
+			return
+		end
+		local index = rand(#entities - 1) + 1
+		local entity = entities[index]
+		if roll == 2 then
+			set_filter(entity, "own")
+		elseif roll == 3 then
+			set_filter(entity, "exported")
+		elseif roll == 4 then
+			local parent = entities[rand(index - 1)]
+			inherits[entity][parent] = true
+			s.world:add(entity, pair(s.net.InheritsPrivacy, parent))
+		elseif roll == 5 then
+			local parent = next(inherits[entity])
+			if parent ~= nil then
+				inherits[entity][parent] = nil
+				s.world:remove(entity, pair(s.net.InheritsPrivacy, parent))
+			end
+		else
+			local parent = entities[rand(index - 1)]
+			child_of[entity] = parent
+			s.world:add(entity, pair(jecs.ChildOf, parent))
+		end
+	end
+
+	-- the departure prune, mirrored: the client leaves every filter, and a blacklist losing its last name goes
+	local function depart(client)
+		for _, store in { own_filters, exported_filters } do
+			for entity, filter in store do
+				local _, sample = next(filter)
+				filter[client] = nil
+				if sample == false and next(filter) == nil then
+					store[entity] = nil
+				end
+			end
+		end
+		s.net.remove_client(client)
+	end
+
+	for _ = 1, 6 do
+		spawn()
+	end
+	local top_shard = 1
+	local multi_joins = 0
+	for round = 1, 40 do
+		for _ = 1, rand(3) do
+			mutate()
+		end
+		for _ = 1, if round % 6 == 0 then rand(24) else rand(4) - 1 do
+			serial += 1
+			local joiner = fake_player(`DagJoiner{serial}`)
+			table.insert(pending, joiner)
+			s.net.add_client(joiner)
+		end
+		-- name some pending joiners in fresh filters while they wait for their slot
+		for _ = 1, rand(3) - 1 do
+			set_filter(entities[rand(#entities)], if rand(2) == 1 then "own" else "exported")
+		end
+		if #clients > 2 and rand(3) == 1 then
+			for _ = 1, if #clients > 90 then 30 else rand(4) do
+				if #clients <= 2 then
+					break
+				end
+				local client = table.remove(clients, rand(#clients - 2) + 2)
+				depart(client)
+			end
+		end
+
+		local joiners = pending
+		pending = {}
+		local packets = env.frame()
+		for _, joiner in joiners do
+			table.insert(clients, joiner)
+		end
+		expect_equal(s.net._check_gates(), nil, `round {round}: every stored gate matches a full re-derivation`)
+		for _, client in clients do
+			local passes = gate_reader(client)
+			for _, entity in entities do
+				expect_equal(
+					s.net.is_entity_visible(entity, client),
+					replicated[entity] == true and passes(entity),
+					`round {round}: {client.Name}'s visibility of entity {entity}`
+				)
+			end
+		end
+		for _, joiner in joiners do
+			local passes = gate_reader(joiner)
+			local packet = packets[joiner]
+			for _, entity in entities do
+				expect_equal(
+					table.find(packet.replicated, entity) ~= nil,
+					replicated[entity] == true and passes(entity),
+					`round {round}: {joiner.Name}'s full packet and entity {entity}`
+				)
+			end
+			top_shard = math.max(top_shard, s.net._client_shard(joiner) :: number)
+		end
+		if #joiners > 1 then
+			multi_joins += 1
+		end
+	end
+	-- the walk is deterministic, so these only fail if the seed or the walk changes: they keep it covering what
+	-- the header promises
+	expect(top_shard >= 3, "precondition: some joiner landed past the 64-client boundary")
+	expect(multi_joins >= 5, "precondition: several frames allocated more than one joiner")
 end)
 
 test("recycling a client slot clears a stale delegated group grant", function(env)
@@ -12091,8 +12639,8 @@ end)
 
 test("a client joining later is admitted to a root exporter's delegators by its ExportsPrivacy blacklist", function(env)
 	-- the joiner's bit enters the blacklist's allow words at slot allocation, and the exported words derive from
-	-- them, so the join has to re-derive every exporter's -- a root group delegating to nothing included, which no
-	-- walk over the delegators' own derivations would refresh -- before the full packet reads the member's gate.
+	-- them, so the join has to carry the bit into the exporter's words -- a root group delegating to nothing
+	-- included -- and on down to the member before the full packet reads the member's gate.
 	local s = env.server
 	local group = s.world:entity()
 	s.world:add(group, s.net.Replicated)
@@ -12118,8 +12666,9 @@ test("a client joining later is admitted to a root exporter's delegators by its 
 end)
 
 test("a client joining later is admitted through a mid-chain exporter's ExportsPrivacy blacklist", function(env)
-	-- mid both inherits and exports, so the join re-derives its self gate from the root first and its exported
-	-- gate from that, both against the joiner's freshly granted bits, before the leaf below reads either.
+	-- mid both inherits and exports, so the join grants its self gate the joiner's bit from the root first and
+	-- its exported gate from that, both against the joiner's freshly granted bits, before the leaf below reads
+	-- either.
 	local s = env.server
 	local root = s.world:entity()
 	s.world:set(root, s.net.Private, { [env.player_a] = false })
@@ -12149,9 +12698,9 @@ test("a client joining later is admitted through a mid-chain exporter's ExportsP
 end)
 
 test("a delegator added after a join inherits the joiner's standing in an export that had no delegators", function(env)
-	-- the join re-derives every exporter's words, not only those a delegator's derivation reaches as a parent: an
-	-- export with nothing below it at the join is read the moment a first delegator arrives, and has to carry the
-	-- joiner's freshly granted bit by then.
+	-- the join grants the joiner's bit to every exporter admitting them, not only those with delegators below:
+	-- an export with nothing below it at the join is read the moment a first delegator arrives, and has to carry
+	-- the joiner's freshly granted bit by then.
 	local s, c = env.server, env.client
 	local group = s.world:entity()
 	s.world:add(group, s.net.Replicated)
@@ -12180,7 +12729,7 @@ end)
 
 test("recycling a client slot clears a stale exported grant", function(env)
 	-- a newcomer reusing a freed bit does not inherit the prior occupant's admission through the export: the
-	-- freed-slot sweep clears the stale bit, and the join re-derives the exported words from the swept ones.
+	-- freed-slot sweep clears the stale bit, and the join grants the newcomer only what the swept words admit.
 	local s = env.server
 	local group = s.world:entity()
 	s.world:set(group, s.net.ExportsPrivacy, { [env.player_b] = true })
@@ -13167,8 +13716,8 @@ end)
 test(
 	"a joiner's full packet respects a through-edge, a departed client rejoins unlisted, and a slot recycles clean",
 	function(env)
-		-- the join re-derives every delegator's gate over the shared mirror, so an edge from a relation is read like
-		-- any other; the departure prunes the room's filter like any filter, so the rejoiner starts unlisted; and
+		-- the join carries the joiner's bit down the shared mirror, so an edge from a relation is followed like any
+		-- other; the departure prunes the room's filter like any filter, so the rejoiner starts unlisted; and
 		-- the slot reuse sweeps the stale grant, so the newcomer inherits nothing through the edge.
 		local s = env.server
 		local room = s.world:entity() -- a pure gate: never replicated itself
