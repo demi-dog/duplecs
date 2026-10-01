@@ -652,6 +652,227 @@ test("recycling a deleted pair's target in the same frame still skips the redund
 	)
 end)
 
+test("values staged on an entity deleted the same frame are dropped in every shard", function(env)
+	-- a deletion leaves the dying entity's cells to its Replicated teardown, which zeroes their masks but leaves
+	-- any value staged earlier in the frame in place; the resolve passes must drop such values rather than ship
+	-- them, in each shard that saw the cell. a survivor's change in the same frame is the control: staged values
+	-- still ship, just not the dead entity's.
+	local s = env.server
+	-- join_fillers' shape, inlined since that helper is declared further down: shard 1 now holds its full 32
+	for i = 1, 30 do
+		s.net.add_client(fake_player(`DyingValueFiller{i}`))
+	end
+	env.frame()
+	local c2 = env.make_client()
+	local overflow = fake_player("DyingValueOverflow")
+	env.join(overflow, c2)
+	expect_equal(s.net._client_shard(overflow), 2, "the overflow player really did open shard 2")
+
+	local target = s.world:entity()
+	s.world:add(target, s.net.Replicated)
+	local dying = s.world:entity()
+	s.world:add(dying, s.net.Replicated)
+	s.world:set(dying, s.defs.Health, 1)
+	s.world:set(dying, s.defs.Inventory, { gold = 1 })
+	s.world:set(dying, pair(s.defs.Likes, target), 1)
+	local survivor = s.world:entity()
+	s.world:add(survivor, s.net.Replicated)
+	s.world:set(survivor, s.defs.Health, 1)
+	env.frame()
+
+	s.world:set(dying, s.defs.Health, 2)
+	s.world:set(dying, s.defs.Inventory, { gold = 2 })
+	s.world:set(dying, pair(s.defs.Likes, target), 2)
+	s.world:set(survivor, s.defs.Health, 2)
+	s.world:delete(dying)
+	local packets = s.net.generate_packets()
+	for _, player in { env.player_a, overflow } do
+		local decoded = decode_packet(deep_copy(packets[player]))
+		expect_equal(#decoded.unreplicated, 1, `{player.Name}'s packet deletes exactly one entity`)
+		expect_equal(decoded.unreplicated[1], dying, `{player.Name} is told to delete the dying entity`)
+		local health = decoded.components[s.defs.Health]
+		expect(
+			health ~= nil and health.ids ~= nil and #health.ids == 1 and health.ids[1] == survivor,
+			`{player.Name} receives the survivor's Health change alone`
+		)
+		expect_equal(health.values[1], 2, `{player.Name} receives the survivor's new value`)
+		expect_equal(decoded.components[s.defs.Inventory], nil, `no Inventory value reaches {player.Name}`)
+		for _, section in decoded.sections do
+			expect(section.relation ~= s.defs.Likes, `no Likes pair section reaches {player.Name}`)
+		end
+	end
+
+	local after = s.net.generate_packets()
+	expect_equal(after[env.player_a], nil, "nothing is left staged for shard 1 the frame after")
+	expect_equal(after[overflow], nil, "nor for shard 2")
+end)
+
+test("unreplicating, changing, and deleting an entity in one frame ships exactly its deletion", function(env)
+	-- the unreplicate zeroes every cell while the entity lives on; the sets after it still stage values (the
+	-- cells' last-sent words are unresolved), and the deletion finds no Replicated left to restage, so the dying
+	-- entity's hooks stage nothing at all. the client holding it must see one deletion and no cell. the same
+	-- goes through a re-replicate in between, and an entity created and deleted within the frame ships nothing.
+	local s, c = env.server, env.client
+	local target = s.world:entity()
+	s.world:add(target, s.net.Replicated)
+	local function spawn()
+		local entity = s.world:entity()
+		s.world:add(entity, s.net.Replicated)
+		s.world:set(entity, s.defs.Health, 1)
+		s.world:add(entity, s.defs.Burning)
+		s.world:set(entity, pair(s.defs.Likes, target), 1)
+		s.world:set(entity, s.net.Private, { [env.player_a] = true })
+		return entity
+	end
+	local unreplicated = spawn()
+	local bounced = spawn()
+	env.sync(env.player_a)
+	local lu = c.net.get_client_entity(unreplicated)
+	local lb = c.net.get_client_entity(bounced)
+	expect(lu ~= nil and c.world:get(lu, c.defs.Health) == 1, "A holds the first entity before the frame")
+	expect(lb ~= nil and c.world:get(lb, c.defs.Health) == 1, "and the second")
+
+	s.world:remove(unreplicated, s.net.Replicated)
+	s.world:set(unreplicated, s.defs.Health, 2)
+	s.world:set(unreplicated, pair(s.defs.Likes, target), 2)
+	s.world:delete(unreplicated)
+
+	s.world:remove(bounced, s.net.Replicated)
+	s.world:add(bounced, s.net.Replicated)
+	s.world:set(bounced, s.defs.Health, 2)
+	s.world:delete(bounced)
+
+	local transient = spawn()
+	s.world:delete(transient)
+
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_b], nil, "B, never admitted, receives no packet at all")
+	local decoded = decode_packet(deep_copy(packets[env.player_a]))
+	expect_equal(#decoded.unreplicated, 2, "A's packet deletes exactly two entities")
+	expect(table.find(decoded.unreplicated, unreplicated) ~= nil, "the unreplicated one")
+	expect(table.find(decoded.unreplicated, bounced) ~= nil, "and the re-replicated one")
+	expect_equal(#decoded.replicated, 0, "and creates nothing: the transient entity never ships")
+	expect_equal(#decoded.sections, 0, "and carries no cell: neither the staged values nor any removal")
+	env.apply(decoded)
+	expect_equal(c.world:contains(lu), false, "A's client drops the first entity")
+	expect_equal(c.world:contains(lb), false, "and the second")
+	expect_equal(c.net.get_client_entity(unreplicated), nil, "with both mappings gone")
+	expect_equal(c.net.get_client_entity(bounced), nil, "both")
+end)
+
+test("a cascade delete hides survivors' pairs aimed at what it kills, so a recycled id ships afresh", function(env)
+	-- a survivor's pairs aimed at entities a deletion kills (under the Remove policy, so the survivor outlives
+	-- them) are zeroed by each dying target's Replicated teardown restaging the pairs aimed at it: the dying
+	-- entity's own hooks stage nothing, and jecs's later removal of the pair from the survivor finds the target
+	-- already unreplicable. both targets are covered -- the deleted root, and a child its ChildOf cascade kills.
+	-- the recycle proves the zeroing reached the server's last-sent record: a pair to the root's recycled id
+	-- must ship to a client that held the old one, which a stale record would swallow.
+	local s, c = env.server, env.client
+	local root = s.world:entity()
+	s.world:add(root, s.net.Replicated)
+	local child = s.world:entity()
+	s.world:add(child, s.net.Replicated)
+	s.world:add(child, pair(jecs.ChildOf, root))
+	local survivor = s.world:entity()
+	s.world:add(survivor, s.net.Replicated)
+	s.world:set(survivor, s.defs.Health, 9)
+	s.world:add(survivor, pair(s.defs.Targeting, root))
+	s.world:set(survivor, pair(s.defs.Likes, child), 3)
+	env.sync(env.player_a)
+	local ls = c.net.get_client_entity(survivor)
+	local lr = c.net.get_client_entity(root)
+	local lc = c.net.get_client_entity(child)
+	expect_equal(c.world:has(ls, pair(c.defs.Targeting, lr)), true, "A holds the pair aimed at the root")
+	expect_equal(c.world:get(ls, pair(c.defs.Likes, lc)), 3, "and the pair aimed at the child")
+
+	local targeting_root = pair(s.defs.Targeting, root) -- captured before the root dies
+	local likes_child = pair(s.defs.Likes, child)
+	s.world:delete(root)
+	expect_equal(s.world:contains(child), false, "the child died through the ChildOf cascade")
+	expect_equal(s.world:contains(survivor), true, "the survivor lives on")
+	expect_equal(s.world:has(survivor, targeting_root), false, "its pairs removed under the Remove policy")
+	expect_equal(s.net.is_component_visible(survivor, targeting_root, env.player_a), false, "the root's pair is hidden")
+	expect_equal(s.net.is_component_visible(survivor, likes_child, env.player_a), false, "and the child's")
+
+	local packet = env.sync(env.player_a)
+	expect_equal(#packet.unreplicated, 2, "A's packet deletes exactly two entities")
+	expect(table.find(packet.unreplicated, root) ~= nil, "the root")
+	expect(table.find(packet.unreplicated, child) ~= nil, "and the child")
+	expect_equal(#packet.sections, 0, "and carries no cell: deleting both targets drops the pairs client-side")
+	expect_equal(c.world:contains(ls), true, "A's survivor lives on")
+	expect_equal(c.world:get(ls, c.defs.Health), 9, "with its Health")
+
+	local reborn = s.world:entity()
+	expect(
+		jecs.ECS_ID(reborn) == jecs.ECS_ID(root) and reborn ~= root,
+		"precondition: jecs did not recycle the root's id, scenario cannot be tested"
+	)
+	s.world:add(reborn, s.net.Replicated)
+	s.world:add(survivor, pair(s.defs.Targeting, reborn))
+	local packet2 = env.sync(env.player_a)
+	expect_equal(packet2.replicated[1], reborn, "A receives the recycled entity")
+	local data = packet2.components[pair(s.defs.Targeting, reborn)]
+	expect(
+		data ~= nil and data.nulled ~= nil and #data.nulled == 1 and data.nulled[1] == survivor,
+		"and the survivor's pair to it, shipped afresh"
+	)
+	expect_equal(
+		c.world:has(ls, pair(c.defs.Targeting, c.net.get_client_entity(reborn))),
+		true,
+		"A's survivor holds the new pair"
+	)
+end)
+
+test("deleting a subject still holding a pair to an already-dead target ships exactly its deletion", function(env)
+	-- jecs 0.11.0's target-death cascade walks the target's archetypes up to a count taken before it starts, so
+	-- a subject moved into a new archetype mid-cascade -- here by the cascaded child's death removing the
+	-- subject's pair to the child -- is never visited and keeps its pair to the dead target. the pair was
+	-- hidden when the target's teardown restaged the pairs aimed at it, and the subject's own deletion later
+	-- fires the pair's removed hook with the target dead: the one stage a dying subject keeps, since its
+	-- teardown restage skips a pair whose target is no longer replicable. nothing about the stale pair may ever
+	-- ship.
+	local s = env.server
+	local target = s.world:entity()
+	s.world:add(target, s.net.Replicated)
+	local subject = s.world:entity()
+	s.world:add(subject, s.net.Replicated)
+	local child = s.world:entity()
+	s.world:add(child, s.net.Replicated)
+	-- the subject's archetype holding the pair to the target predates the child's ChildOf archetype
+	s.world:set(subject, pair(s.defs.Likes, child), 1)
+	s.world:set(subject, pair(s.defs.Likes, target), 2)
+	s.world:add(child, pair(jecs.ChildOf, target))
+	env.frame()
+
+	local likes_target = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_equal(s.world:contains(child), false, "the child died with the target")
+	expect_equal(
+		s.world:has(subject, likes_target),
+		true,
+		"precondition: jecs leaves the subject holding the pair to its dead target -- if jecs fixed its cascade, this test has nothing left to pin"
+	)
+	expect_equal(s.net.is_component_visible(subject, likes_target, env.player_a), false, "the stale pair is hidden")
+	local packets = s.net.generate_packets()
+	for _, player in { env.player_a, env.player_b } do
+		local decoded = decode_packet(deep_copy(packets[player]))
+		expect_equal(#decoded.unreplicated, 2, `{player.Name}'s packet deletes exactly two entities`)
+		expect(table.find(decoded.unreplicated, target) ~= nil, `{player.Name} is told to delete the target`)
+		expect(table.find(decoded.unreplicated, child) ~= nil, `{player.Name} is told to delete the child`)
+		expect_equal(#decoded.sections, 0, `{player.Name}'s packet carries no cell`)
+	end
+
+	s.world:delete(subject)
+	local packets2 = s.net.generate_packets()
+	for _, player in { env.player_a, env.player_b } do
+		local decoded = decode_packet(deep_copy(packets2[player]))
+		expect_equal(#decoded.unreplicated, 1, `{player.Name}'s packet deletes exactly one entity`)
+		expect_equal(decoded.unreplicated[1], subject, `{player.Name} is told to delete the subject`)
+		expect_equal(#decoded.replicated + #decoded.sections, 0, `and nothing else reaches {player.Name}`)
+	end
+	expect_equal(s.net.generate_packets()[env.player_a], nil, "and nothing is left staged the frame after")
+end)
+
 test("an entity with only Replicated still creates a mapped client entity", function(env)
 	local s, c = env.server, env.client
 	local e = s.world:entity()
@@ -9309,6 +9530,196 @@ test("deleting one of several groups a member delegates to still deletes the mem
 	expect_equal(c.world:contains(ls_a), true, "A's local sibling entity survives")
 end)
 
+test("deleting a group never widens its delegators mid-teardown, even to a user's own removed hook", function(env)
+	-- a group's teardown removes its filters before its cascade reaches the delegators, and re-deriving their
+	-- gates there would open them to every client for the rest of the cascade: never on the wire, since each
+	-- delegator's own teardown hides it before anything resolves, but visible to is_entity_visible from a
+	-- removed hook of the user's own. a deletion re-derives nothing, so every delegator reads exactly as before
+	-- until its own teardown hides it. four shapes: a Private group with a member and a member's own delegator
+	-- (the fan-out down a chain), an ExportsPrivacy group visible to all narrowing its member, and a room whose
+	-- content inherits through ChildOf. Probe is minted after duplecs's components, so its removed hook fires
+	-- after their hooks in each group's teardown and before Replicated's in each delegator's.
+	local s = env.server
+	local Probe = s.world:component()
+
+	local private_group = s.world:entity()
+	s.world:set(private_group, s.net.Private, { [env.player_a] = true })
+	local private_member = s.world:entity()
+	s.world:add(private_member, s.net.Replicated)
+	s.world:add(private_member, pair(s.net.InheritsPrivacy, private_group))
+	local chained = s.world:entity()
+	s.world:add(chained, s.net.Replicated)
+	s.world:add(chained, pair(s.net.InheritsPrivacy, private_member))
+
+	local export_group = s.world:entity()
+	s.world:add(export_group, s.net.Replicated)
+	s.world:set(export_group, s.net.ExportsPrivacy, { [env.player_a] = true })
+	local export_member = s.world:entity()
+	s.world:add(export_member, s.net.Replicated)
+	s.world:add(export_member, pair(s.net.InheritsPrivacy, export_group))
+
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local content = s.world:entity()
+	s.world:add(content, s.net.Replicated)
+	s.world:add(content, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:add(content, pair(jecs.ChildOf, room))
+
+	local delegators = { private_member, chained, export_member, content }
+	for _, entity in { private_group, export_group, room, private_member, chained, export_member, content } do
+		s.world:set(entity, Probe, true)
+	end
+	env.frame()
+	for _, delegator in delegators do
+		expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "precondition: A sees every delegator")
+		expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "precondition: B sees none")
+	end
+
+	local observations = 0
+	local widened = 0
+	s.world:removed(Probe, function()
+		for _, delegator in delegators do
+			if s.world:contains(delegator) then
+				observations += 1
+				if s.net.is_entity_visible(delegator, env.player_b) then
+					widened += 1
+				end
+			end
+		end
+	end)
+
+	s.world:delete(private_group)
+	s.world:delete(export_group)
+	s.world:delete(room)
+	for _, delegator in delegators do
+		expect_equal(s.world:contains(delegator), false, "every delegator died in its group's cascade")
+	end
+	-- every teardown observed live delegators: each group's own, then each delegator's ahead of its Replicated
+	expect(observations >= 10, `the hook observed the teardowns ({observations} observations)`)
+	expect_equal(widened, 0, "no delegator ever read as visible to B mid-teardown")
+
+	local packets = s.net.generate_packets()
+	local decoded_b = decode_packet(deep_copy(packets[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 1, "B's packet deletes exactly one entity")
+	expect_equal(decoded_b.unreplicated[1], export_group, "the export group B could see")
+	expect_equal(#decoded_b.replicated + #decoded_b.sections, 0, "and nothing else: no delegator ever reached B")
+	local decoded_a = decode_packet(deep_copy(packets[env.player_a]))
+	expect_equal(#decoded_a.unreplicated, 6, "A's packet deletes exactly the six replicated entities")
+	for _, entity in { export_group, room, private_member, chained, export_member, content } do
+		expect(table.find(decoded_a.unreplicated, entity) ~= nil, "A is told to delete each of them")
+	end
+	expect_equal(#decoded_a.replicated + #decoded_a.sections, 0, "and nothing else")
+end)
+
+test("deleting a mid-chain delegator leaves its surviving group's later edits reaching only survivors", function(env)
+	-- the dying delegator drops its edge and its exported words as mirror cleanup alone, and its own delegator
+	-- dies in the cascade, so the group's later edits must find exactly the delegator it has left: a revoke
+	-- deletes the group and its survivor, and a joiner the group admits receives the same two.
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local mid = s.world:entity()
+	s.world:add(mid, s.net.Replicated)
+	s.world:set(mid, s.net.ExportsPrivacy, { [env.player_a] = true, [env.player_b] = true })
+	s.world:add(mid, pair(s.net.InheritsPrivacy, group))
+	local leaf = s.world:entity()
+	s.world:add(leaf, s.net.Replicated)
+	s.world:set(leaf, s.defs.Health, 3)
+	s.world:add(leaf, pair(s.net.InheritsPrivacy, mid))
+	local sibling = s.world:entity()
+	s.world:add(sibling, s.net.Replicated)
+	s.world:add(sibling, pair(s.net.InheritsPrivacy, group))
+	env.frame()
+
+	s.world:delete(mid)
+	expect_equal(s.world:contains(leaf), false, "the leaf died with the mid node")
+	expect_equal(s.world:contains(group), true, "the group survives")
+	local packets = s.net.generate_packets()
+	for _, player in { env.player_a, env.player_b } do
+		local decoded = decode_packet(deep_copy(packets[player]))
+		expect_equal(#decoded.unreplicated, 2, `{player.Name}'s packet deletes exactly two entities`)
+		expect(table.find(decoded.unreplicated, mid) ~= nil, `{player.Name} is told to delete the mid node`)
+		expect(table.find(decoded.unreplicated, leaf) ~= nil, `{player.Name} is told to delete the leaf`)
+		expect_equal(#decoded.replicated + #decoded.sections, 0, `and nothing else reaches {player.Name}`)
+	end
+
+	s.net.edit_entity_privacy(group, env.player_b, false)
+	local revoked = s.net.generate_packets()
+	expect_equal(revoked[env.player_a], nil, "A receives nothing for the revoke")
+	local decoded_b = decode_packet(deep_copy(revoked[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 2, "B's revoke deletes exactly two entities")
+	expect(table.find(decoded_b.unreplicated, group) ~= nil, "the group")
+	expect(table.find(decoded_b.unreplicated, sibling) ~= nil, "and its surviving delegator")
+
+	local joiner = fake_player("MidChainJoiner")
+	s.net.add_client(joiner)
+	s.net.edit_entity_privacy(group, joiner, true) -- named while pending: bitless until the join
+	local full = env.frame()[joiner]
+	expect_equal(#full.replicated, 2, "the joiner's full packet creates exactly two entities")
+	expect(table.find(full.replicated, group) ~= nil, "the group")
+	expect(table.find(full.replicated, sibling) ~= nil, "and its surviving delegator")
+end)
+
+test("deleting a member of two groups leaves each group's later edits reaching only its survivor", function(env)
+	-- the member dies on its own, so its teardown drops both edges as mirror cleanup alone and neither group
+	-- re-derives anything. each group's later revoke and readmission must then reach exactly the one sibling it
+	-- still holds -- with the member's dense id recycled into a fresh replicated tenant in between, so an edge
+	-- the teardown failed to drop would restage the dead member under its successor's replication and ship it.
+	local s = env.server
+	local group_a = s.world:entity()
+	s.world:set(group_a, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local group_b = s.world:entity()
+	s.world:set(group_b, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	s.world:add(member, pair(s.net.InheritsPrivacy, group_a))
+	s.world:add(member, pair(s.net.InheritsPrivacy, group_b))
+	local sibling_a = s.world:entity()
+	s.world:add(sibling_a, s.net.Replicated)
+	s.world:add(sibling_a, pair(s.net.InheritsPrivacy, group_a))
+	local sibling_b = s.world:entity()
+	s.world:add(sibling_b, s.net.Replicated)
+	s.world:add(sibling_b, pair(s.net.InheritsPrivacy, group_b))
+	env.frame()
+
+	s.world:delete(member)
+	local packets = s.net.generate_packets()
+	for _, player in { env.player_a, env.player_b } do
+		local decoded = decode_packet(deep_copy(packets[player]))
+		expect_equal(#decoded.unreplicated, 1, `{player.Name}'s packet deletes exactly one entity`)
+		expect_equal(decoded.unreplicated[1], member, `{player.Name} is told to delete the member`)
+		expect_equal(#decoded.replicated + #decoded.sections, 0, `and nothing else reaches {player.Name}`)
+	end
+
+	local tenant = s.world:entity()
+	expect(
+		jecs.ECS_ID(tenant) == jecs.ECS_ID(member) and tenant ~= member,
+		"precondition: jecs did not recycle the member's id, scenario cannot be tested"
+	)
+	s.world:add(tenant, s.net.Replicated)
+	env.frame()
+
+	s.net.edit_entity_privacy(group_a, env.player_b, false)
+	s.net.edit_entity_privacy(group_b, env.player_b, false)
+	local revoked = s.net.generate_packets()
+	expect_equal(revoked[env.player_a], nil, "A receives nothing for the revokes")
+	local decoded_b = decode_packet(deep_copy(revoked[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 2, "B's revokes delete exactly two entities")
+	expect(table.find(decoded_b.unreplicated, sibling_a) ~= nil, "group_a's survivor")
+	expect(table.find(decoded_b.unreplicated, sibling_b) ~= nil, "and group_b's")
+
+	s.net.edit_entity_privacy(group_a, env.player_b, true)
+	s.net.edit_entity_privacy(group_b, env.player_b, true)
+	local readmitted = s.net.generate_packets()
+	expect_equal(readmitted[env.player_a], nil, "A receives nothing for the readmissions")
+	local decoded_b2 = decode_packet(deep_copy(readmitted[env.player_b]))
+	expect_equal(#decoded_b2.replicated, 2, "B's readmissions create exactly two entities")
+	expect(table.find(decoded_b2.replicated, sibling_a) ~= nil, "group_a's survivor")
+	expect(table.find(decoded_b2.replicated, sibling_b) ~= nil, "and group_b's")
+end)
+
 test("a group's per-component Private filter has no effect on a member's component", function(env)
 	-- delegation is scoped to the entity-level gate only: a (component, group)
 	-- key can't be encoded in a single pair target, so per-component filters on
@@ -10894,6 +11305,63 @@ test("deleting a through-parent deletes the entity under the relation's own clea
 	)
 	env.apply(decoded_a)
 	expect_equal(c.world:contains(le_a), false, "A's client drops the item")
+end)
+
+test("deleting a container mid-chain leaves the room's later edits reaching only what is still in it", function(env)
+	-- room -> chest -> coin through ChildOf, beside a lamp directly in the room. deleting the chest kills the
+	-- coin under ChildOf's own policy, and both teardowns drop their through-edges as mirror cleanup alone: the
+	-- deletion ships exactly the two deletions, and the room's next edits find the lamp as its only inheritor.
+	local s = env.server
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true, [env.player_b] = true })
+	local function contained(parent)
+		local entity = s.world:entity()
+		s.world:add(entity, s.net.Replicated)
+		s.world:add(entity, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+		s.world:add(entity, pair(jecs.ChildOf, parent))
+		return entity
+	end
+	local chest = contained(room)
+	local coin = contained(chest)
+	s.world:set(coin, s.defs.Health, 5)
+	local lamp = contained(room)
+	env.frame()
+	expect_equal(s.net.is_entity_visible(coin, env.player_b), true, "precondition: B sees the coin through the chain")
+
+	s.world:delete(chest)
+	expect_equal(s.world:contains(coin), false, "the coin died with its chest")
+	expect_equal(s.world:contains(lamp), true, "while the lamp beside it stays in the room")
+	local packets = s.net.generate_packets()
+	for _, player in { env.player_a, env.player_b } do
+		local decoded = decode_packet(deep_copy(packets[player]))
+		expect_equal(#decoded.unreplicated, 2, `{player.Name}'s packet deletes exactly two entities`)
+		expect(table.find(decoded.unreplicated, chest) ~= nil, `{player.Name} is told to delete the chest`)
+		expect(table.find(decoded.unreplicated, coin) ~= nil, `{player.Name} is told to delete the coin`)
+		expect_equal(#decoded.replicated, 0, `{player.Name}'s packet creates nothing`)
+		expect_equal(#decoded.sections, 0, `{player.Name}'s packet carries no cell: the deletions cover them`)
+	end
+
+	s.net.edit_entity_privacy(room, env.player_b, false)
+	local revoked = s.net.generate_packets()
+	expect_equal(revoked[env.player_a], nil, "A receives nothing for the revoke")
+	local decoded_b = decode_packet(deep_copy(revoked[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 2, "B's revoke deletes exactly two entities")
+	expect(table.find(decoded_b.unreplicated, room) ~= nil, "the room")
+	expect(table.find(decoded_b.unreplicated, lamp) ~= nil, "and the lamp, its one remaining inheritor")
+
+	s.net.edit_entity_privacy(room, env.player_b, true)
+	local readmitted = s.net.generate_packets()
+	expect_equal(readmitted[env.player_a], nil, "A receives nothing for the readmission")
+	local decoded_b2 = decode_packet(deep_copy(readmitted[env.player_b]))
+	expect_equal(#decoded_b2.replicated, 2, "B's readmission creates exactly two entities")
+	expect(table.find(decoded_b2.replicated, room) ~= nil, "the room")
+	expect(table.find(decoded_b2.replicated, lamp) ~= nil, "and the lamp")
+	local childof = decoded_b2.components[pair(jecs.ChildOf, room)]
+	expect(
+		childof ~= nil and childof.nulled ~= nil and #childof.nulled == 1 and childof.nulled[1] == lamp,
+		"with the lamp's ChildOf pair, and no pair of the dead chest's"
+	)
 end)
 
 test("a containment chain through ChildOf gates every level, and a room edit reaches the bottom", function(env)

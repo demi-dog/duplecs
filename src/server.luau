@@ -1029,19 +1029,28 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					stage_value(id, entity, if value == nil then _nulled else value)
 				end
 			end),
-			removed = hooks.removed(world, component, function(entity: Entity, id: Id)
+			-- delete marks a dying subject, whose cells are left to on_replicated_removed's restage (see the
+			-- dying-entity rule there); the pair index is a mirror, so it drops either way
+			removed = hooks.removed(world, component, function(entity: Entity, id: Id, delete: boolean?)
 				if id ~= component then
 					deindex_tracked_pair(id)
 					-- the gen caches can't say whether the target is dead or replicable here (the deindex may have just
 					-- retired the gen, and a dying target's entry lingers while its mirrors clear), so keep the live death
 					-- check; staging a never-visible pair is a no-op
 					local target: Entity = jecs.pair_second(world, id) :: any
-					if (target :: any) == 0 or is_pair_target_replicable(target) then
+					if (target :: any) == 0 then
+						-- a pair outliving its target stages even on a dying subject: the teardown restage skips a pair whose
+						-- target is no longer replicable. (jecs 0.11.0 can leave one: a target's death cascade misses a
+						-- subject moved into a new archetype mid-cascade, which then keeps the pair until its own removal.)
+						stage_removed(id, entity)
+					elseif not delete and is_pair_target_replicable(target) then
 						stage_removed(id, entity)
 					end
 					return
 				end
-				stage_removed(id, entity)
+				if not delete then
+					stage_removed(id, entity)
+				end
 			end),
 		}
 		reconcile_tracking_modes(component)
@@ -1476,6 +1485,19 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		restage_entity(entity)
 	end
 
+	-- the dying-entity rule: world:delete first fires a removed hook for every id the dying entity holds, each
+	-- passed delete = true (see jecs.md), all before any of them leaves the archetype. the restage below then
+	-- zeroes the entity's existence and every networked cell it owns in one pass, whichever of its hooks it runs
+	-- among -- and an entity without Replicated has every cell at 0 already, by the staging rule (next ?? last
+	-- is current visibility). so the other removed hooks, passed delete = true, do mirror and cache cleanup
+	-- only: no stage_removed per cell, no privacy restage, no delegation re-derivation or fan-out. beyond the
+	-- cost, skipping the fan-out keeps a group's teardown from widening the delegators its cascade is about to
+	-- delete, which a user's own removed hook could otherwise observe through is_entity_visible. two pair-level
+	-- stages stay: a pair whose target is already dead (the restage skips it), and the through-relation hook's
+	-- forced removal of its departing pair. this hook's own restage_pairs_targeting stays too, since subjects
+	-- whose relation uses the Remove policy outlive the entity. a value staged before the deletion is left in
+	-- changed_values, and the resolve passes drop it: the restage zeroes the cell, the merge prunes its last
+	-- word, and resolve_value_cells only sends to cells holding a post-merge last word.
 	local function on_replicated_removed(entity: Entity, id: Id)
 		if id ~= Replicated then
 			return
@@ -1759,6 +1781,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
+	-- refresh_delegator's counterpart for a dying entity (see the dying-entity rule above
+	-- on_replicated_removed): its teardown drops every edge, and its delegators die in the same cascade, so
+	-- nothing re-derives, restages, or fans out. the self words only leave the store with the last edge, as
+	-- recompute_effective drops them; until then they go unread, since edges are pairs, which tear down after
+	-- every unpaired id -- Replicated included -- and nothing re-derives the entity's delegators.
+	local function release_dying_delegator(entity: Entity)
+		if delegation_parents[entity] == nil then
+			effective_masks[entity] = nil
+		end
+	end
+
 	-- adds one source to the entity -> group edge, returning whether the edge is new (the first source creates
 	-- it; later ones only count)
 	local function add_delegation_edge(entity: Entity, group: Entity): boolean
@@ -1844,13 +1877,18 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- the pair id only packs the group's dense half (and the group may already be dead mid-cascade), so the edge
 	-- resolves through the dense-keyed mirror. the re-derivation against the remaining edges widens (or clears)
-	-- the stored words -- unless another source still holds the edge, when nothing moves.
-	local function on_inherits_removed(entity: Entity, id: Id)
+	-- the stored words -- unless another source still holds the edge, when nothing moves, or the entity is
+	-- dying, when only the mirrors go.
+	local function on_inherits_removed(entity: Entity, id: Id, delete: boolean?)
 		if id == InheritsPrivacy then
 			return
 		end
 		if remove_delegation_edge(entity, ECS_PAIR_SECOND(id)) then
-			refresh_delegator(entity)
+			if delete then
+				release_dying_delegator(entity)
+			else
+				refresh_delegator(entity)
+			end
 		end
 	end
 
@@ -1889,8 +1927,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- the removal fires before the pair leaves the archetype, so the widening restage below still walks the
 	-- departing pair as one of the entity's own cells and would stage it visible again -- after the relation's
 	-- own tracking hook (when the relation is networked) staged its removal. so the cell is forced back to 0
-	-- afterwards, whichever order the two hooks ran in; for an untracked relation that is a no-op.
-	local function on_through_relation_removed(entity: Entity, id: Id, relation: Component)
+	-- afterwards, whichever order the two hooks ran in; for an untracked relation that is a no-op. a dying
+	-- entity skips the restage (see the dying-entity rule above on_replicated_removed) but keeps the forced
+	-- removal: redundant there, the teardown restage having zeroed the cell, yet one pair-level stage that keeps
+	-- this hook's outcome for the departing pair the same on both paths.
+	local function on_through_relation_removed(entity: Entity, id: Id, relation: Component, delete: boolean?)
 		if id == relation then
 			return
 		end
@@ -1899,7 +1940,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			return
 		end
 		if remove_delegation_edge(entity, ECS_PAIR_SECOND(id)) then
-			refresh_delegator(entity)
+			if delete then
+				release_dying_delegator(entity)
+			else
+				refresh_delegator(entity)
+			end
 			stage_removed(id, entity)
 		end
 	end
@@ -1917,8 +1962,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			added = hooks.added(world, relation, function(entity: Entity, id: Id)
 				on_through_relation_added(entity, id, relation)
 			end),
-			removed = hooks.removed(world, relation, function(entity: Entity, id: Id)
-				on_through_relation_removed(entity, id, relation)
+			removed = hooks.removed(world, relation, function(entity: Entity, id: Id, delete: boolean?)
+				on_through_relation_removed(entity, id, relation, delete)
 			end),
 		}
 	end
@@ -2000,8 +2045,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 
 	-- the mirror resolves the relation from the packed pair id; a missing entry is a guard undoing its own add.
 	-- the edges drop by dense target so a target already dead mid-cascade still loses its edge, and the widening
-	-- is correct: it was asked for.
-	local function on_through_removed(entity: Entity, id: Id)
+	-- is correct: it was asked for -- except on a dying entity, which only drops the mirrors and the hooks' use.
+	local function on_through_removed(entity: Entity, id: Id, delete: boolean?)
 		if id == InheritsPrivacyThrough then
 			return
 		end
@@ -2027,7 +2072,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 		disconnect_through_hooks(relation)
 		if changed then
-			refresh_delegator(entity)
+			if delete then
+				release_dying_delegator(entity)
+			else
+				refresh_delegator(entity)
+			end
 		end
 	end
 
@@ -2300,15 +2349,23 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	local function on_private_removed(entity: Entity, id: Id)
+	-- a dying entity only drops the cache (see the dying-entity rule above on_replicated_removed): re-deriving
+	-- its gates would widen it, and fan the widening out over the delegators its cascade is about to delete. the
+	-- derived words leave with the teardown's other hooks -- the self words with the last delegation edge, the
+	-- exported ones with the ExportsPrivacy filter.
+	local function on_private_removed(entity: Entity, id: Id, delete: boolean?)
 		if id == Private then
 			clear_cached_privacy(entity, Existence)
-			refresh_entity_gate(entity)
+			if not delete then
+				refresh_entity_gate(entity)
+			end
 			return
 		end
 		local key = jecs.pair_second(world, id)
 		clear_cached_privacy(entity, key)
-		restage_privacy_cells(entity, key)
+		if not delete then
+			restage_privacy_cells(entity, key)
+		end
 	end
 
 	-- ExportsPrivacy's set hooks: the filter caches under Exported like any other, but it gates nothing on the
@@ -2327,11 +2384,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
-	local function on_exports_removed(entity: Entity, id: Id)
+	-- a dying entity drops its exported words outright rather than re-deriving them and fanning the widening out
+	-- over delegators its cascade is about to delete (see the dying-entity rule above on_replicated_removed)
+	local function on_exports_removed(entity: Entity, id: Id, delete: boolean?)
 		if id ~= ExportsPrivacy then
 			return
 		end
 		clear_cached_privacy(entity, Exported)
+		if delete then
+			exported_masks[entity] = nil
+			return
+		end
 		if recompute_exported(entity, false) then
 			refresh_descendants(entity)
 		end
