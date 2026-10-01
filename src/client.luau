@@ -76,9 +76,46 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	local dense = (jecs.ECS_ID :: any) :: (entity_gen: unknown) -> number
 	local ECS_PAIR_SECOND = (jecs.ECS_PAIR_SECOND :: any) :: (id: unknown) -> number
 
+	-- the component-record flag bit jecs's world:delete reads to decide whether an id's holders die with it
+	-- (see delete_client_entities)
+	local ECS_ID_DELETE = jecs.ECS_ID_DELETE
+
 	-- jecs never replaces this container on a live world (unlike world.archetypes, which world:cleanup
-	-- rebuilds), so the sweep's record walks share one fetch
+	-- rebuilds), so the record walks share one fetch
 	local component_index = world.component_index
+
+	-- calls visit(entities, id) once per pair id aimed at target in each non-empty archetype holding one, with
+	-- the archetype's entities. pairs sharing a *target* are not contiguous in types (pair ids pack
+	-- relation-major, and types is sorted by id), so each archetype's types scan, with the record's count as
+	-- an early exit. the walk drives off the pair(Wildcard, target) record directly, re-reading
+	-- world.archetypes per call since world:cleanup rebuilds it. visit must not move entities between
+	-- archetypes -- callers collect under the walk and apply afterward.
+	local function each_pair_targeting(target: Entity, visit: (entities: { Entity }, id: Id) -> ())
+		local idr_target = component_index[pair(jecs.Wildcard, target)]
+		if idr_target == nil then
+			return
+		end
+		local target_dense = dense(target)
+		local world_archetypes = world.archetypes
+		local target_counts = idr_target.counts
+		for archetype_id in idr_target.records do
+			local archetype = world_archetypes[archetype_id]
+			local entities = archetype.entities
+			if #entities == 0 then
+				continue
+			end
+			local remaining = target_counts[archetype_id]
+			for _, id in archetype.types do
+				if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
+					visit(entities, id)
+					remaining -= 1
+					if remaining == 0 then
+						break
+					end
+				end
+			end
+		end
+	end
 
 	-- ENTITY MAPPING
 
@@ -213,8 +250,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- -- is never visited and keeps its pair to the deleted entity. the server ships no removal for a pair whose
 	-- target a client drops (the local deletion removes it), so the pair would linger, and -- pairs packing only
 	-- dense halves -- read as aimed at whatever entity next reuses the id. this removes each such leftover from
-	-- its holder, as the cascade should have: the deletion walk detached or queued every (OnDeleteTarget,
-	-- Delete) dependent beforehand, so only Remove-policy pairs can remain. leftovers are collected before any
+	-- its holder, as the cascade should have: the deletion walk detached or queued every dependent jecs would
+	-- delete beforehand, so only Remove-policy pairs can remain. leftovers are collected before any
 	-- is removed, since removing moves holders between archetypes under the walk, and nothing is touched while
 	-- the dense id has a live tenant (one of the batch's removed hooks may have minted one), whose pairs are
 	-- genuine.
@@ -223,38 +260,16 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if jecs.entity_index_get_alive(world.entity_index :: any, target_dense) ~= nil then
 			return
 		end
-		local idr_target = component_index[pair(jecs.Wildcard, deleted)]
-		if idr_target == nil then
-			return
-		end
 		local holders: { Entity } = {}
 		local pair_ids: { Id } = {}
 		local count = 0
-		-- same-target pairs are not contiguous in types (see sweep_imported_cells), so each archetype's types scan,
-		-- with the record's count as an early exit
-		local world_archetypes = world.archetypes
-		local target_counts = idr_target.counts
-		for archetype_id in idr_target.records do
-			local archetype = world_archetypes[archetype_id]
-			local entities = archetype.entities
-			if #entities == 0 then
-				continue
+		each_pair_targeting(deleted, function(entities: { Entity }, id: Id)
+			for _, holder in entities do
+				count += 1
+				holders[count] = holder
+				pair_ids[count] = id
 			end
-			local remaining = target_counts[archetype_id]
-			for _, id in archetype.types do
-				if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
-					for _, holder in entities do
-						count += 1
-						holders[count] = holder
-						pair_ids[count] = id
-					end
-					remaining -= 1
-					if remaining == 0 then
-						break
-					end
-				end
-			end
-		end
+		end)
 		for i = 1, count do
 			world:remove(holders[i], pair_ids[i])
 		end
@@ -295,34 +310,81 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			return offset
 		end
 
-		-- the cleanup relations, resolved once per batch rather than once per walked entity
-		local relations = {} :: { Entity }
-		for relation in world:each(pair(jecs.OnDeleteTarget, jecs.Delete)) do
-			table.insert(relations, relation)
+		-- imported dependents to detach, as (holder, id) rows: collected by the walk below and removed only once it
+		-- finishes, since removing moves holders between archetypes under the record walks
+		local detach_holders = {} :: { Entity }
+		local detach_ids = {} :: { Id }
+		local detached = 0
+
+		-- claims every entity of one archetype that jecs would delete along with `id`: an imported one is
+		-- collected for detaching from it, a local one queued; visited keeps cyclical dependencies from
+		-- re-queueing.
+		local function claim(entities: { Entity }, id: Id)
+			for _, holder in entities do
+				if get_server_entity(holder) then
+					detached += 1
+					detach_holders[detached] = holder
+					detach_ids[detached] = id
+				elseif visited[holder] == nil then
+					visited[holder] = true
+					queued += 1
+					queue[queued] = holder
+				end
+			end
 		end
 
-		-- walks the local (OnDeleteTarget, Delete) closure without deleting yet: detaches imported dependents
-		-- (removing the iterated pair is iteration-safe) and queues local ones; visited keeps cyclical relations
-		-- from re-queueing. an entity no pair targets has no dependents at all, so its walk is skipped outright
-		-- -- the common case for a group's members.
+		-- the target role's visitor: jecs deletes a holder when any one of its pairs targeting the entity carries
+		-- the bit
+		local function claim_if_deleting(entities: { Entity }, id: Id)
+			if bit32.btest(component_index[id].flags, ECS_ID_DELETE) then
+				claim(entities, id)
+			end
+		end
+
+		-- walks the local deletion closure without deleting yet, mirroring the three ways world:delete cascades:
+		-- into holders of the entity as a component, of a pair targeting it, and of a pair using it as the
+		-- relation. jecs decides each by the delete bit on the id's component record -- set at the record's
+		-- creation from (OnDelete, Delete) on the component or relation, and for a pair also from
+		-- (OnDeleteTarget, Delete) on the relation -- never by the policy pairs as they stand now, so this reads
+		-- the same bit. an entity no id references has no records at all, so its walk costs three lookups -- the
+		-- common case for a group's members.
+		local world_archetypes = world.archetypes
 		local index = 0
 		while index < queued do
 			index += 1
 			local entity = queue[index]
-			if component_index[pair(jecs.Wildcard, entity)] == nil then
-				continue
+
+			local idr_unpaired = component_index[entity]
+			if idr_unpaired ~= nil and bit32.btest(idr_unpaired.flags, ECS_ID_DELETE) then
+				for archetype_id in idr_unpaired.records do
+					claim(world_archetypes[archetype_id].entities, entity)
+				end
 			end
-			for _, relation in relations do
-				for dependent in world:each(pair(relation, entity)) do
-					if get_server_entity(dependent) then
-						world:remove(dependent, pair(relation, entity))
-					elseif visited[dependent] == nil then
-						visited[dependent] = true
-						queued += 1
-						queue[queued] = dependent
+
+			each_pair_targeting(entity, claim_if_deleting)
+
+			-- the relation role reads the bit off the (entity, Wildcard) record alone, as jecs does, and detaches an
+			-- imported holder from every pair of the relation it carries: same-relation pairs sit contiguously in
+			-- types, so the record's records/counts give each archetype's exact slice
+			local idr_relation = component_index[pair(entity, jecs.Wildcard)]
+			if idr_relation ~= nil and bit32.btest(idr_relation.flags, ECS_ID_DELETE) then
+				local relation_counts = idr_relation.counts
+				for archetype_id, slice_start in idr_relation.records do
+					local archetype = world_archetypes[archetype_id]
+					local entities = archetype.entities
+					if #entities == 0 then
+						continue
+					end
+					local archetype_types = archetype.types
+					for i = slice_start, slice_start + relation_counts[archetype_id] - 1 do
+						claim(entities, archetype_types[i])
 					end
 				end
 			end
+		end
+
+		for i = 1, detached do
+			world:remove(detach_holders[i], detach_ids[i])
 		end
 
 		-- with every imported dependent detached, deletion order is free; an entity an earlier deletion already
@@ -559,7 +621,6 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- a genuine deletion's pairs are removed by jecs with the dying entity. removals are collected before any is
 	-- applied, since applying moves subjects between archetypes under the walk.
 	function sweep_imported_cells(client_target: Entity)
-		local target_dense = dense(client_target)
 		local subjects: { Entity } = {}
 		local cell_ids: { Id } = {}
 		local count = 0
@@ -569,39 +630,19 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		-- per sweep since world:cleanup rebuilds it.
 		local world_archetypes = world.archetypes
 
-		-- pairs targeting the entity. pairs sharing a *target* are not contiguous in types (pair ids pack
-		-- relation-major, and types is sorted by id), so this scans each archetype's types, with the record's count
-		-- as an early exit.
-		local idr_target = component_index[pair(jecs.Wildcard, client_target)]
-		if idr_target ~= nil then
-			local target_counts = idr_target.counts
-			for archetype_id in idr_target.records do
-				local archetype = world_archetypes[archetype_id]
-				local entities = archetype.entities
-				if #entities == 0 then
-					continue
-				end
-				local remaining = target_counts[archetype_id]
-				for _, id in archetype.types do
-					if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
-						local relation = jecs.pair_first(world, id)
-						if server_entity_map[dense(relation)] ~= nil then
-							for _, subject in entities do
-								if server_entity_map[dense(subject)] ~= nil then
-									count += 1
-									subjects[count] = subject
-									cell_ids[count] = id
-								end
-							end
-						end
-						remaining -= 1
-						if remaining == 0 then
-							break
-						end
+		-- pairs targeting the entity
+		each_pair_targeting(client_target, function(entities: { Entity }, id: Id)
+			local relation = jecs.pair_first(world, id)
+			if server_entity_map[dense(relation)] ~= nil then
+				for _, subject in entities do
+					if server_entity_map[dense(subject)] ~= nil then
+						count += 1
+						subjects[count] = subject
+						cell_ids[count] = id
 					end
 				end
 			end
-		end
+		end)
 
 		-- pairs using the entity as the relation: same-relation pairs sit contiguously in types, so the record's
 		-- records/counts give each archetype's exact slice (see the server's each_target). the entity's own mapping

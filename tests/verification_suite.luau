@@ -2788,6 +2788,192 @@ test("a deletion batch's removal hooks see its members deleted, never detached, 
 	expect_equal(c.world:contains(survivor), true, "survivor survives")
 end)
 
+-- the tests below pin that the deletion walk follows every cascade jecs's world:delete does, not just pairs whose
+-- relation carries (OnDeleteTarget, Delete): jecs reads the delete bit off each id's component record, set when
+-- that record is created, so a deleted entity's holders can die with it as a component, as a pair's target, or
+-- as a pair's relation.
+
+test("a deleted entity with (OnDelete, Delete) used as a component detaches imported holders", function(env)
+	local c = env.make_client()
+	local deleted_id, holder_id = 100041, 100042
+	local e = import_entity(c, deleted_id)
+	c.world:add(e, pair(jecs.OnDelete, jecs.Delete))
+
+	local holder = import_entity(c, holder_id)
+	c.world:add(holder, e)
+	c.world:set(holder, c.defs.Health, 5)
+	local local_holder = c.world:entity()
+	c.world:add(local_holder, e)
+
+	c.net.reconcile_packet(entity_list_packet({ deleted_id }, nil))
+
+	expect_equal(c.world:contains(e), false, "the deleted entity is gone")
+	expect_equal(c.world:contains(local_holder), false, "the local holder is deleted with it")
+	expect_equal(c.world:contains(holder), true, "the imported holder survives")
+	expect_equal(c.net.get_client_entity(holder_id), holder, "the imported holder's mapping is intact")
+	expect_equal(c.world:has(holder, e), false, "the imported holder is detached from the deleted component")
+	expect_equal(c.world:get(holder, c.defs.Health), 5, "the imported holder keeps its other cells")
+end)
+
+test(
+	"a deleted entity with (OnDelete, Delete) used as a relation detaches imported holders from every pair",
+	function(env)
+		local c = env.make_client()
+		local deleted_id, holder_id, target_id = 100051, 100052, 100053
+		local relation = import_entity(c, deleted_id)
+		c.world:add(relation, pair(jecs.OnDelete, jecs.Delete))
+		local imported_target = import_entity(c, target_id)
+		local local_target = c.world:entity()
+
+		local holder = import_entity(c, holder_id)
+		c.world:add(holder, pair(relation, imported_target))
+		c.world:add(holder, pair(relation, local_target))
+		c.world:set(holder, c.defs.Health, 5)
+		local local_holder = c.world:entity()
+		c.world:add(local_holder, pair(relation, local_target))
+
+		c.net.reconcile_packet(entity_list_packet({ deleted_id }, nil))
+
+		expect_equal(c.world:contains(relation), false, "the deleted relation is gone")
+		expect_equal(c.world:contains(local_holder), false, "the local holder is deleted with it")
+		expect_equal(c.world:contains(holder), true, "the imported holder survives")
+		expect_equal(c.net.get_client_entity(holder_id), holder, "the imported holder's mapping is intact")
+		expect_equal(
+			c.world:has(holder, pair(relation, imported_target)),
+			false,
+			"the pair to the imported target is removed"
+		)
+		expect_equal(
+			c.world:has(holder, pair(relation, local_target)),
+			false,
+			"the pair to the local target is removed"
+		)
+		expect_equal(c.world:get(holder, c.defs.Health), 5, "the imported holder keeps its other cells")
+		expect_equal(c.world:contains(imported_target), true, "the imported target is untouched")
+		expect_equal(c.world:contains(local_target), true, "the local target is untouched")
+	end
+)
+
+test("a deleted relation with (OnDeleteTarget, Delete) detaches imported holders", function(env)
+	-- the (R, Wildcard) record's delete bit also comes from the relation's OnDeleteTarget policy, so jecs deletes
+	-- holders of R's pairs when R itself is deleted, not only when their target is
+	local c = env.make_client()
+	local deleted_id, holder_id = 100091, 100092
+	local relation = import_entity(c, deleted_id)
+	c.world:add(relation, pair(jecs.OnDeleteTarget, jecs.Delete))
+	local target = c.world:entity()
+
+	local holder = import_entity(c, holder_id)
+	c.world:add(holder, pair(relation, target))
+	c.world:set(holder, c.defs.Health, 5)
+	local local_holder = c.world:entity()
+	c.world:add(local_holder, pair(relation, target))
+
+	c.net.reconcile_packet(entity_list_packet({ deleted_id }, nil))
+
+	expect_equal(c.world:contains(relation), false, "the deleted relation is gone")
+	expect_equal(c.world:contains(local_holder), false, "the local holder is deleted with it")
+	expect_equal(c.world:contains(holder), true, "the imported holder survives")
+	expect_equal(c.net.get_client_entity(holder_id), holder, "the imported holder's mapping is intact")
+	expect_equal(c.world:has(holder, pair(relation, target)), false, "the imported holder is detached from the pair")
+	expect_equal(c.world:get(holder, c.defs.Health), 5, "the imported holder keeps its other cells")
+	expect_equal(c.world:contains(target), true, "the target is untouched")
+end)
+
+test("a deleted target of a relation with (OnDelete, Delete) detaches imported holders", function(env)
+	-- jecs sets a pair record's delete bit from the relation's OnDelete policy as well as its OnDeleteTarget one,
+	-- so holders of (R, T) die with T even though R carries only (OnDelete, Delete)
+	local c = env.make_client()
+	local deleted_id, holder_id = 100061, 100062
+	local target = import_entity(c, deleted_id)
+	local R = c.world:entity()
+	c.world:add(R, pair(jecs.OnDelete, jecs.Delete))
+	-- a relation with the default Remove policy, whose pair jecs itself removes
+	local Near = c.world:entity()
+	local other = c.world:entity()
+
+	local holder = import_entity(c, holder_id)
+	c.world:add(holder, pair(R, target))
+	c.world:add(holder, pair(Near, target))
+	c.world:add(holder, pair(R, other))
+	c.world:set(holder, c.defs.Health, 5)
+	local local_holder = c.world:entity()
+	c.world:add(local_holder, pair(R, target))
+
+	c.net.reconcile_packet(entity_list_packet({ deleted_id }, nil))
+
+	expect_equal(c.world:contains(target), false, "the deleted target is gone")
+	expect_equal(c.world:contains(local_holder), false, "the local holder is deleted with it")
+	expect_equal(c.world:contains(holder), true, "the imported holder survives")
+	expect_equal(c.net.get_client_entity(holder_id), holder, "the imported holder's mapping is intact")
+	expect_equal(c.world:has(holder, pair(R, target)), false, "the delete-flagged pair is removed")
+	expect_equal(c.world:has(holder, pair(Near, target)), false, "the Remove-policy pair to the target is removed")
+	expect_equal(c.world:has(holder, pair(R, other)), true, "the pair to another target is kept")
+	expect_equal(c.world:get(holder, c.defs.Health), 5, "the imported holder keeps its other cells")
+end)
+
+test("imported dependents of local holders deleted as a component or relation are detached", function(env)
+	local c = env.make_client()
+	local deleted_id, component_child_id, relation_child_id = 100071, 100072, 100073
+	local e = import_entity(c, deleted_id)
+	c.world:add(e, pair(jecs.OnDelete, jecs.Delete))
+
+	-- imported <- local <- imported chains, the local link holding the deleted entity as a component in one and
+	-- as a relation in the other
+	local component_holder = c.world:entity()
+	c.world:add(component_holder, e)
+	local relation_holder = c.world:entity()
+	c.world:add(relation_holder, pair(e, c.world:entity()))
+	local component_child = import_entity(c, component_child_id)
+	c.world:add(component_child, pair(jecs.ChildOf, component_holder))
+	local relation_child = import_entity(c, relation_child_id)
+	c.world:add(relation_child, pair(jecs.ChildOf, relation_holder))
+
+	c.net.reconcile_packet(entity_list_packet({ deleted_id }, nil))
+
+	expect_equal(c.world:contains(e), false, "the deleted entity is gone")
+	expect_equal(c.world:contains(component_holder), false, "the local component holder is deleted")
+	expect_equal(c.world:contains(relation_holder), false, "the local relation holder is deleted")
+	expect_equal(c.world:contains(component_child), true, "the component holder's imported child survives")
+	expect_equal(c.net.get_client_entity(component_child_id), component_child, "its mapping is intact")
+	expect_equal(c.world:target(component_child, jecs.ChildOf), nil, "it is detached from the deleted holder")
+	expect_equal(c.world:contains(relation_child), true, "the relation holder's imported child survives")
+	expect_equal(c.net.get_client_entity(relation_child_id), relation_child, "its mapping is intact")
+	expect_equal(c.world:target(relation_child, jecs.ChildOf), nil, "it is detached from the deleted holder")
+end)
+
+test("a cleanup policy added after a pair's record exists is not honored, as in jecs", function(env)
+	-- jecs freezes a pair record's delete bit when the record is created, so (OnDeleteTarget, Delete) added to a
+	-- relation later deletes holders only of pairs first created after it; holders of an older pair just lose it
+	local c = env.make_client()
+	local old_target_id, new_target_id, holder_id = 100081, 100082, 100083
+	local old_target = import_entity(c, old_target_id)
+	local new_target = import_entity(c, new_target_id)
+	local R = c.world:entity()
+
+	local holder = import_entity(c, holder_id)
+	c.world:add(holder, pair(R, old_target))
+	c.world:set(holder, c.defs.Health, 5)
+	local old_local_holder = c.world:entity()
+	c.world:add(old_local_holder, pair(R, old_target))
+
+	c.world:add(R, pair(jecs.OnDeleteTarget, jecs.Delete))
+	local new_local_holder = c.world:entity()
+	c.world:add(new_local_holder, pair(R, new_target))
+
+	c.net.reconcile_packet(entity_list_packet({ old_target_id, new_target_id }, nil))
+
+	expect_equal(c.world:contains(old_target), false, "the older pair's target is gone")
+	expect_equal(c.world:contains(new_target), false, "the newer pair's target is gone")
+	expect_equal(c.world:contains(old_local_holder), true, "the older pair's local holder survives")
+	expect_equal(c.world:has(old_local_holder, pair(R, old_target)), false, "the older pair's local holder loses it")
+	expect_equal(c.world:contains(new_local_holder), false, "the newer pair's local holder is deleted")
+	expect_equal(c.world:contains(holder), true, "the imported holder survives")
+	expect_equal(c.net.get_client_entity(holder_id), holder, "the imported holder's mapping is intact")
+	expect_equal(c.world:has(holder, pair(R, old_target)), false, "the imported holder loses the older pair")
+	expect_equal(c.world:get(holder, c.defs.Health), 5, "the imported holder keeps its other cells")
+end)
+
 test("a server-side group delete and revoke each reconcile in one packet, sparing client-side survivors", function(env)
 	local s, c = env.server, env.client
 	local group = s.world:entity()

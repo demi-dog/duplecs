@@ -95,7 +95,7 @@ What clients receive when a pair's target dies depends on what the target was:
 - **A `Replicated` target** — its deletion replicates, the client deletes the client entity, and jecs's own cleanup removes every pair aimed at it on both sides. No per-pair removals ship; the wholesale delete covers them.
 - **A named, unreplicated target** — the client entity survives (a name-mapped entity belongs to the client world, and reconciliation never deletes it), so there is no wholesale delete to lean on: clients instead receive explicit removals for exactly the pairs aimed at it. The name mapping ends afterward via a retraction, so a recycled server id can never misbind against it.
 
-On the client side, reconciliation follows `(OnDeleteTarget, Delete)` relations with one twist: when a deleted entity's dependents are *imported* (server-driven), they are detached rather than cascade-deleted — the server remains authoritative about their lifetimes and deletes them itself if that's the intent. Purely-local dependents are deleted with it.
+On the client side, reconciliation follows jecs's delete cleanup policies — `(OnDeleteTarget, Delete)` relations like `ChildOf`, and `(OnDelete, Delete)` on a deleted component or relation — with one twist: when a deleted entity's dependents are *imported* (server-driven), they are detached rather than cascade-deleted — the server remains authoritative about their lifetimes and deletes them itself if that's the intent. Purely-local dependents are deleted with it.
 
 ## Choosing the target's mechanism
 
