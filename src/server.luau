@@ -367,11 +367,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		return nil
 	end
 
-	-- iterates an entity's targets under relation through the internals world:target resolves per call (see
-	-- jecs.md): same-relation pairs are contiguous in archetype.types, and the relation's wildcard record holds
-	-- each archetype's slice start (records) and length (counts). the slice is snapshotted up front, so no
-	-- caller may move the entity mid-iteration; a dead target resolves to nil and ends the loop. replace with
-	-- jecs's own iterator if a later version adds one.
+	-- iterates an entity's live targets under relation through the internals world:target resolves per call
+	-- (see jecs.md): same-relation pairs are contiguous in archetype.types, and the relation's wildcard record
+	-- holds each archetype's slice start (records) and length (counts). the slice is snapshotted up front, so no
+	-- caller may move the entity mid-iteration. a dead target -- a pair jecs left behind on its deleted target
+	-- (see stale_pairs) -- is skipped, never ending the walk early: the pairs sorted after it are still visited.
+	-- replace with jecs's own iterator if a later version adds one.
 	local function each_target(entity: Entity, relation: Id): () -> Entity?
 		local record = entity_index.sparse_array[dense(entity)]
 		local idr = component_index[pair(relation, jecs.Wildcard)]
@@ -387,12 +388,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local archetype_types = archetype.types
 		local index = start
 		return function(): Entity?
-			if index > last then
-				return nil
+			while index <= last do
+				local pair_id = archetype_types[index]
+				index += 1
+				local target = jecs.entity_index_get_alive(entity_index :: any, ECS_PAIR_SECOND(pair_id))
+				if target ~= nil then
+					return target :: any
+				end
 			end
-			local pair_id = archetype_types[index]
-			index += 1
-			return jecs.entity_index_get_alive(entity_index :: any, ECS_PAIR_SECOND(pair_id)) :: any
+			return nil
 		end
 	end
 
@@ -445,7 +449,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- pair(Networked*, Target) on a definition replicates its pairs aimed at Target under that tag's mode,
 	-- overriding the unpaired tag -- or standing in for one, in which case only designated targets' pairs
 	-- replicate (see on_designation_added). a target's death removes its pairs before its dense id can recycle,
-	-- so an entry never names a stale tenant.
+	-- so an entry never names a stale tenant -- except where jecs's cascade misses the definition itself (see
+	-- stale_pairs), which is left undefended: a definition holding a designation would also have to hold a pair
+	-- to an entity dying in the same cascade.
 	local designations = {} :: { [Component]: { [number]: Component } }
 
 	-- designations already warned about an unreplicable target, keyed by the gameplay pair id; the designation's
@@ -469,18 +475,33 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- reverse index of live tracked-relation pair cells, [dense target][pair id] = subject count, maintained by
 	-- the per-component hooks and the tracking walks regardless of the target's replicability (restaging on a
 	-- target's visibility shift is exactly when that changes). dense-keyed because removed hooks can fire with
-	-- the target already dead; a dead target's cells are all removed before its dense id can recycle.
+	-- the target already dead. a dead target's cells are all removed before its dense id can recycle, unless
+	-- jecs's cascade missed a subject (see stale_pairs): a bucket is checked against its dense id's live tenant
+	-- before that tenant indexes or restages through it.
 	local tracked_pairs_by_target = {} :: { [number]: { [Id]: number } }
 
 	-- gen-qualified ids of the indexed targets, captured while alive (a pair's halves are alive when its record
 	-- is created). the resolve paths read it in place of jecs.pair_second -- every pair reaching them is
 	-- indexed, so a miss is a dead half or unindexed pair, ineligible either way -- and removals resolving after
 	-- a target's death recover the full id the wire needs from it. during a death cascade a hit can briefly name
-	-- the dying target, but its mirrors clear before the hooks restage, so eligibility still resolves false.
-	-- deindexing a target's last pair moves its entry to retired_target_gens, read for gone targets and cleared
-	-- by generate_packets.
+	-- the dying target, but its mirrors clear before the hooks restage, so eligibility still resolves false;
+	-- past the cascade, a hit naming a dead target is a bucket jecs left stale pairs in, ineligible the same way
+	-- until its dense id's next tenant retires it. deindexing a target's last pair moves its entry to
+	-- retired_target_gens, read for gone targets and cleared by generate_packets.
 	local tracked_target_gens = {} :: { [number]: Entity }
 	local retired_target_gens = {} :: { [number]: Entity }
+
+	-- pair cells jecs left behind on a deleted target, [pair id][subject] = true. jecs 0.11.0's world:delete
+	-- walks the dying target's archetypes up to a count taken before its cascade starts, so a subject the
+	-- cascade itself moves into a freshly created archetype (a nested deletion removing one of its other pairs)
+	-- is never visited and keeps its pair to the dead target -- under a Delete policy too -- until it is removed
+	-- some other way. duplecs treats such a pair as already removed: never staged visible, never indexed, never
+	-- announcing anything. pairs pack only dense halves, so once the target's dense id recycles a stale pair
+	-- reads, by id, exactly like a pair aimed at the new tenant, and this set is what tells the two apart. marks
+	-- land when a reverse-index bucket turns out to belong to a dead target (retire_stale_target), outlive a
+	-- relation's untracking (a later re-track honors them), and clear in the pair's eventual removed hook.
+	-- delegation edges carry their own memory instead (see dead_parent_masks).
+	local stale_pairs = {} :: { [Id]: { [Entity]: true } }
 
 	-- latest privacy filter of every Private cell, keyed [entity][key], key being the paired component, Existence
 	-- for an unpaired Private (which gates the whole entity), or Exported for the entity's ExportsPrivacy filter.
@@ -504,24 +525,35 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- privacy delegation state (see PRIVACY DELEGATION). delegation_parents mirrors the live delegation edges,
 	-- entity -> its groups, keyed by the group's dense id with the gen-qualified group as value: the removed
 	-- hooks must resolve which edge died from a packed pair id alone (the group may already be dead
-	-- mid-cascade), and a group's death removes its edges before its dense id can recycle. like the other
-	-- mirrors it reads correctly inside a removal hook, when world:target still sees the old pair. an edge
-	-- comes from one or more *sources* -- a direct pair(InheritsPrivacy, group), plus one per relation the
-	-- entity inherits through (pair(InheritsPrivacyThrough, relation)) whose pair targets the group -- and
-	-- delegation_edge_sources counts them per edge, so dropping one source never removes an edge another still
-	-- holds; the edge exists exactly while its count does. effective_masks holds derived words for delegating
-	-- entities only -- own intersect every parent's exported, absent when nothing inherited restricts -- while
-	-- own words stay untouched in allow_masks, whose 1:1 mapping to filter membership the grant loop, sweeps,
-	-- and compaction rely on; entity_gate_masks takes effective over own. exported_masks holds the words an
-	-- entity hands its delegators when it narrows them -- its gate intersect its ExportsPrivacy filter's words
-	-- -- present exactly while the filter is cached, and exported_gate_masks takes it over the entity's gate.
-	-- both derived stores are copies the sweeps and compaction edit in place like the own words.
+	-- mid-cascade), and a group's death removes its edges before its dense id can recycle -- unless jecs's
+	-- cascade missed a delegator (see stale_pairs), whose edge then keeps naming the dead group, never the dense
+	-- id's next tenant (see dead_parent_masks). like the other mirrors it reads correctly inside a removal hook,
+	-- when world:target still sees the old pair. an edge comes from one or more *sources* -- a direct
+	-- pair(InheritsPrivacy, group), plus one per relation the entity inherits through
+	-- (pair(InheritsPrivacyThrough, relation)) whose pair targets the group -- and delegation_edge_sources
+	-- counts them per edge, so dropping one source never removes an edge another still holds; the edge exists
+	-- exactly while its count does. effective_masks holds derived words for delegating entities only -- own
+	-- intersect every parent's exported, absent when nothing inherited restricts -- while own words stay
+	-- untouched in allow_masks, whose 1:1 mapping to filter membership the grant loop, sweeps, and compaction
+	-- rely on; entity_gate_masks takes effective over own. exported_masks holds the words an entity hands its
+	-- delegators when it narrows them -- its gate intersect its ExportsPrivacy filter's words -- present exactly
+	-- while the filter is cached, and exported_gate_masks takes it over the entity's gate. both derived stores
+	-- are copies the sweeps and compaction edit in place like the own words.
 	local delegation_parents = {} :: { [Entity]: { [number]: Entity } }
 	local delegation_edge_sources = {} :: { [Entity]: { [number]: number } }
 	-- the reverse (group -> its delegators), maintained in lockstep, so the fan-out never queries the world
 	local delegation_children = {} :: { [Entity]: { [Entity]: true } }
 	local effective_masks = {} :: { [Entity]: ShardMasks }
 	local exported_masks = {} :: { [Entity]: ShardMasks }
+
+	-- the exported words a group handed its delegators when it died, frozen, for the delegators jecs's cascade
+	-- missed (see stale_pairs): such a delegator should have died with the group (every delegation relation
+	-- carries a Delete policy), and dropping the edge instead would widen it -- so its edge keeps the dead group,
+	-- which narrows by these words in place of a live gate. captured at the group's death while it has
+	-- delegators (freeze_dying_gate), absent for a group restricting nothing, dropped with its last delegator's
+	-- edge, and swept and compacted like the other derived words; never granted a joiner's bit, so a delegator
+	-- left behind admits no client that joined after its group died.
+	local dead_parent_masks = {} :: { [Entity]: ShardMasks }
 
 	-- the relations each entity inherits through, mirroring its live pair(InheritsPrivacyThrough, relation)
 	-- pairs and keyed like delegation_parents (the relation's dense id -> the gen-qualified relation), so the
@@ -792,7 +824,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	-- stages one cell standalone: the client-agnostic resolve and the allow-mask fetches run once up front, then
-	-- the word loop above.
+	-- the word loop above. a pair jecs left behind on its deleted target (see stale_pairs) stays at 0, whatever
+	-- its dense target's current tenant allows.
 	local function stage_visibility(component: Id, entity: Entity)
 		local replicated, entity_masks = entity_vis_masks(entity)
 		local eligible = false
@@ -800,6 +833,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		if replicated then
 			local privacy_key, target
 			eligible, privacy_key, target = resolve_component_eligibility(component)
+			if eligible and target ~= nil then
+				local stale_holders = stale_pairs[component]
+				if stale_holders ~= nil and stale_holders[entity] ~= nil then
+					eligible = false
+				end
+			end
 			if eligible then
 				cell_masks, target_masks = cell_vis_masks(entity, privacy_key, target)
 			end
@@ -939,13 +978,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- store operations are idempotent. it reads the mirrors rather than the world because inside a removed hook
 	-- the world still holds the component while the mirrors already reflect its absence. the retract is gated on
 	-- the announced tenant being this entity, so a stale caller (a dead id resolved through a dense-keyed store)
-	-- never withdraws a newer tenant's announcement.
+	-- never withdraws a newer tenant's announcement. tracked pairs count through the target gen cache, which is
+	-- present exactly while the target's reverse-index bucket is and names whose bucket it is, so pairs jecs left
+	-- behind on a dead previous tenant of the dense id (see stale_pairs) never make this entity relevant.
 	local function refresh_announcement(entity: Entity)
 		local dense_id = dense(entity)
 		if
 			named_entities[dense_id] ~= nil
 			and replicated_entities[dense_id] == nil
-			and (tracked_by[entity] ~= nil or designations[entity] ~= nil or tracked_pairs_by_target[dense_id] ~= nil)
+			and (tracked_by[entity] ~= nil or designations[entity] ~= nil or tracked_target_gens[dense_id] == entity)
 		then
 			shared_names.announce(entity)
 		elseif shared_names.announced_id(dense_id) == entity then
@@ -1003,19 +1044,88 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		)
 	end
 
-	local function index_tracked_pair(pair_id: Id)
+	-- STALE PAIRS
+
+	local function is_stale_pair(pair_id: Id, subject: Entity): boolean
+		local stale_holders = stale_pairs[pair_id]
+		return stale_holders ~= nil and stale_holders[subject] ~= nil
+	end
+
+	-- drops the subject's stale mark on the pair, returning whether it had one
+	local function clear_stale_pair(pair_id: Id, subject: Entity): boolean
+		local stale_holders = stale_pairs[pair_id]
+		if stale_holders == nil or stale_holders[subject] == nil then
+			return false
+		end
+		stale_holders[subject] = nil
+		if next(stale_holders) == nil then
+			stale_pairs[pair_id] = nil
+		end
+		return true
+	end
+
+	-- retires a reverse-index bucket its dead target left behind, marking every current holder of each indexed
+	-- pair id stale (see stale_pairs). all of them are subjects the death cascade missed: an add aimed at the
+	-- dense id's next tenant validates the bucket before indexing, so no newer pair can have joined it -- the
+	-- added hook that triggered the retirement clears its own subject's mark afterwards. the bucket and its gen
+	-- retire as at an ordinary last deindex. nothing stages: each cell was zeroed when its target stopped being
+	-- replicable (or was never visible), and staging only ever resolves it 0 from here on.
+	local function retire_stale_target(dense_target: number)
+		local bucket = tracked_pairs_by_target[dense_target] :: { [Id]: number }
+		tracked_pairs_by_target[dense_target] = nil
+		local target_gen = tracked_target_gens[dense_target]
+		if target_gen ~= nil then
+			tracked_target_gens[dense_target] = nil
+			retired_target_gens[dense_target] = target_gen
+		end
+		local world_archetypes = world.archetypes
+		for pair_id in bucket do
+			local idr = component_index[pair_id]
+			if idr == nil then
+				continue
+			end
+			local stale_holders = stale_pairs[pair_id]
+			for archetype_id in idr.records do
+				for _, subject in world_archetypes[archetype_id].entities do
+					if stale_holders == nil then
+						stale_holders = {}
+						stale_pairs[pair_id] = stale_holders
+					end
+					stale_holders[subject] = true
+				end
+			end
+		end
+		-- like an ordinary last deindex, re-derive whatever announcement the dense id still holds
+		local announced = shared_names.announced_id(dense_target)
+		if announced ~= nil then
+			refresh_announcement(announced)
+		end
+	end
+
+	-- a bucket whose captured gen is not its dense id's live tenant was left behind by a dead target: retired
+	-- before the live tenant (or a caller holding nothing live, nil) indexes or restages through the dense id.
+	local function validate_tracked_target(dense_target: number, live_target: Entity?)
+		if tracked_pairs_by_target[dense_target] ~= nil and tracked_target_gens[dense_target] ~= live_target then
+			retire_stale_target(dense_target)
+		end
+	end
+
+	-- target_gen is the pair's live target as the caller resolved it (jecs.pair_second, so 0 for a pair a caller
+	-- aimed at an already-dead entity), validating the bucket against it first.
+	local function index_tracked_pair(pair_id: Id, target_gen: Entity)
 		local target = ECS_PAIR_SECOND(pair_id)
+		local live_target: Entity? = if (target_gen :: any) ~= 0 then target_gen else nil
+		validate_tracked_target(target, live_target)
 		local bucket = tracked_pairs_by_target[target]
 		if bucket == nil then
 			bucket = {}
 			tracked_pairs_by_target[target] = bucket
-			local target_gen: Entity = jecs.pair_second(world, pair_id) :: any
-			if (target_gen :: any) ~= 0 then
+			if live_target ~= nil then
 				-- capture the gen-qualified id while the target is alive, for removals that resolve after its death
-				tracked_target_gens[target] = target_gen
+				tracked_target_gens[target] = live_target
 				-- the target's first tracked pair may make it announcement-relevant: a named, unreplicated target is a
 				-- shared definition clients map by name (replicated targets map through their creation entry instead)
-				refresh_announcement(target_gen)
+				refresh_announcement(live_target)
 			end
 		end
 		bucket[pair_id] = (bucket[pair_id] or 0) + 1
@@ -1167,7 +1277,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		for entity in world:each(pair(component, jecs.Wildcard)) do
 			for target in each_target(entity, component) do
 				local pair_id = pair(component, target)
-				index_tracked_pair(pair_id)
+				-- a pair marked stale during an earlier tracking stretch stays retired (see stale_pairs)
+				if is_stale_pair(pair_id, entity) then
+					continue
+				end
+				index_tracked_pair(pair_id, target)
 				if is_pair_replicable(pair_id) then
 					stage_visibility(pair_id, entity)
 				end
@@ -1179,7 +1293,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				-- pairs index regardless of the target's replicability, so a target's visibility shift can find them;
 				-- staging an ineligible cell is a no-op, so no mode check here
 				if id ~= component then
-					index_tracked_pair(id)
+					index_tracked_pair(id, jecs.pair_second(world, id) :: any)
+					-- the add proves the subject held no such pair a moment ago, so a stale mark the index's validation
+					-- may have just given it (see retire_stale_target) is not its own
+					clear_stale_pair(id, entity)
 				end
 				if id == component or is_pair_replicable(id) then
 					stage_visibility(id, entity)
@@ -1190,6 +1307,11 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- dying-entity rule there); the pair index is a mirror, so it drops either way
 			removed = hooks.removed(world, component, function(entity: Entity, id: Id, delete: boolean?)
 				if id ~= component then
+					-- a pair jecs left behind on its deleted target was retired when that was found (see stale_pairs):
+					-- unindexed, and hidden ever since, so its eventual removal only drops the mark
+					if clear_stale_pair(id, entity) then
+						return
+					end
 					deindex_tracked_pair(id)
 					-- the gen caches can't say whether the target is dead or replicable here (the deindex may have just
 					-- retired the gen, and a dying target's entry lingers while its mirrors clear), so keep the live death
@@ -1197,8 +1319,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					local target: Entity = jecs.pair_second(world, id) :: any
 					if (target :: any) == 0 then
 						-- a pair outliving its target stages even on a dying subject: the teardown restage skips a pair whose
-						-- target is no longer replicable. (jecs 0.11.0 can leave one: a target's death cascade misses a
-						-- subject moved into a new archetype mid-cascade, which then keeps the pair until its own removal.)
+						-- target is no longer replicable. (jecs 0.11.0 can leave one -- see stale_pairs -- that nothing has
+						-- marked yet, its dense id not having recycled.)
 						stage_removed(id, entity)
 					elseif not delete and is_pair_target_replicable(target) then
 						stage_removed(id, entity)
@@ -1229,10 +1351,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			stage_removed(component, entity)
 		end
 
+		-- pairs jecs left behind (see stale_pairs) keep their stale marks through the untracking, so a re-track
+		-- honors them. each walked target is live, so a bucket its dense id's dead previous tenant left retires
+		-- first, marking such pairs rather than letting the walk deindex them as the tenant's; one aimed at a
+		-- still-dead target is skipped by each_target and stays counted in its bucket, for a later retirement.
 		for entity in world:each(pair(component, jecs.Wildcard)) do
 			for target in each_target(entity, component) do
 				local pair_id = pair(component, target)
-				deindex_tracked_pair(pair_id)
+				validate_tracked_target(dense(target), target)
+				if not is_stale_pair(pair_id, entity) then
+					deindex_tracked_pair(pair_id)
+				end
 				stage_removed(pair_id, entity)
 			end
 		end
@@ -1327,7 +1456,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- already tracked: stage the target's existing pairs, restaging their values when the designation moved
-		-- them out of unreliable mode
+		-- them out of unreliable mode -- after retiring any bucket the target's dense id holds for a dead previous
+		-- tenant (see stale_pairs), so neither the staging nor the warning reads it as the target's
+		validate_tracked_target(dense_target, jecs.entity_index_get_alive(entity_index :: any, dense_target) :: any)
 		local gameplay_pair = pair(component, dense_target :: any)
 		stage_designated_pairs(
 			gameplay_pair,
@@ -1524,7 +1655,8 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	-- restages every networked cell the entity owns (unpaired components and pairs it is the subject of),
-	-- mirroring resolve_component_eligibility / cell_vis_masks with the entity-invariant fetches hoisted.
+	-- mirroring resolve_component_eligibility / cell_vis_masks with the entity-invariant fetches hoisted. a pair
+	-- jecs left behind on its deleted target (see stale_pairs) is skipped: its cell is 0 and stays so.
 	local function restage_own_cells(entity: Entity)
 		local entity_masks = allow_masks[entity]
 		for _, component in get_components(entity) do
@@ -1537,6 +1669,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					and target ~= nil
 					and is_pair_target_replicable(target)
 					and is_pair_mode_tracked(relation, dense_target)
+					and not is_stale_pair(component, entity)
 				then
 					local cell_masks = if entity_masks then entity_masks[relation] else nil
 					local target_masks: ShardMasks? = nil
@@ -1556,10 +1689,17 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- index holds exactly the live tracked-relation pairs; the pair-level resolve and the target's gate hoist
 	-- out of the subject loop, while the subjects (other entities) stage their own words per subject. subjects
 	-- walk each pair id's component record directly; staging never moves a subject between archetypes, so the
-	-- walk is iteration-safe.
+	-- walk is iteration-safe. a bucket this entity's dense id holds for a dead previous tenant is retired
+	-- instead (see stale_pairs) -- none of its pairs is aimed at this entity -- and the walk skips the pairs
+	-- such a retirement marked, which share the live pairs' ids and component records.
 	local function restage_pairs_targeting(entity: Entity)
-		local bucket = tracked_pairs_by_target[dense(entity)]
+		local dense_id = dense(entity)
+		local bucket = tracked_pairs_by_target[dense_id]
 		if bucket == nil then
+			return
+		end
+		if tracked_target_gens[dense_id] ~= entity then
+			retire_stale_target(dense_id)
 			return
 		end
 		local world_archetypes = world.archetypes
@@ -1573,8 +1713,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			if idr == nil then
 				continue
 			end
+			local stale_holders = stale_pairs[pair_id]
 			for archetype_id in idr.records do
 				for _, subject in world_archetypes[archetype_id].entities do
+					if stale_holders ~= nil and stale_holders[subject] ~= nil then
+						continue
+					end
 					local replicated, subject_masks = entity_vis_masks(subject)
 					local cell_masks: ShardMasks? = nil
 					if replicated and eligible then
@@ -1760,7 +1904,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- re-derives a delegator's self words as own intersect every parent's exported words, storing them (absent
 	-- when every input is absent, leaving the store when the last edge goes) and returning whether they changed.
 	-- always a fresh top-down derivation, never an in-place AND: intersection can't restore bits a widening edit
-	-- must grant back.
+	-- must grant back. a parent jecs's cascade left this entity pointing at after deleting it (see stale_pairs)
+	-- reads as the words it exported when it died -- frozen in dead_parent_masks, or nothing when it restricted
+	-- nothing, its gate stores having cleared with it -- so the derivation neither widens past the dead parent
+	-- nor ever reads its dense id's next tenant.
 	local function recompute_effective(entity: Entity): boolean
 		local old = effective_masks[entity]
 		local parents = delegation_parents[entity]
@@ -1780,7 +1927,10 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			derived = table.clone(own)
 		end
 		for _, parent in parents do
-			local parent_masks = exported_gate_masks(parent)
+			local parent_masks: ShardMasks? = dead_parent_masks[parent]
+			if parent_masks == nil then
+				parent_masks = exported_gate_masks(parent)
+			end
 			if parent_masks == nil then
 				continue
 			end
@@ -1890,6 +2040,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		bucket[child] = true
 	end
 
+	-- a dead group's frozen words (see dead_parent_masks) leave with its last delegator
 	local function deindex_delegation_child(group: Entity, child: Entity)
 		local bucket = delegation_children[group]
 		if bucket == nil then
@@ -1898,6 +2049,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		bucket[child] = nil
 		if next(bucket) == nil then
 			delegation_children[group] = nil
+			dead_parent_masks[group] = nil
 		end
 	end
 
@@ -1938,19 +2090,40 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 	end
 
+	-- freezes the gate a dying entity exports while it still has delegators (see dead_parent_masks), for any of
+	-- them jecs's cascade misses: called by each teardown hook about to clear part of that gate, so the first
+	-- one captures it whole. its delegators all hold their edges until the cascade reaches them, after every
+	-- one of the entity's own removed hooks has run; those it deletes take the frozen words with their last
+	-- edge.
+	local function freeze_dying_gate(entity: Entity)
+		if delegation_children[entity] == nil or dead_parent_masks[entity] ~= nil then
+			return
+		end
+		local gate = exported_gate_masks(entity)
+		if gate ~= nil then
+			dead_parent_masks[entity] = table.clone(gate)
+		end
+	end
+
 	-- refresh_delegator's counterpart for a dying entity (see the dying-entity rule above
 	-- on_replicated_removed): its teardown drops every edge, and its delegators die in the same cascade, so
 	-- nothing re-derives, restages, or fans out. the self words only leave the store with the last edge, as
-	-- recompute_effective drops them; until then they go unread, since edges are pairs, which tear down after
-	-- every unpaired id -- Replicated included -- and nothing re-derives the entity's delegators.
+	-- recompute_effective drops them, frozen first for its delegators; until then they go unread, since edges
+	-- are pairs, which tear down after every unpaired id -- Replicated included -- and nothing re-derives the
+	-- entity's delegators.
 	local function release_dying_delegator(entity: Entity)
 		if delegation_parents[entity] == nil then
+			freeze_dying_gate(entity)
 			effective_masks[entity] = nil
 		end
 	end
 
 	-- adds one source to the entity -> group edge, returning whether the edge is new (the first source creates
-	-- it; later ones only count)
+	-- it; later ones only count). an edge already on the group's dense id but naming a dead previous tenant --
+	-- kept by a pair jecs left behind (see stale_pairs) -- is taken over by the live group, which is new to the
+	-- derivation too: the edge then stands for the inheritance just added, and the dead group's frozen words go
+	-- with the old naming, while the stale pair's source stays counted, since only the count can tell when a
+	-- removal empties the dense-keyed edge.
 	local function add_delegation_edge(entity: Entity, group: Entity): boolean
 		local dense_group = dense(group)
 		local sources = delegation_edge_sources[entity]
@@ -1961,7 +2134,15 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		local count = sources[dense_group]
 		if count ~= nil then
 			sources[dense_group] = count + 1
-			return false
+			local parents = delegation_parents[entity] :: { [number]: Entity }
+			local existing = parents[dense_group]
+			if existing == group then
+				return false
+			end
+			parents[dense_group] = group
+			deindex_delegation_child(existing, entity)
+			index_delegation_child(group, entity)
+			return true
 		end
 		sources[dense_group] = 1
 		local parents = delegation_parents[entity]
@@ -2509,9 +2690,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	-- a dying entity only drops the cache (see the dying-entity rule above on_replicated_removed): re-deriving
 	-- its gates would widen it, and fan the widening out over the delegators its cascade is about to delete. the
 	-- derived words leave with the teardown's other hooks -- the self words with the last delegation edge, the
-	-- exported ones with the ExportsPrivacy filter.
+	-- exported ones with the ExportsPrivacy filter -- and the gate is frozen first for any delegator the
+	-- cascade misses (freeze_dying_gate).
 	local function on_private_removed(entity: Entity, id: Id, delete: boolean?)
 		if id == Private then
+			if delete then
+				freeze_dying_gate(entity)
+			end
 			clear_cached_privacy(entity, Existence)
 			if not delete then
 				refresh_entity_gate(entity)
@@ -2542,10 +2727,14 @@ local function create_server(world: World, shared_record: get_shared.Record)
 	end
 
 	-- a dying entity drops its exported words outright rather than re-deriving them and fanning the widening out
-	-- over delegators its cascade is about to delete (see the dying-entity rule above on_replicated_removed)
+	-- over delegators its cascade is about to delete (see the dying-entity rule above on_replicated_removed),
+	-- freezing them first for any delegator the cascade misses (freeze_dying_gate)
 	local function on_exports_removed(entity: Entity, id: Id, delete: boolean?)
 		if id ~= ExportsPrivacy then
 			return
+		end
+		if delete then
+			freeze_dying_gate(entity)
 		end
 		clear_cached_privacy(entity, Exported)
 		if delete then
@@ -2922,8 +3111,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 		end
 
 		-- clears freed slots' stale marks from one shard's persistent stores: its last tree, the allow words, and
-		-- the effective words (bit clears distribute over intersection). bits may carry several set bits
-		-- (compaction batches per shard). entries that zero are pruned, so a present last word is always nonzero.
+		-- the derived words -- effective, exported, and dead groups' frozen ones (bit clears distribute over
+		-- intersection). bits may carry several set bits (compaction batches per shard). entries that zero are
+		-- pruned, so a present last word is always nonzero.
 		local function sweep_freed_slots(shard: number, bits: VisibilityMask)
 			local clear = bit32.bnot(bits)
 			local shard_last_visibilities = last_visibilities[shard]
@@ -2948,6 +3138,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				sweep_masks_word(masks, shard, clear)
 			end
 			for _, masks in exported_masks do
+				sweep_masks_word(masks, shard, clear)
+			end
+			for _, masks in dead_parent_masks do
 				sweep_masks_word(masks, shard, clear)
 			end
 		end
@@ -3099,11 +3292,13 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			-- the walked archetype's networked cells, parallel over 1..cell_count: the cell id as keyed in the last
 			-- tree, the privacy key gating it per entity (the component, or the gen-qualified relation, doubling as
 			-- emit's relation argument), the value column (tags read plain nils off jecs's shared empty column), and
-			-- for pairs the gen-qualified target.
+			-- for pairs the gen-qualified target plus the subjects holding the pair stale (see stale_pairs), skipped
+			-- per entity.
 			local cell_ids: { number } = fetch_scratch()
 			local cell_keys: { number } = fetch_scratch()
 			local cell_columns: { { any } } = fetch_scratch()
 			local cell_targets: { [number]: Entity } = fetch_scratch()
+			local cell_stale: { [number]: { [Entity]: true } } = fetch_scratch()
 
 			local idr_replicated = component_index[Replicated]
 			local replicated_records = (if idr_replicated ~= nil then idr_replicated.records else empty_records) :: {
@@ -3154,8 +3349,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 					cell_ids[cell_count] = component :: any
 					cell_keys[cell_count] = privacy_key
 					cell_columns[cell_count] = columns_map[component]
-					-- assigned even when nil, clearing whatever the previous archetype left at this row
+					-- both assigned even when nil, clearing whatever the previous archetype left at this row
 					cell_targets[cell_count] = target :: any
+					cell_stale[cell_count] = if target ~= nil then stale_pairs[component] else nil :: any
 				end
 
 				for row, entity in entities do
@@ -3187,6 +3383,12 @@ local function create_server(world: World, shared_record: get_shared.Record)
 							end
 						end
 						local target = cell_targets[i]
+						if target ~= nil then
+							local stale_holders = cell_stale[i]
+							if stale_holders ~= nil and stale_holders[entity] ~= nil then
+								continue
+							end
+						end
 						emit(
 							cell_ids[i] :: any,
 							entity,
@@ -3202,6 +3404,7 @@ local function create_server(world: World, shared_record: get_shared.Record)
 			release_scratch(cell_keys)
 			release_scratch(cell_columns)
 			release_scratch(cell_targets)
+			release_scratch(cell_stale)
 
 			-- measure first, then write back-to-back into one exactly-sized buffer, like finalize_node_sections: the
 			-- whole snapshot encodes into a single section buffer assemble_packet stamps with one copy
@@ -3362,6 +3565,9 @@ local function create_server(world: World, shared_record: get_shared.Record)
 				transfer_masks_word(masks)
 			end
 			for _, masks in exported_masks do
+				transfer_masks_word(masks)
+			end
+			for _, masks in dead_parent_masks do
 				transfer_masks_word(masks)
 			end
 

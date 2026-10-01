@@ -873,6 +873,459 @@ test("deleting a subject still holding a pair to an already-dead target ships ex
 	expect_equal(s.net.generate_packets()[env.player_a], nil, "and nothing is left staged the frame after")
 end)
 
+-- the cascade miss the test above pins, as a reusable shape: a target, a subject whose archetype holding
+-- pair(Likes, target) predates the ChildOf archetype of the target's child, and that child -- so deleting the
+-- target deletes the child first, and the child's death moves the subject past the walk. the target is
+-- Replicated, or only named when a name is given, or neither when name is false -- a target no hook of
+-- duplecs's observes dying. A is synced after every step, so A's client builds its entities through the same
+-- archetype sequence (and can hit the same miss deleting them). returns the target and the subject, both
+-- alive; the caller deletes the target and asserts the miss with expect_cascade_miss.
+local function build_cascade_miss(env, name)
+	local s = env.server
+	local target = s.world:entity()
+	if type(name) == "string" then
+		s.world:set(target, jecs.Name, name)
+	elseif name == nil then
+		s.world:add(target, s.net.Replicated)
+	end
+	local subject = s.world:entity()
+	s.world:add(subject, s.net.Replicated)
+	local child = s.world:entity()
+	s.world:add(child, s.net.Replicated)
+	env.sync(env.player_a)
+	s.world:set(subject, pair(s.defs.Likes, child), 1)
+	env.sync(env.player_a)
+	s.world:set(subject, pair(s.defs.Likes, target), 2)
+	env.sync(env.player_a)
+	s.world:add(child, pair(jecs.ChildOf, target))
+	env.sync(env.player_a)
+	return target, subject
+end
+
+-- the jecs-bug precondition of every stale-pair test, asserted right after the deletion: the subject outlived
+-- its target's cascade still holding the pair (or delegation edge). a jecs that fixes the miss fails the tests
+-- here, loudly, rather than letting them pass without exercising the workaround -- which, with them, can then
+-- go.
+local function expect_cascade_miss(world, subject, stale_pair)
+	expect(
+		world:contains(subject) and world:has(subject, stale_pair),
+		"precondition no longer holds: jecs no longer leaves the subject holding its pair to the deleted target -- if jecs fixed its delete cascade, retire duplecs's stale-pair workaround along with this test"
+	)
+end
+
+-- the same miss on a bare jecs world, the precondition for a test whose own miss happens where it can't look
+-- before duplecs repairs it (a client's deletion of a replicated target): true while the pinned jecs still
+-- leaves the moved subject holding its pair
+local function jecs_misses_moved_cascade_subjects()
+	local world = jecs.world()
+	local Likes = world:component()
+	local target = world:entity()
+	local child = world:entity()
+	local subject = world:entity()
+	world:set(subject, pair(Likes, child), 1)
+	world:set(subject, pair(Likes, target), 2)
+	world:add(child, pair(jecs.ChildOf, target))
+	world:delete(target)
+	return world:has(subject, pair(Likes, target))
+end
+
+-- mints the entity reusing a dead entity's dense id (jecs hands out the latest freed id first), asserting the
+-- recycle the scenario depends on
+local function mint_recycled(world, dead)
+	local reborn = world:entity()
+	expect(
+		jecs.ECS_ID(reborn) == jecs.ECS_ID(dead) and reborn ~= dead,
+		"precondition: jecs did not recycle the dead entity's id, scenario cannot be tested"
+	)
+	return reborn
+end
+
+test("a pair its target's deletion left behind never ships aimed at the replicated entity reusing the id", function(env)
+	-- the miss carried past a recycle: pairs pack only dense halves, so once the dead target's id is reused the
+	-- subject's leftover pair reads, by id, exactly like a pair aimed at the new tenant -- jecs's own world:has
+	-- agrees. duplecs treats it as removed at the target's death, so neither the tenant's replication nor its
+	-- later gate edits may stage it, and no client may receive it, while a genuine pair aimed at the tenant from
+	-- another subject ships beside it as usual.
+	local s, c = env.server, env.client
+	local target, subject = build_cascade_miss(env)
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	env.sync(env.player_a)
+
+	local reborn = mint_recycled(s.world, target)
+	expect_equal(
+		s.world:has(subject, pair(s.defs.Likes, reborn)),
+		true,
+		"precondition: jecs reads the leftover as aimed at the new tenant"
+	)
+	s.world:add(reborn, s.net.Replicated)
+	-- reuses the dead child's id, so section entries (dense on the wire) compare against its dense half
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:set(other, pair(s.defs.Likes, reborn), 7)
+	for _, player in { env.player_a, env.player_b } do
+		expect_equal(
+			s.net.is_component_visible(subject, stale, player),
+			false,
+			`the leftover stays hidden from {player.Name}`
+		)
+		expect_equal(
+			s.net.is_component_visible(other, stale, player),
+			true,
+			`the genuine pair is visible to {player.Name}`
+		)
+	end
+
+	local packets = env.frame()
+	for _, player in { env.player_a, env.player_b } do
+		local packet = packets[player]
+		expect(table.find(packet.replicated, reborn) ~= nil, `{player.Name} receives the new tenant`)
+		local data = packet.components[stale]
+		expect(
+			data ~= nil and data.ids ~= nil and #data.ids == 1 and data.ids[1] == jecs.ECS_ID(other),
+			`{player.Name} receives the genuine pair alone`
+		)
+		expect_equal(data.nulled, nil, `and no other entry for {player.Name}`)
+	end
+	env.apply(packets[env.player_a])
+	local lr = c.net.get_client_entity(reborn)
+	expect_equal(
+		c.world:has(c.net.get_client_entity(subject), pair(c.defs.Likes, lr)),
+		false,
+		"A's subject holds no pair aimed at the new tenant"
+	)
+	expect_equal(
+		c.world:get(c.net.get_client_entity(other), pair(c.defs.Likes, lr)),
+		7,
+		"while the genuine pair arrived"
+	)
+
+	-- the subject's own filter edits restage its cells, the leftover among them, at both levels
+	local everyone = { [env.player_a] = true, [env.player_b] = true }
+	s.world:set(subject, s.net.Private, everyone)
+	expect_equal(
+		s.net.is_component_visible(subject, stale, env.player_a),
+		false,
+		"its entity-level edit passes over it"
+	)
+	s.world:set(subject, pair(s.net.Private, s.defs.Likes), everyone)
+	expect_equal(s.net.is_component_visible(subject, stale, env.player_a), false, "and so does its relation's filter")
+
+	-- a gate edit on the tenant restages the pairs aimed at it, and must still pass over the leftover
+	s.world:set(reborn, s.net.Private, { [env.player_a] = true })
+	expect_equal(
+		s.net.is_component_visible(subject, stale, env.player_a),
+		false,
+		"the leftover stays hidden after the edit"
+	)
+	expect_equal(s.net.is_component_visible(other, stale, env.player_a), true, "the genuine pair stays with A")
+	expect_equal(s.net.is_component_visible(other, stale, env.player_b), false, "and follows the edit away from B")
+end)
+
+test("a client's own deletion of a pair's target leaves no pair behind for the id's next tenant", function(env)
+	-- a client applies a target's deletion through its own world:delete, which jecs can cascade just as
+	-- incompletely. the shape here is the client's alone: a local child of the target, and the imported subject's
+	-- local pair to it, added before the server's pair to the target so the subject's archetype predates the
+	-- child's. the server ships no removal for a pair whose target a client drops, so the client finishes the
+	-- cascade itself -- otherwise the leftover would read as aimed at whatever client entity next takes the id.
+	expect(
+		jecs_misses_moved_cascade_subjects(),
+		"precondition no longer holds: jecs no longer misses a subject its cascade moves -- if jecs fixed its delete cascade, retire duplecs's stale-pair workaround along with this test"
+	)
+	local s, c = env.server, env.client
+	local target = s.world:entity()
+	s.world:add(target, s.net.Replicated)
+	local subject = s.world:entity()
+	s.world:add(subject, s.net.Replicated)
+	env.sync(env.player_a)
+	local lt = c.net.get_client_entity(target)
+	local ls = c.net.get_client_entity(subject)
+	local local_child = c.world:entity()
+	c.world:set(ls, pair(c.defs.Likes, local_child), 1)
+	s.world:set(subject, pair(s.defs.Likes, target), 2)
+	env.sync(env.player_a)
+	c.world:add(local_child, pair(jecs.ChildOf, lt))
+	expect_equal(c.world:get(ls, pair(c.defs.Likes, lt)), 2, "A's subject holds the server's pair to the target")
+
+	s.world:delete(target)
+	env.sync(env.player_a)
+	expect_equal(c.world:contains(lt), false, "A's client deleted the target")
+	expect_equal(c.world:contains(local_child), false, "and its local child with it")
+	expect_equal(c.world:contains(ls), true, "while the subject lives on")
+	expect_equal(c.world:has(ls, pair(c.defs.Likes, lt)), false, "without its pair to the deleted target")
+	local reused = mint_recycled(c.world, lt)
+	expect_equal(
+		c.world:has(ls, pair(c.defs.Likes, reused)),
+		false,
+		"so nothing reads as aimed at the id's next tenant"
+	)
+end)
+
+test("a pair its named target's deletion left behind never makes a named entity reusing the id announced", function(env)
+	-- the miss with a name-mapped target, whose own name removal ships the explicit removal of the subject's
+	-- pair before jecs's cascade misses the subject. a named entity reusing the id must not count as the
+	-- leftover's target: announcements reach every client regardless of privacy, so a spurious one would leak
+	-- a server-side entity's name. it stays unannounced until something genuinely targets it, and then only
+	-- the genuine pair ships.
+	local s, c = env.server, env.client
+	c.world:set(c.world:entity(), jecs.Name, "LeftBehindTarget")
+	local target, subject = build_cascade_miss(env, "LeftBehindTarget")
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	local packet = env.sync(env.player_a)
+	local data = packet.components[stale]
+	expect(
+		data ~= nil and data.removed ~= nil and #data.removed == 1 and data.removed[1] == subject,
+		"the target's death ships the pair's removal"
+	)
+
+	local reborn = mint_recycled(s.world, target)
+	s.world:set(reborn, jecs.Name, "ServerOnlySecret")
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "A receives nothing: the new tenant is neither announced nor targeted")
+	expect_equal(packets[env.player_b], nil, "and neither does B")
+	expect_equal(s.net.is_component_visible(subject, stale, env.player_a), false, "the leftover stays hidden")
+
+	local lsecret = c.world:entity()
+	c.world:set(lsecret, jecs.Name, "ServerOnlySecret")
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:set(other, pair(s.defs.Likes, reborn), 7)
+	local packet2 = env.sync(env.player_a)
+	expect_equal(packet2.names[reborn], "ServerOnlySecret", "a genuine pair aimed at the tenant announces it")
+	local data2 = packet2.components[stale]
+	expect(
+		data2 ~= nil and data2.ids ~= nil and #data2.ids == 1 and data2.ids[1] == jecs.ECS_ID(other),
+		"and only the genuine pair ships"
+	)
+	expect_equal(
+		c.world:has(c.net.get_client_entity(subject), pair(c.defs.Likes, lsecret)),
+		false,
+		"A's subject holds no pair aimed at the tenant"
+	)
+	expect_equal(
+		c.world:get(c.net.get_client_entity(other), pair(c.defs.Likes, lsecret)),
+		7,
+		"while the genuine one arrived"
+	)
+end)
+
+test(
+	"a leftover pair on a target no hook saw die stays hidden once the id's next tenant is genuinely targeted",
+	function(env)
+		-- a target that is neither Replicated nor named carries nothing duplecs hooks, so its death goes unobserved
+		-- and the leftover is only found when the reused id is next read: here by a genuine pair aimed at the new
+		-- tenant, the first thing to index under it. that pair must count as the tenant's alone -- the leftover
+		-- retired, the genuine pair indexed and visible -- once the tenant becomes replicable.
+		local s = env.server
+		local target, subject = build_cascade_miss(env, false)
+		local stale = pair(s.defs.Likes, target)
+		s.world:delete(target)
+		expect_cascade_miss(s.world, subject, stale)
+		local reborn = mint_recycled(s.world, target)
+		local other = s.world:entity()
+		s.world:add(other, s.net.Replicated)
+		s.world:set(other, pair(s.defs.Likes, reborn), 7)
+		s.world:add(reborn, s.net.Replicated)
+		expect_equal(s.net.is_component_visible(subject, stale, env.player_a), false, "the leftover stays hidden")
+		expect_equal(s.net.is_component_visible(other, stale, env.player_a), true, "the genuine pair is visible")
+		local data = env.frame()[env.player_a].components[stale]
+		expect(
+			data ~= nil and data.ids ~= nil and #data.ids == 1 and data.ids[1] == jecs.ECS_ID(other),
+			"only the genuine pair ships"
+		)
+	end
+)
+
+test("designating the id a dead target's leftover pair still reads as aimed at never warns about it", function(env)
+	-- a designation of an unreplicable target warns once something aims a pair at it. the leftover, aimed by id
+	-- at the entity reusing its dead target's id, is not such a pair: designating the reused id must stay
+	-- silent (the suite asserts silence), and must not stage the leftover under the designated mode either.
+	local s = env.server
+	local target, subject = build_cascade_miss(env)
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	env.frame()
+	local reborn = mint_recycled(s.world, target)
+	s.world:add(s.defs.Likes, pair(s.net.NetworkedOnce, reborn))
+	s.world:add(reborn, s.net.Replicated)
+	expect_equal(s.net.is_component_visible(subject, stale, env.player_a), false, "the leftover stays hidden")
+end)
+
+-- the post-recycle state the next tests share: the miss, then a replicated entity reusing the target's id with
+-- a genuine pair aimed at it from another subject, everything synced to A. returns the leftover pair's id (also
+-- the genuine pair's), the subject, the new tenant, and the other subject -- which reuses the dead child's id,
+-- so section entries (dense on the wire) compare against its dense half.
+local function strand_beside_recycled_tenant(env)
+	local s = env.server
+	local target, subject = build_cascade_miss(env)
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	env.sync(env.player_a)
+	local reborn = mint_recycled(s.world, target)
+	s.world:add(reborn, s.net.Replicated)
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:set(other, pair(s.defs.Likes, reborn), 7)
+	env.sync(env.player_a)
+	return stale, subject, reborn, other
+end
+
+-- the tenant's gate edit restages the pairs aimed at it through the reverse index: a genuine pair it forgot
+-- would stay visible to the client the edit excludes
+local function expect_genuine_pair_follows_tenant_gate(env, stale, reborn, other)
+	local s = env.server
+	s.world:set(reborn, s.net.Private, { [env.player_a] = true })
+	expect_equal(s.net.is_component_visible(other, stale, env.player_a), true, "the genuine pair stays with A")
+	expect_equal(
+		s.net.is_component_visible(other, stale, env.player_b),
+		false,
+		"and follows the tenant's edit away from B"
+	)
+	local decoded_b = decode_packet(deep_copy(s.net.generate_packets()[env.player_b]))
+	expect_equal(#decoded_b.unreplicated, 1, "B's packet deletes exactly one entity")
+	expect_equal(decoded_b.unreplicated[1], jecs.ECS_ID(reborn), "the tenant, taking the genuine pair with it")
+end
+
+test("removing a pair its target's deletion left behind keeps the id's next tenant's own pairs indexed", function(env)
+	-- the leftover shares its id with the pairs genuinely aimed at the entity reusing the target's id, so its
+	-- removal must not count as one of theirs. the removal itself ships and warns nothing.
+	local s = env.server
+	local stale, subject, reborn, other = strand_beside_recycled_tenant(env)
+	s.world:remove(subject, stale)
+	expect_equal(s.world:has(subject, stale), false, "the leftover is gone")
+	local packets = s.net.generate_packets()
+	expect_equal(packets[env.player_a], nil, "its removal ships nothing to A")
+	expect_equal(packets[env.player_b], nil, "nor to B")
+	expect_genuine_pair_follows_tenant_gate(env, stale, reborn, other)
+end)
+
+test(
+	"deleting a subject still holding a leftover pair after its id was reused ships exactly its deletion",
+	function(env)
+		-- the subject's own teardown removes the leftover among its cells: nothing may ship for the pair, and the
+		-- genuine pairs sharing its id must stay indexed, exactly as when the leftover is removed alone.
+		local s = env.server
+		local stale, subject, reborn, other = strand_beside_recycled_tenant(env)
+		s.world:delete(subject)
+		local packets = s.net.generate_packets()
+		for _, player in { env.player_a, env.player_b } do
+			local decoded = decode_packet(deep_copy(packets[player]))
+			expect_equal(#decoded.unreplicated, 1, `{player.Name}'s packet deletes exactly one entity`)
+			expect_equal(decoded.unreplicated[1], subject, `{player.Name} is told to delete the subject`)
+			expect_equal(#decoded.replicated + #decoded.sections, 0, `and nothing else reaches {player.Name}`)
+		end
+		expect_genuine_pair_follows_tenant_gate(env, stale, reborn, other)
+	end
+)
+
+test("a joiner's full packet never carries a leftover pair aimed at the entity reusing its target's id", function(env)
+	-- the full packet resolves cells from the subjects' archetypes, where the leftover sits under the same id
+	-- as the genuine pair aimed at the tenant: it must skip the one and carry the other.
+	local s = env.server
+	local stale, subject, reborn, other = strand_beside_recycled_tenant(env)
+	local joiner = fake_player("LeftoverJoiner")
+	local c2 = env.make_client()
+	local full = env.join(joiner, c2)
+	for _, entity in { subject, reborn, other } do
+		expect(table.find(full.replicated, entity) ~= nil, "the joiner receives all three entities")
+	end
+	local data = full.components[stale]
+	expect(
+		data ~= nil and data.ids ~= nil and #data.ids == 1 and data.ids[1] == jecs.ECS_ID(other),
+		"and the genuine pair alone"
+	)
+	local lr = c2.net.get_client_entity(reborn)
+	expect_equal(
+		c2.world:has(c2.net.get_client_entity(subject), pair(c2.defs.Likes, lr)),
+		false,
+		"the joiner's subject holds no pair aimed at the tenant"
+	)
+	expect_equal(
+		s.net.is_component_visible(subject, stale, joiner),
+		false,
+		"and the server reads it hidden from the joiner"
+	)
+end)
+
+test("a pair its target's deletion left behind never cuts short the walk over its subject's later pairs", function(env)
+	-- a subject's pairs of one relation are walked in id order, and the leftover's dead target used to end the
+	-- walk: a pair(Private, relation) edit then never restaged the pairs sorted after it, leaving one visible to
+	-- the client the edit excludes, and the relation's untracking never removed them. later is minted before the
+	-- deletion, so its id sorts after the dead target's and is never the recycled one.
+	local s = env.server
+	local target, subject = build_cascade_miss(env)
+	local later = s.world:entity()
+	s.world:add(later, s.net.Replicated)
+	expect(jecs.ECS_ID(later) > jecs.ECS_ID(target), "precondition: the later pair's id sorts after the leftover's")
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	local likes_later = pair(s.defs.Likes, later)
+	s.world:set(subject, likes_later, 3)
+	env.frame()
+	expect_equal(
+		s.net.is_component_visible(subject, likes_later, env.player_b),
+		true,
+		"precondition: B sees the later pair"
+	)
+
+	s.world:set(subject, pair(s.net.Private, s.defs.Likes), { [env.player_a] = true })
+	expect_equal(
+		s.net.is_component_visible(subject, likes_later, env.player_a),
+		true,
+		"the edit keeps the later pair with A"
+	)
+	expect_equal(s.net.is_component_visible(subject, likes_later, env.player_b), false, "and takes it from B")
+	local decoded_b = decode_packet(deep_copy(s.net.generate_packets()[env.player_b]))
+	local data = decoded_b.components[likes_later]
+	expect(
+		data ~= nil and data.removed ~= nil and #data.removed == 1 and data.removed[1] == subject,
+		"B receives the later pair's removal"
+	)
+
+	s.world:remove(s.defs.Likes, s.net.Networked)
+	local decoded_a = decode_packet(deep_copy(s.net.generate_packets()[env.player_a]))
+	local untracked = decoded_a.components[likes_later]
+	expect(
+		untracked ~= nil and untracked.removed ~= nil and #untracked.removed == 1 and untracked.removed[1] == subject,
+		"untracking the relation removes the later pair from A too"
+	)
+end)
+
+test("a leftover pair stays retired through its relation's untracking and re-tracking", function(env)
+	-- the relation stops being tracked after the target's id is reused but before anything reads the id again,
+	-- so the untracking is what first meets the leftover under the new tenant's id. the mark it leaves must
+	-- outlive the untracking: re-tracking reads the leftover, by id, as aimed at the tenant, and only the mark
+	-- keeps it from replicating once the tenant is replicable.
+	local s = env.server
+	local target, subject = build_cascade_miss(env)
+	local stale = pair(s.defs.Likes, target)
+	s.world:delete(target)
+	expect_cascade_miss(s.world, subject, stale)
+	env.sync(env.player_a)
+	local reborn = mint_recycled(s.world, target)
+
+	s.world:remove(s.defs.Likes, s.net.Networked)
+	s.world:add(s.defs.Likes, s.net.Networked)
+	s.world:add(reborn, s.net.Replicated)
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:set(other, pair(s.defs.Likes, reborn), 7)
+	expect_equal(s.net.is_component_visible(subject, stale, env.player_a), false, "the leftover stays hidden")
+	expect_equal(s.net.is_component_visible(other, stale, env.player_a), true, "the genuine pair is visible")
+	local packet = env.frame()[env.player_a]
+	local data = packet.components[stale]
+	expect(
+		data ~= nil and data.ids ~= nil and #data.ids == 1 and data.ids[1] == jecs.ECS_ID(other),
+		"only the genuine pair ships"
+	)
+end)
+
 test("an entity with only Replicated still creates a mapped client entity", function(env)
 	local s, c = env.server, env.client
 	local e = s.world:entity()
@@ -10383,6 +10836,136 @@ test("deleting a group never widens its delegators mid-teardown, even to a user'
 	expect_equal(#decoded_a.replicated + #decoded_a.sections, 0, "and nothing else")
 end)
 
+-- the delete-cascade miss of section 1 on InheritsPrivacy's own Delete policy: the delegator's archetype
+-- holding its pair to the group predates the member's ChildOf archetype, so deleting the group deletes the
+-- member first, and the member's death moves the delegator (its pair to the member removed) past the walk. the
+-- group admits only A unless whitelist names others (it must still admit A and not B). deletes the group and
+-- asserts the miss, returning the group and the delegator left behind holding its pair to it.
+local function strand_delegator(env, whitelist)
+	local s = env.server
+	local group = s.world:entity()
+	s.world:add(group, s.net.Replicated)
+	s.world:set(group, s.net.Private, whitelist or { [env.player_a] = true })
+	local member = s.world:entity()
+	s.world:add(member, s.net.Replicated)
+	local delegator = s.world:entity()
+	s.world:add(delegator, s.net.Replicated)
+	s.world:set(delegator, pair(s.defs.Likes, member), 1)
+	s.world:add(delegator, pair(s.net.InheritsPrivacy, group))
+	s.world:add(member, pair(jecs.ChildOf, group))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "precondition: A sees the delegator")
+	expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "precondition: B does not")
+	s.world:delete(group)
+	expect_cascade_miss(s.world, delegator, pair(s.net.InheritsPrivacy, group))
+	return group, delegator
+end
+
+test("a delegator its group's deletion left behind keeps the group's last gate, never the reused id's", function(env)
+	-- the delegator should have died with its group, and dropping its edge instead would widen it to its own
+	-- gate. so it keeps the gate the group exported when it died, frozen: never granting a client that joins
+	-- afterwards, unmoved by edits of the entity reusing the group's id (which jecs, reading the leftover pair
+	-- by id, now names as its group), and re-derived to the same answer by a join or an edit of its own --
+	-- until the leftover pair is removed, the widening that always was.
+	local s = env.server
+	local group, delegator = strand_delegator(env)
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "the delegator stays visible to A")
+	expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "and hidden from B")
+
+	local recycled = mint_recycled(s.world, group)
+	local inherits = pair(s.net.InheritsPrivacy, recycled)
+	expect_equal(
+		s.world:has(delegator, inherits),
+		true,
+		"precondition: jecs reads the leftover as aimed at the new tenant"
+	)
+	s.world:add(recycled, s.net.Replicated)
+	s.world:set(recycled, s.net.Private, { [env.player_b] = true })
+	local joiner = fake_player("AfterTheGroup")
+	s.net.add_client(joiner)
+	local packets = s.net.generate_packets()
+	local full = decode_packet(deep_copy(packets[joiner]))
+	expect_equal(table.find(full.replicated, delegator), nil, "the joiner never receives the delegator")
+	local function expect_frozen(label)
+		expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, `A still sees the delegator {label}`)
+		expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, `B still does not {label}`)
+		expect_equal(s.net.is_entity_visible(delegator, joiner), false, `nor does the joiner {label}`)
+	end
+	expect_frozen("after the join")
+
+	s.world:set(delegator, s.net.Private, { [env.player_a] = true, [env.player_b] = true, [joiner] = true })
+	expect_frozen("after its own filter admits everyone")
+	s.world:set(recycled, s.net.Private, { [env.player_a] = true, [env.player_b] = true, [joiner] = true })
+	expect_frozen("after the new tenant's filter admits everyone")
+	local packets2 = s.net.generate_packets()
+	expect_equal(packets2[env.player_b], nil, "B receives nothing: the new tenant already reached it")
+	local delta = decode_packet(deep_copy(packets2[joiner]))
+	expect(table.find(delta.replicated, recycled) ~= nil, "the joiner now receives the new tenant")
+	expect_equal(table.find(delta.replicated, delegator), nil, "and still not the delegator")
+
+	s.world:remove(delegator, inherits)
+	for _, player in { env.player_a, env.player_b, joiner } do
+		expect_equal(
+			s.net.is_entity_visible(delegator, player),
+			true,
+			`removing the leftover widens it to {player.Name}`
+		)
+	end
+end)
+
+test(
+	"a joiner reusing a departed client's slot never inherits its admission through a group's frozen gate",
+	function(env)
+		-- the frozen gate is slot words like any other: a departed client's bit in it must be swept before a joiner
+		-- reuses the slot, or the joiner would see the delegator the group only ever admitted for its predecessor.
+		local s = env.server
+		local _, delegator = strand_delegator(env)
+		s.net.remove_client(env.player_a)
+		env.frame()
+		local successor = fake_player("SlotSuccessor")
+		s.net.add_client(successor)
+		local full = decode_packet(deep_copy(s.net.generate_packets()[successor]))
+		expect_equal(table.find(full.replicated, delegator), nil, "the successor never receives the delegator")
+		expect_equal(s.net.is_entity_visible(delegator, successor), false, "and the server reads it hidden from them")
+	end
+)
+
+test("compacting shards carries a group's frozen gate along with the clients it moves", function(env)
+	-- the frozen words move between shards like every other slot word: otherwise the next re-derivation of the
+	-- delegator (here its own filter edit) would drop every client compaction moved, though the group admitted
+	-- them when it died.
+	local s = env.server
+	local fillers = join_named_fillers(env, 30)
+	local admitted = {}
+	for i = 1, 4 do
+		admitted[i] = fake_player(`FrozenAdmitted{i}`)
+		s.net.add_client(admitted[i])
+	end
+	env.frame()
+	local whitelist = { [env.player_a] = true }
+	for _, player in admitted do
+		expect_equal(s.net._client_shard(player), 2, "precondition: the admitted clients sit in shard 2")
+		whitelist[player] = true
+	end
+	local _, delegator = strand_delegator(env, whitelist)
+	for _, filler in fillers do
+		s.net.remove_client(filler)
+	end
+	env.frame()
+	local everyone = { [env.player_a] = true, [env.player_b] = true }
+	for _, player in admitted do
+		expect_equal(s.net._client_shard(player), 1, "precondition: compaction moved the admitted clients to shard 1")
+		everyone[player] = true
+	end
+
+	s.world:set(delegator, s.net.Private, everyone)
+	for _, player in admitted do
+		expect_equal(s.net.is_entity_visible(delegator, player), true, `{player.Name} still sees the delegator`)
+	end
+	expect_equal(s.net.is_entity_visible(delegator, env.player_a), true, "as does A")
+	expect_equal(s.net.is_entity_visible(delegator, env.player_b), false, "while B never does")
+end)
+
 test("deleting a mid-chain delegator leaves its surviving group's later edits reaching only survivors", function(env)
 	-- the dying delegator drops its edge and its exported words as mirror cleanup alone, and its own delegator
 	-- dies in the cascade, so the group's later edits must find exactly the delegator it has left: a revoke
@@ -12076,6 +12659,97 @@ test("deleting a through-parent deletes the entity under the relation's own clea
 	)
 	env.apply(decoded_a)
 	expect_equal(c.world:contains(le_a), false, "A's client drops the item")
+end)
+
+-- the delete-cascade miss of section 1 through ChildOf itself: the item's archetype holding ChildOf -> room
+-- predates the marker's, so the room's deletion deletes the marker first and the marker's death moves the item
+-- past the walk. the room admits only A. deletes the room and asserts the miss, returning the room and the item
+-- left behind in it, everything synced.
+local function strand_contained_item(env)
+	local s = env.server
+	local room = s.world:entity()
+	s.world:add(room, s.net.Replicated)
+	s.world:set(room, s.net.Private, { [env.player_a] = true })
+	local marker = s.world:entity()
+	s.world:add(marker, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:add(item, pair(s.net.InheritsPrivacyThrough, jecs.ChildOf))
+	s.world:set(item, pair(s.defs.Likes, marker), 1)
+	s.world:add(item, pair(jecs.ChildOf, room))
+	s.world:add(marker, pair(jecs.ChildOf, room))
+	env.frame()
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "precondition: A sees the item")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), false, "precondition: B does not")
+	s.world:delete(room)
+	expect_cascade_miss(s.world, item, pair(jecs.ChildOf, room))
+	env.frame()
+	return room, item
+end
+
+test(
+	"an item its room's deletion left behind keeps the room's gate and never reads as the reused id's child",
+	function(env)
+		-- the leftover ChildOf pair is two things at once here -- a networked pair and the edge the item inherits
+		-- through -- and duplecs treats both as the room's alone: the inherited gate stays the room's, frozen, and
+		-- the pair never ships aimed at the entity reusing the room's id, which passes its own open gate to nobody
+		-- through it.
+		local s = env.server
+		local room, item = strand_contained_item(env)
+		local in_room = pair(jecs.ChildOf, room)
+		expect_equal(s.net.is_entity_visible(item, env.player_a), true, "the item stays visible to A")
+		expect_equal(s.net.is_entity_visible(item, env.player_b), false, "and hidden from B")
+
+		local recycled = mint_recycled(s.world, room)
+		expect_equal(
+			s.world:has(item, pair(jecs.ChildOf, recycled)),
+			true,
+			"precondition: jecs reads the item as the new tenant's child"
+		)
+		s.world:add(recycled, s.net.Replicated)
+		local joiner = fake_player("AfterTheRoom")
+		s.net.add_client(joiner)
+		local packets = env.frame()
+		for _, player in { env.player_a, env.player_b } do
+			expect(table.find(packets[player].replicated, recycled) ~= nil, `{player.Name} receives the new tenant`)
+			expect_equal(packets[player].components[in_room], nil, `{player.Name} receives no ChildOf pair aimed at it`)
+		end
+		local full = packets[joiner]
+		expect(table.find(full.replicated, recycled) ~= nil, "the joiner receives the new tenant")
+		expect_equal(table.find(full.replicated, item), nil, "but never the item")
+		expect_equal(full.components[in_room], nil, "nor any ChildOf pair aimed at the new tenant")
+		for _, player in { env.player_a, env.player_b, joiner } do
+			expect_equal(
+				s.net.is_component_visible(item, in_room, player),
+				false,
+				`the pair stays hidden from {player.Name}`
+			)
+		end
+		expect_equal(s.net.is_entity_visible(item, env.player_a), true, "and the item stays with A alone")
+		expect_equal(s.net.is_entity_visible(item, env.player_b), false, "not B")
+		expect_equal(s.net.is_entity_visible(item, joiner), false, "nor the joiner")
+	end
+)
+
+test("a fresh InheritsPrivacy pair aimed at a reused id takes over a leftover edge to its dead tenant", function(env)
+	-- the item's leftover edge to the dead room and a new pair(InheritsPrivacy, tenant) share the dense id the
+	-- edge mirror keys by, so they meet as one edge. the live tenant takes it over: the item now inherits what
+	-- was just asked for -- the tenant's gate, B alone -- rather than keeping the dead room's frozen one, while
+	-- the leftover still counts as a source, so the edge (and the tenant's narrowing) lasts until both are gone.
+	local s = env.server
+	local room, item = strand_contained_item(env)
+	local recycled = mint_recycled(s.world, room)
+	s.world:add(recycled, s.net.Replicated)
+	s.world:set(recycled, s.net.Private, { [env.player_b] = true })
+	s.world:add(item, pair(s.net.InheritsPrivacy, recycled))
+	expect_equal(s.net.is_entity_visible(item, env.player_a), false, "the item leaves A with the dead room's gate")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "and follows the tenant to B")
+	s.world:remove(item, pair(jecs.ChildOf, recycled))
+	expect_equal(s.net.is_entity_visible(item, env.player_a), false, "removing the leftover keeps the tenant's gate")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "B included")
+	s.world:remove(item, pair(s.net.InheritsPrivacy, recycled))
+	expect_equal(s.net.is_entity_visible(item, env.player_a), true, "and the last source's removal widens the item")
+	expect_equal(s.net.is_entity_visible(item, env.player_b), true, "to everyone")
 end)
 
 test("deleting a container mid-chain leaves the room's later edits reaching only what is still in it", function(env)

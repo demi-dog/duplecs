@@ -209,6 +209,59 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 	end
 
+	-- jecs 0.11.0's world:delete walks the deleted entity's pair(Wildcard, entity) archetypes up to a count taken
+	-- before its cascade starts, so a subject that the cascade's own nested deletions move into a freshly
+	-- created archetype -- e.g. a deleted target's ChildOf child taking the subject's pair to the child with it
+	-- -- is never visited and keeps its pair to the deleted entity. the server ships no removal for a pair whose
+	-- target a client drops (the local deletion removes it), so the pair would linger, and -- pairs packing only
+	-- dense halves -- read as aimed at whatever entity next reuses the id. this removes each such leftover from
+	-- its holder, as the cascade should have: the deletion walk detached or queued every (OnDeleteTarget,
+	-- Delete) dependent beforehand, so only Remove-policy pairs can remain. leftovers are collected before any
+	-- is removed, since removing moves holders between archetypes under the walk, and nothing is touched while
+	-- the dense id has a live tenant (one of the batch's removed hooks may have minted one), whose pairs are
+	-- genuine.
+	local function remove_stale_pairs(deleted: Entity)
+		local target_dense = dense(deleted)
+		if jecs.entity_index_get_alive(world.entity_index :: any, target_dense) ~= nil then
+			return
+		end
+		local idr_target = component_index[pair(jecs.Wildcard, deleted)]
+		if idr_target == nil then
+			return
+		end
+		local holders: { Entity } = {}
+		local pair_ids: { Id } = {}
+		local count = 0
+		-- same-target pairs are not contiguous in types (see sweep_imported_cells), so each archetype's types scan,
+		-- with the record's count as an early exit
+		local world_archetypes = world.archetypes
+		local target_counts = idr_target.counts
+		for archetype_id in idr_target.records do
+			local archetype = world_archetypes[archetype_id]
+			local entities = archetype.entities
+			if #entities == 0 then
+				continue
+			end
+			local remaining = target_counts[archetype_id]
+			for _, id in archetype.types do
+				if jecs.IS_PAIR(id) and ECS_PAIR_SECOND(id) == target_dense then
+					for _, holder in entities do
+						count += 1
+						holders[count] = holder
+						pair_ids[count] = id
+					end
+					remaining -= 1
+					if remaining == 0 then
+						break
+					end
+				end
+			end
+		end
+		for i = 1, count do
+			world:remove(holders[i], pair_ids[i])
+		end
+	end
+
 	-- applies a packet's deletion list (`count` dense server ids at data[offset]) as one batch, returning the
 	-- offset past it. deleting must not cascade (OnDeleteTarget, Delete) into imported entities the packet
 	-- doesn't delete, which might still exist on the server with Replicated dependents: those are detached
@@ -280,6 +333,15 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			local entity = queue[i]
 			if world:contains(entity) then
 				world:delete(entity)
+			end
+		end
+
+		-- then finish what jecs 0.11.0's cascade can leave undone (see remove_stale_pairs); a deleted entity
+		-- nothing still targets has no pair(Wildcard, entity) record left, so the common case is one lookup
+		for i = 1, queued do
+			local entity = queue[i]
+			if component_index[pair(jecs.Wildcard, entity)] ~= nil then
+				remove_stale_pairs(entity)
 			end
 		end
 		return offset
