@@ -2323,6 +2323,47 @@ test("set_client_entity rejects remapping a live server id", function(env)
 	expect_equal(c.world:has(spare, c.net.Imported), true, "and the client entity is tagged Imported")
 end)
 
+test("set_client_entity rejects a client entity already mapped to another server id", function(env)
+	-- an entity holds one reverse entry, so a second server id would keep resolving to it after its mapping ended
+	local s, c = env.server, env.client
+	local first = s.world:entity()
+	local second = s.world:entity()
+	local le = c.world:entity()
+	c.net.set_client_entity(first, le)
+	expect_error(function()
+		c.net.set_client_entity(second, le)
+	end, "mapping a mapped client entity onto another server id", "is already mapped to server entity")
+
+	-- the refusal is total: the second id gained nothing and the first mapping stands in both directions
+	expect_equal(c.net.get_client_entity(second), nil, "the second server id maps to nothing")
+	expect_equal(c.net.get_server_entity(le), first, "the client entity still resolves to the first server id")
+	expect_equal(c.net.get_client_entity(first), le, "and the first server id still resolves to it")
+
+	-- and the guard refuses only entities currently mapped: removing Imported ends the mapping on the spot, after
+	-- which the entity is free to take another server id
+	c.world:remove(le, c.net.Imported)
+	expect_equal(c.net.get_server_entity(le), nil, "precondition: removing Imported ended the mapping")
+	c.net.set_client_entity(second, le)
+	expect_equal(c.net.get_client_entity(second), le, "an unmapped client entity maps normally")
+	expect_equal(c.net.get_server_entity(le), second, "and resolves to its new server id")
+	expect_equal(c.net.get_client_entity(first), nil, "while the ended first mapping stays gone")
+	expect_equal(c.world:has(le, c.net.Imported), true, "and the client entity is tagged Imported again")
+end)
+
+test("set_client_entity rejects a name-mapped client entity under another server id", function(env)
+	-- the shared-name announcement maps the same way a manual call does, so its entity is refused alike
+	local s, c = env.server, env.client
+	local other = s.world:entity()
+	expect_equal(c.net.get_client_entity(s.defs.Health), c.defs.Health, "precondition: the name mapped Health")
+	expect_error(function()
+		c.net.set_client_entity(other, c.defs.Health)
+	end, "mapping a name-mapped client entity onto another server id", "is already mapped to server entity")
+
+	expect_equal(c.net.get_client_entity(other), nil, "the other server id maps to nothing")
+	expect_equal(c.net.get_server_entity(c.defs.Health), s.defs.Health, "Health still resolves to its server id")
+	expect_equal(c.net.get_client_entity(s.defs.Health), c.defs.Health, "and its server id still resolves to it")
+end)
+
 test("set_client_entity rejects a dead client entity and maps nothing", function(env)
 	-- nothing would ever end a mapping onto a dead entity: the server id would resolve to it, and its dense slot's
 	-- next tenant inherit the reverse entry

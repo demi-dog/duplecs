@@ -260,11 +260,20 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			fail(`client entity {id_to_string(client_entity)} is deleted or being deleted, so it cannot be mapped!`)
 		end
 		local existing_entity = client_entity_map[dense(server_entity_gen)]
-		if existing_entity == nil or world:contains(existing_entity) ~= true then
-			set_client_entity(server_entity_gen, client_entity)
-		else
+		if existing_entity ~= nil and world:contains(existing_entity) then
 			fail(`server entity {id_to_string(dense(server_entity_gen))} is already mapped to a client entity!`)
 		end
+		-- one client entity under two server ids would leave the first resolving to it after its mapping ends
+		-- (an entity holds one server_entity_map entry), the collision map_shared_name refuses too
+		local mapped_server = get_server_entity(client_entity)
+		if mapped_server ~= nil then
+			fail(
+				`client entity {id_to_string(client_entity)} is already mapped to server entity {id_to_string(
+					dense(mapped_server)
+				)}!`
+			)
+		end
+		set_client_entity(server_entity_gen, client_entity)
 	end
 
 	local function remove_references(client_entity: Entity, server_entity: number)
@@ -357,7 +366,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			if client_entity ~= nil then
 				-- the liveness check is defensive (a deletion begins its entity's teardown, unmapping the server
 				-- id), keeping a dead entity's recycled dense slot out of the walk's pair lookups; visited dedupes
-				-- a client entity mapped under two listed server ids
+				-- defensively too, since a client entity is never mapped under two server ids
 				if world:contains(client_entity) ~= true then
 					remove_references(client_entity, server_entity)
 				else
