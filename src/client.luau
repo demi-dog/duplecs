@@ -13,6 +13,7 @@ local pair = jecs.pair
 
 local types = require("./types")
 local wire = require("./wire")
+local inspect = require("./inspect")
 local get_shared = require("./shared")
 local hooks = require("./hooks")
 local diagnostics = require("./diagnostics")
@@ -50,6 +51,8 @@ type Component<T = any> = types.Component<T>
 type Id<T = any> = types.Id<T>
 type Packet = types.Packet
 type Serdes<T = any> = types.Serdes<T>
+type PacketDescription = types.PacketDescription
+type ChunkDescription = types.ChunkDescription
 
 export type ChangedOverride<T = any> = (Entity, T) -> ()
 export type RemovedOverride = (Entity) -> ()
@@ -1075,6 +1078,42 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 	end
 
+	-- INSPECTION
+
+	-- the debug inspector's view of this world (see inspect.luau): wire ids resolve through this client's own
+	-- mapping, a live mapped entity only -- describing before reconcile sees the mappings the packet has yet to
+	-- establish as unresolved, the packet's own announcements still naming them -- and values decode through
+	-- this world's serdes store.
+	local inspect_resolver: inspect.Resolver = {
+		entity = function(dense_id: number): number?
+			local client_entity = client_entity_map[dense_id]
+			if client_entity ~= nil and world:contains(client_entity) then
+				return client_entity :: any
+			end
+			return nil
+		end,
+		gen_entity = function(gen_id: number): number?
+			local client_entity = get_client_entity(gen_id)
+			if client_entity ~= nil and world:contains(client_entity) then
+				return client_entity :: any
+			end
+			return nil
+		end,
+		name = function(entity: number): string?
+			local name = world:get(entity :: any, jecs.Name)
+			return if type(name) == "string" then name else nil
+		end,
+		resolve_serdes = resolve_serdes,
+	}
+
+	local function describe_packet(packet: Packet): PacketDescription
+		return inspect.describe_packet(packet, inspect_resolver)
+	end
+
+	local function describe_chunk(chunk: buffer): ChunkDescription
+		return inspect.describe_chunk(chunk, inspect_resolver)
+	end
+
 	-- INSTANTIATE
 
 	return {
@@ -1083,6 +1122,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		reconcile_chunk = reconcile_chunk,
 		get_packet_frame = get_packet_frame,
 		get_chunk_frame = get_chunk_frame,
+		describe_packet = describe_packet,
+		describe_chunk = describe_chunk,
 
 		-- entity mapping
 		get_client_entity = get_client_entity,

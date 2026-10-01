@@ -52,4 +52,96 @@ export type Serdes<T = any> = {
 	decode: (buf: buffer) -> T,
 }
 
+-- the debug inspector's record views (see inspect.luau, which builds them for both halves'
+-- describe_packet / describe_chunk). every id is a raw wire id -- dense for everything a section carries and
+-- for the deletion list, gen-qualified in the creation and names lists, the packed pair id for a pair's
+-- component -- and entity is the local id the describing half resolves it to, nil when it resolves to
+-- nothing. byte counts come from the wire's own length prefixes and counts, never from decoding, so they are
+-- exact whether or not values decode. like every public table shape, these may gain fields in a minor release
+-- but never lose or change one.
+export type EntityDescription = {
+	id: number,
+	entity: Entity?,
+	name: string?,
+}
+
+export type NameDescription = {
+	id: number,
+	entity: Entity?,
+	-- the announced name; for a retraction, the name the describing world resolves for the id, if any
+	name: string?,
+	retracted: boolean,
+}
+
+-- one section of a packet or chunk, or one per-target run of a grouped pair section. values decode only where
+-- the describing half resolves the section's ids and serdes hooks (a throwing decode hook leaves them nil
+-- too); hookless values are read off the packet's side array and always present. ids is always a list (empty
+-- for a section setting no values); nulled and removed are nil when absent.
+export type SectionDescription = {
+	component: number,
+	relation: number?,
+	target: number?,
+	name: string?,
+	relation_name: string?,
+	target_name: string?,
+	entity: Id?,
+	layout: "plain" | "grouped",
+	bytes: number,
+	value_bytes: number,
+	ids: { number },
+	values: { any }?,
+	nulled: { number }?,
+	removed: { number }?,
+	side_values: number,
+}
+
+-- one component's (or concrete pair's) sections summed across a packet or chunk
+export type ComponentDescription = {
+	bytes: number,
+	value_bytes: number,
+	entries: number,
+	side_values: number,
+	name: string?,
+	relation_name: string?,
+	target_name: string?,
+}
+
+export type PacketDescription = {
+	frame: number,
+	bytes: number,
+	header_bytes: number,
+	entity_list_bytes: number,
+	names_bytes: number,
+	created: { EntityDescription },
+	deleted: { EntityDescription },
+	names: { NameDescription },
+	sections: { SectionDescription },
+	components: { [number]: ComponentDescription },
+}
+
+export type ChunkDescription = {
+	frame: number,
+	bytes: number,
+	header_bytes: number,
+	sections: { SectionDescription },
+	components: { [number]: ComponentDescription },
+}
+
+-- the server's opt-in byte counters for one generate_packets / generate_unreliable_chunks call (see
+-- set_packet_stats in server.luau). encoded_bytes is paid once per group of clients sharing the bytes;
+-- sent_bytes, entries, and side_values are summed over every recipient.
+export type ComponentStats = {
+	encoded_bytes: number,
+	sent_bytes: number,
+	entries: number,
+	side_values: number,
+}
+
+export type PacketStats = {
+	packets: number,
+	sent_bytes: number,
+	overhead_bytes: number,
+	components: { [Id]: ComponentStats },
+}
+
 return {}

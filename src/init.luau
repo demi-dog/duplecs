@@ -33,6 +33,17 @@ export type ClientInstance = client.ClientInstance
 export type ChangedOverride<T = any> = client.ChangedOverride<T>
 export type RemovedOverride = client.RemovedOverride
 
+-- the debug inspector's record views (both halves' describe_packet / describe_chunk) and the server's opt-in
+-- byte counters (get_packet_stats / get_chunk_stats)
+export type PacketDescription = types.PacketDescription
+export type ChunkDescription = types.ChunkDescription
+export type SectionDescription = types.SectionDescription
+export type ComponentDescription = types.ComponentDescription
+export type EntityDescription = types.EntityDescription
+export type NameDescription = types.NameDescription
+export type PacketStats = types.PacketStats
+export type ComponentStats = types.ComponentStats
+
 return {
 	server = server,
 	client = client,

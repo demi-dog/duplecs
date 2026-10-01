@@ -34,6 +34,21 @@ Builds every client's packet in a single pass and returns them keyed by client �
 #### `server.generate_unreliable_chunks(chunk_bytes: number?) -> { [Client]: { buffer } }`
 Builds the always-replicate chunks for `NetworkedUnreliable` components: every visible value is re-read and re-sent on every call, packed into self-contained chunk buffers of at most `chunk_bytes` bytes (default 980, sized for Roblox's 1000-byte unreliable remote limit), for the caller to send through an unreliable transport each frame. Drains nothing and can be called at its own rate; visibility follows the last reliable packets sent. Chunk buffers are shared by reference between clients with equal visibility — never mutate them.
 
+#### `server.describe_packet(packet: Packet) -> PacketDescription`
+A debugging view of one packet: its frame and total size, the bytes its header, entity lists, and name announcements take, the entities it creates and deletes, its name announcements and retractions, and every section in order — which component (or relation and target) it carries, its byte size and the share of that spent on encoded values, its entity ids and values. A per-component total sums the sections. Ids are the raw ids the packet carries, each paired with the server entity it names now and that entity's `jecs.Name` where known. Byte sizes are exact even where values can't be read back; values decode through this world's serdes hooks. Never changes anything — describe a packet right after `generate_packets` to see what it carries. See the spec's [packet inspection](spec.md#packet-inspection) for the full shape.
+
+#### `server.describe_chunk(chunk: buffer) -> ChunkDescription`
+The unreliable-chunk counterpart to `describe_packet`: the chunk's frame and size, the bytes its header takes, and every section in order, with the same per-section and per-component fields.
+
+#### `server.set_packet_stats(enabled: boolean)`
+Turns this instance's byte counters on or off. While on, every `generate_packets` and `generate_unreliable_chunks` call records how many bytes it produced and which components they went to, readable through `get_packet_stats` / `get_chunk_stats` until the next call replaces them. Off by default, and costing next to nothing while off; turning them off discards the last readings.
+
+#### `server.get_packet_stats() -> PacketStats?`
+The byte counters for the most recent `generate_packets` call, or `nil` while the counters are off or before a call has run with them on: how many packets it returned and their total bytes, how much of that is packet overhead (headers, entity lists, name announcements), and per component — pairs counted under their relation — the bytes encoded once for every group of clients sharing them, the bytes actually sent summed over every recipient, and how many entries and side-array values they carried. Joiners' and freshly-marked clients' full packets are included. See the spec's [byte counters](spec.md#byte-counters).
+
+#### `server.get_chunk_stats() -> PacketStats?`
+The same counters for the most recent `generate_unreliable_chunks` call, counting chunks as packets and chunk headers as overhead.
+
 #### `server.is_entity_visible(entity: Entity, client: Client) -> boolean`
 Returns whether the entity's existence is currently visible to the client — reflecting entity replication and the entity-level privacy filter, including changes made this frame that no packet has carried yet. Always `false` for an untracked client.
 
@@ -114,6 +129,12 @@ Returns the packet frame a packet carries — shared by every packet of one `gen
 #### `client.get_chunk_frame(chunk: buffer) -> number`
 Returns the chunk frame a chunk carries — shared by every chunk of one `generate_unreliable_chunks` call, and independent of the packet frame — without reconciling it. Validates the chunk version first, like `reconcile_chunk`. Read it before reconciling to timestamp the values your changed overrides capture (reconcile is synchronous, so an upvalue carries it into the overrides).
 
+#### `client.describe_packet(packet: Packet) -> PacketDescription`
+The client-side counterpart to the server's `describe_packet`, for a received packet: the same view, with ids resolved through this client's own entity mapping and values decoded through its own serdes hooks. Never reconciles anything; describe before `reconcile_packet` to see what is about to apply (entities the packet is about to create or map don't resolve yet, though names the packet announces still show), or after to see where it landed.
+
+#### `client.describe_chunk(chunk: buffer) -> ChunkDescription`
+The client-side counterpart to the server's `describe_chunk`, resolving through this client's mapping and hooks like `describe_packet`.
+
 #### `client.set_client_entity(server_entity: number, client_entity: Entity)`
 Registers a mapping between a server id and a client entity and tags the client entity `Imported`. Primarily for prediction — a client creates a stand-in entity immediately, learns the server id through a side channel (typically echoed back off the triggering request alongside the stand-in's own id), and maps it so the server's creation adopts the stand-in — and for startup mapping of definitions that shared names don't cover. Mapping does not claim the entity as client-owned; it will be deleted if the server entity is deleted. Errors if the server id is already mapped to a live client entity, so a predicting caller should check `get_client_entity` first, and on losing that race adopt the server's entity and discard the now-duplicate stand-in.
 
@@ -181,3 +202,9 @@ The full per-world component set `duplecs.shared` returns — one frozen table p
 
 #### `RemovedOverride`
 `(Entity) -> ()` — signature of a removed override handler.
+
+#### `PacketDescription` & `ChunkDescription`
+What `describe_packet` and `describe_chunk` return, along with the record types they are built from: `SectionDescription` (one section), `ComponentDescription` (one component's per-packet total), `EntityDescription` (one created or deleted entity), and `NameDescription` (one name announcement or retraction). The exact fields are listed in the spec's [packet inspection](spec.md#packet-inspection) section.
+
+#### `PacketStats`
+What `get_packet_stats` and `get_chunk_stats` return, with `ComponentStats` as its per-component entry type. The exact fields are listed in the spec's [byte counters](spec.md#byte-counters) section.

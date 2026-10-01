@@ -134,7 +134,8 @@
 -- read_packet_header / read_section_header are the one decode authority for each layout's header; readers
 -- walk the lists themselves from the returned counts and offset, so the client's reconcile stays a fused
 -- stream-parse-and-apply allocating only decode's per-value buffers. decode_packet / decode_section build
--- allocating record views on the same readers for the verification suite and diagnostics.
+-- allocating record views on the same readers for the verification suite and diagnostics, and inspect.luau's
+-- describers -- the public face of this module -- walk them for both halves' describe_packet / describe_chunk.
 
 local jecs = require("../roblox_packages/jecs")
 
@@ -1864,7 +1865,9 @@ return {
 	read_chunk_frame = read_chunk_frame,
 	read_chunk_section_header = read_chunk_section_header,
 
-	-- record-view decoders (test/debug-facing; reconcile never uses them)
+	-- record-view decoders (test/debug-facing; reconcile never uses them). decode_values also backs
+	-- inspect.luau, the public wrapper over this module's readers
+	decode_values = decode_values,
 	decode_section = decode_section,
 	decode_packet = decode_packet,
 	decode_chunk = decode_chunk,

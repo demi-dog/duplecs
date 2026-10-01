@@ -5899,6 +5899,777 @@ test("the packet frame advances between successive generate_packets calls", func
 	expect_equal(third, second + 2, "the quiet call consumed a frame")
 end)
 
+-- packet inspection (describe_packet / describe_chunk) and the server's byte counters (set_packet_stats). the
+-- fixtures below are local to this block: section 17's serdes hooks and section 26's unreliable helpers sit
+-- later in the file.
+
+-- f64 hooks, with a static size and without (the latter rides each value behind a u16 length prefix)
+local inspect_f64_serdes = {
+	size = 8,
+	encode = function(value)
+		local buf = buffer.create(8)
+		buffer.writef64(buf, 0, value)
+		return buf
+	end,
+	decode = function(buf)
+		return buffer.readf64(buf, 0)
+	end,
+}
+
+local inspect_f64_prefixed_serdes = {
+	encode = inspect_f64_serdes.encode,
+	decode = inspect_f64_serdes.decode,
+}
+
+-- a fresh component tracked under `tag` on the server and mapped on the client, with serdes hooks registered
+-- on each side only where given -- so a test can leave the client without hooks the server encodes with
+local function make_inspected_component(env, tag, server_serdes, client_serdes)
+	local s, c = env.server, env.client
+	local comp_s = s.world:component()
+	local comp_c = c.world:component()
+	c.net.set_client_entity(comp_s, comp_c)
+	if server_serdes ~= nil then
+		s.world:set(comp_s, s.net.Serdes, server_serdes)
+	end
+	if client_serdes ~= nil then
+		c.world:set(comp_c, c.net.Serdes, client_serdes)
+	end
+	s.world:add(comp_s, tag)
+	return comp_s, comp_c
+end
+
+-- the one described section carrying `component` (a raw wire id), asserting there is exactly one
+local function described_section(description, component, label)
+	local found = nil
+	for _, section in description.sections do
+		if section.component == component then
+			expect(found == nil, `{label}: one section carries the component`)
+			found = section
+		end
+	end
+	expect(found ~= nil, `{label}: a section carries the component`)
+	return found
+end
+
+-- a description's parts sum to its buffer: the header (plus a packet's entity and names lists) and every
+-- section's bytes
+local function expect_described_bytes(description, label)
+	local total = description.header_bytes + (description.entity_list_bytes or 0) + (description.names_bytes or 0)
+	for _, section in description.sections do
+		total += section.bytes
+	end
+	expect_equal(total, description.bytes, `{label}: the described parts sum to the buffer`)
+end
+
+-- the counters' identity against the buffers a call actually returned: their count and total size, and the
+-- per-component sent bytes plus the overhead accounting for every byte
+local function expect_stats_add_up(stats, buffers, label)
+	expect(stats ~= nil, `{label}: the counters recorded the call`)
+	local total = 0
+	for _, data in buffers do
+		total += buffer.len(data)
+	end
+	expect_equal(stats.packets, #buffers, `{label}: packets counts every returned buffer`)
+	expect_equal(stats.sent_bytes, total, `{label}: sent_bytes is the returned buffers' total size`)
+	local attributed = stats.overhead_bytes
+	for _, entry in stats.components do
+		attributed += entry.sent_bytes
+	end
+	expect_equal(attributed, total, `{label}: overhead plus every component's sent bytes is every byte returned`)
+end
+
+local function packet_buffers(packets)
+	local buffers = {}
+	for _, packet in packets do
+		table.insert(buffers, packet.data)
+	end
+	return buffers
+end
+
+local function chunk_buffers(chunks_by_client)
+	local buffers = {}
+	for _, chunks in chunks_by_client do
+		for _, chunk in chunks do
+			table.insert(buffers, chunk)
+		end
+	end
+	return buffers
+end
+
+-- the per-component totals rebuilt from the server's describe over every returned buffer, pairs keyed by their
+-- relation like the counters (test definitions are generation 0, so a raw id is its entity), then compared
+-- with the counters entry by entry: an independent read of the same bytes, through the wire's own framing
+local function expect_stats_match_descriptions(stats, descriptions, label)
+	local totals = {}
+	for _, description in descriptions do
+		for _, section in description.sections do
+			local key = section.relation or section.component
+			local entry = totals[key]
+			if entry == nil then
+				entry = { bytes = 0, entries = 0, side_values = 0 }
+				totals[key] = entry
+			end
+			entry.bytes += section.bytes
+			entry.entries += #section.ids + (if section.nulled then #section.nulled else 0) + (if section.removed
+				then #section.removed
+				else 0)
+			entry.side_values += section.side_values
+		end
+	end
+	local compared = 0
+	for key, entry in stats.components do
+		local described = totals[key]
+		expect(described ~= nil, `{label}: a counted component appears in the described packets`)
+		expect_equal(entry.sent_bytes, described.bytes, `{label}: sent_bytes matches the described sections`)
+		expect_equal(entry.entries, described.entries, `{label}: entries matches the described sections`)
+		expect_equal(entry.side_values, described.side_values, `{label}: side_values matches the described sections`)
+		compared += 1
+	end
+	for key in totals do
+		expect(stats.components[key] ~= nil, `{label}: every described component is counted`)
+	end
+	return compared
+end
+
+test("describe_packet reads a packet's entity lists, names, and a hookless section on both halves", function(env)
+	local s, c = env.server, env.client
+	s.world:set(s.defs.Health, jecs.Name, "Health")
+	c.world:set(c.defs.Health, jecs.Name, "Health")
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 5)
+
+	local packet = s.net.generate_packets()[env.player_a]
+	local described = s.net.describe_packet(packet)
+	expect_equal(described.frame, c.net.get_packet_frame(packet), "the frame is the packet frame")
+	expect_equal(described.bytes, buffer.len(packet.data), "bytes is the buffer's length")
+	-- version, frame, flags, then the two present lists' counts (creations and names)
+	expect_equal(described.header_bytes, version_width + 4 + 1 + 2 * 2, "the header")
+	expect_equal(described.entity_list_bytes, gen_id_width, "one creation entry")
+	expect_equal(described.names_bytes, gen_id_width + 1 + #"Health", "one announcement")
+	expect_described_bytes(described, "server")
+
+	expect_equal(#described.created, 1, "one creation")
+	expect_equal(described.created[1].id, e, "the creation carries the full id")
+	expect_equal(described.created[1].entity, e, "and resolves to the entity")
+	expect_equal(described.created[1].name, nil, "which has no name")
+	expect_equal(#described.deleted, 0, "no deletions")
+	expect_equal(#described.names, 1, "one names entry")
+	expect_equal(described.names[1].id, s.defs.Health, "the announcement names Health")
+	expect_equal(described.names[1].name, "Health", "with its name")
+	expect_equal(described.names[1].retracted, false, "as an announcement")
+	expect_equal(described.names[1].entity, s.defs.Health, "resolving to the definition")
+
+	expect_equal(#described.sections, 1, "one section")
+	local section = described.sections[1]
+	expect_equal(section.component, s.defs.Health, "the section's component")
+	expect_equal(section.entity, s.defs.Health, "resolves to the definition")
+	expect_equal(section.name, "Health", "and is named")
+	expect_equal(section.layout, "plain", "a plain section")
+	-- flags, the component id, and the ids count, then one id; the value rides the side array
+	expect_equal(section.bytes, 1 + id_width + 2 + id_width, "the section's bytes")
+	expect_equal(section.value_bytes, 0, "no inline value bytes")
+	expect_equal(section.side_values, 1, "one side value")
+	expect_equal(#section.ids, 1, "one id")
+	expect_equal(section.ids[1], jecs.ECS_ID(e), "the dense id")
+	expect_equal(section.values[1], 5, "the value, read off the side array")
+	expect(section.values ~= packet.values[1], "values are a copy, never the packet's shared array")
+	expect_equal(section.nulled, nil, "no nulled list")
+	expect_equal(section.removed, nil, "no removed list")
+	local health = described.components[s.defs.Health]
+	expect(health ~= nil, "a per-component total for Health")
+	expect_equal(health.bytes, section.bytes, "its bytes")
+	expect_equal(health.entries, 1, "its entries")
+	expect_equal(health.side_values, 1, "its side values")
+	expect_equal(health.name, "Health", "its name")
+
+	-- the client, before reconciling: the creation the packet carries resolves to nothing yet, while the mapped
+	-- definition does
+	local copy = deep_copy(packet)
+	local before = c.net.describe_packet(copy)
+	expect_equal(before.bytes, described.bytes, "the client sizes the packet identically")
+	expect_equal(before.created[1].entity, nil, "an entity the packet is creating is unmapped before reconcile")
+	expect_equal(before.sections[1].entity, c.defs.Health, "the section resolves to the client's definition")
+	expect_equal(before.sections[1].name, "Health", "named")
+	expect_equal(before.sections[1].values[1], 5, "with the value")
+	expect_described_bytes(before, "client")
+
+	c.net.reconcile_packet(copy)
+	local after = c.net.describe_packet(copy)
+	local client_entity = c.net.get_client_entity(e)
+	expect(client_entity ~= nil, "the reconcile created the entity")
+	expect_equal(after.created[1].entity, client_entity, "after reconcile the creation resolves to it")
+	expect_equal(after.names[1].entity, c.defs.Health, "and the announcement to the mapped definition")
+end)
+
+test("describe_packet sizes and decodes inline serdes values, static and prefixed, on both halves", function(env)
+	local s, c = env.server, env.client
+	local static_s, static_c = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, inspect_f64_serdes)
+	local prefixed_s, prefixed_c =
+		make_inspected_component(env, s.net.Networked, inspect_f64_prefixed_serdes, inspect_f64_prefixed_serdes)
+	local e1 = s.world:entity()
+	local e2 = s.world:entity()
+	s.world:add(e1, s.net.Replicated)
+	s.world:add(e2, s.net.Replicated)
+	s.world:set(e1, static_s, 1.5)
+	s.world:set(e2, static_s, 2.5)
+	s.world:set(e1, prefixed_s, 3.5)
+
+	local packet = s.net.generate_packets()[env.player_a]
+	local views = {
+		{ label = "server", description = s.net.describe_packet(packet), static = static_s, prefixed = prefixed_s },
+		{
+			label = "client",
+			description = c.net.describe_packet(deep_copy(packet)),
+			static = static_c,
+			prefixed = prefixed_c,
+		},
+	}
+	local expected = { [jecs.ECS_ID(e1)] = 1.5, [jecs.ECS_ID(e2)] = 2.5 }
+	for _, view in views do
+		local label = view.label
+		local static = described_section(view.description, static_s, label)
+		expect_equal(static.entity, view.static, `{label}: the static section resolves locally`)
+		expect_equal(static.value_bytes, 16, `{label}: two static values, no prefixes`)
+		-- flags, length, component, count, two ids, the values
+		expect_equal(static.bytes, 1 + 2 + id_width + 2 + 2 * id_width + 16, `{label}: the static section's bytes`)
+		expect_equal(static.side_values, 0, `{label}: nothing rides the side array`)
+		for index, id in static.ids do
+			expect_equal(static.values[index], expected[id], `{label}: each value aligns with its id`)
+		end
+
+		local prefixed = described_section(view.description, prefixed_s, label)
+		expect_equal(prefixed.entity, view.prefixed, `{label}: the prefixed section resolves locally`)
+		expect_equal(prefixed.value_bytes, 2 + 8, `{label}: one value behind its length prefix`)
+		expect_equal(prefixed.bytes, 1 + 2 + id_width + 2 + id_width + 10, `{label}: the prefixed section's bytes`)
+		expect_equal(prefixed.values[1], 3.5, `{label}: the prefixed value decodes`)
+		expect_equal(view.description.components[static_s].value_bytes, 16, `{label}: the total's value bytes`)
+		expect_described_bytes(view.description, label)
+	end
+end)
+
+test("describe_packet splits a grouped pair section into per-target entries summing to the section", function(env)
+	local s, c = env.server, env.client
+	s.world:set(s.defs.Likes, jecs.Name, "Likes")
+	c.world:set(c.defs.Likes, jecs.Name, "Likes")
+	local subject = s.world:entity()
+	s.world:add(subject, s.net.Replicated)
+	-- runs follow the packet's own order, so each is checked against its target's index
+	local targets = {}
+	local index_of = {}
+	for i = 1, 3 do
+		local target = s.world:entity()
+		s.world:add(target, s.net.Replicated)
+		s.world:set(target, jecs.Name, `Target{i}`)
+		targets[i] = target
+		index_of[jecs.ECS_ID(target)] = i
+		s.world:set(subject, pair(s.defs.Likes, target), `v{i}`)
+	end
+
+	local packet = s.net.generate_packets()[env.player_a]
+	local described = s.net.describe_packet(packet)
+	expect_described_bytes(described, "server")
+
+	-- the packet's one section is the grouped one: read its true size off the wire
+	local section_start = described.header_bytes + described.entity_list_bytes + described.names_bytes
+	local _, section_end = read_section_header(packet.data, section_start)
+	expect_equal(section_end, buffer.len(packet.data), "the grouped section is the packet's only section")
+
+	expect_equal(#described.sections, 3, "one entry per target")
+	-- the shared framing (flags, length, relation, run count: 8 bytes) splits 3 / 3 / 2 over the three runs,
+	-- each run itself 9 bytes (run flags, target, ids count, one id)
+	local expected_bytes = { 12, 12, 11 }
+	local total = 0
+	for position, section in described.sections do
+		expect_equal(section.layout, "grouped", "a grouped entry")
+		expect_equal(section.relation, s.defs.Likes, "the relation's raw id")
+		expect_equal(section.relation_name, "Likes", "the relation's name")
+		expect_equal(section.name, nil, "pairs name their halves instead")
+		local index = index_of[section.target]
+		expect(index ~= nil, "the target's raw id is one of the three")
+		local target = targets[index]
+		expect_equal(section.target_name, `Target{index}`, "the target's name")
+		expect_equal(section.component, pair(s.defs.Likes, target), "the component is the packed pair id")
+		expect_equal(section.entity, pair(s.defs.Likes, target), "resolving to the live pair")
+		expect_equal(section.values[1], `v{index}`, "each run's own slice of the side array")
+		expect_equal(section.side_values, 1, "one side value per run")
+		expect_equal(section.bytes, expected_bytes[position], "the framing splits evenly, the remainder going first")
+		total += section.bytes
+		local per_pair = described.components[section.component]
+		expect_equal(per_pair.bytes, section.bytes, "each concrete pair totals on its own")
+		expect_equal(per_pair.relation_name, "Likes", "named by its halves")
+	end
+	expect_equal(total, section_end - section_start, "the entries sum to the section")
+
+	-- the client before reconcile: the targets the packet is creating don't resolve yet, but every size and
+	-- hookless value still reads
+	local copy = deep_copy(packet)
+	local before = c.net.describe_packet(copy)
+	for position, section in before.sections do
+		expect_equal(section.bytes, expected_bytes[position], "the client sizes each run identically")
+		expect_equal(section.entity, nil, "an unmapped target leaves the pair unresolved")
+		expect_equal(section.relation_name, "Likes", "while the relation still names")
+		expect_equal(section.values[1], `v{index_of[section.target]}`, "and hookless values still read")
+	end
+	c.net.reconcile_packet(copy)
+	local after = c.net.describe_packet(copy)
+	for _, section in after.sections do
+		local client_target = c.net.get_client_entity(targets[index_of[section.target]])
+		expect_equal(section.entity, pair(c.defs.Likes, client_target), "after reconcile the pair resolves locally")
+	end
+end)
+
+test("describe_packet reports deletions and name retractions on both halves", function(env)
+	local s, c = env.server, env.client
+	local def_s = s.world:component()
+	local def_c = c.world:component()
+	s.world:set(def_s, jecs.Name, "Announced")
+	c.world:set(def_c, jecs.Name, "Announced")
+	s.world:add(def_s, s.net.Networked)
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	env.sync(env.player_a)
+	local client_entity = c.net.get_client_entity(e)
+	expect(client_entity ~= nil, "the client holds the entity")
+	expect_equal(c.net.get_server_entity(def_c), def_s, "and mapped the definition by name")
+
+	s.world:remove(e, s.net.Replicated)
+	-- withdrawing the definition's tracking withdraws its announcement
+	s.world:remove(def_s, s.net.Networked)
+	local packet = s.net.generate_packets()[env.player_a]
+
+	local described = s.net.describe_packet(packet)
+	expect_described_bytes(described, "server")
+	expect_equal(#described.deleted, 1, "one deletion")
+	expect_equal(described.deleted[1].id, jecs.ECS_ID(e), "carrying the dense id")
+	expect_equal(described.deleted[1].entity, e, "resolving to the still-live server entity")
+	expect_equal(described.entity_list_bytes, id_width, "a deletion entry is a dense id")
+	expect_equal(#described.names, 1, "one names entry")
+	local retraction = described.names[1]
+	expect_equal(retraction.id, def_s, "the retraction names the definition")
+	expect_equal(retraction.retracted, true, "as a retraction")
+	expect_equal(retraction.name, "Announced", "carrying the name the server still resolves")
+	expect_equal(described.names_bytes, gen_id_width + 1, "a retraction is an id and a zero length")
+
+	local copy = deep_copy(packet)
+	local before = c.net.describe_packet(copy)
+	expect_equal(before.deleted[1].entity, client_entity, "the client resolves the deletion before reconcile")
+	expect_equal(before.names[1].entity, def_c, "and the retraction to its mapped definition")
+	expect_equal(before.names[1].name, "Announced", "named locally")
+	c.net.reconcile_packet(copy)
+	local after = c.net.describe_packet(copy)
+	expect_equal(after.deleted[1].entity, nil, "after reconcile the deleted entity resolves to nothing")
+	expect_equal(after.names[1].entity, nil, "and the retracted mapping has ended")
+	expect_equal(after.names[1].name, nil, "leaving no name to resolve")
+end)
+
+test("describe_packet sizes sections whose ids or hooks the describing side lacks, with values nil", function(env)
+	local s, c = env.server, env.client
+	-- inline on the server, but the client has no hooks to decode it
+	local inline_s, inline_c = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, nil)
+	-- networked on the server and never mapped on the client, hookless and inline
+	local unmapped_s = s.world:component()
+	s.world:add(unmapped_s, s.net.Networked)
+	local unmapped_inline_s = s.world:component()
+	s.world:set(unmapped_inline_s, s.net.Serdes, inspect_f64_serdes)
+	s.world:add(unmapped_inline_s, s.net.Networked)
+
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, inline_s, 1.5)
+	s.world:set(e, unmapped_s, "hookless")
+	s.world:set(e, unmapped_inline_s, 2.5)
+
+	local packet = s.net.generate_packets()[env.player_a]
+	local server = s.net.describe_packet(packet)
+	-- described only: reconciling would refuse the inline values the client has no hooks for
+	local client = c.net.describe_packet(deep_copy(packet))
+	expect_equal(client.bytes, server.bytes, "both halves size the packet identically")
+	expect_described_bytes(client, "client")
+	for _, component in { inline_s, unmapped_s, unmapped_inline_s } do
+		local server_section = described_section(server, component, "server")
+		local client_section = described_section(client, component, "client")
+		expect_equal(client_section.bytes, server_section.bytes, "each section sizes identically")
+		expect_equal(client_section.value_bytes, server_section.value_bytes, "inline value bytes included")
+		expect(server_section.values ~= nil, "the server decodes every section")
+	end
+
+	local inline = described_section(client, inline_s, "client")
+	expect_equal(inline.entity, inline_c, "a mapped component resolves")
+	expect_equal(inline.values, nil, "but without hooks its values stay undecoded")
+	expect_equal(inline.value_bytes, 8, "while its value bytes still count")
+
+	local unmapped = described_section(client, unmapped_s, "client")
+	expect_equal(unmapped.entity, nil, "an unmapped component resolves to nothing")
+	expect_equal(unmapped.name, nil, "and has no name")
+	expect_equal(unmapped.values[1], "hookless", "hookless values read off the side array regardless")
+
+	local unmapped_inline = described_section(client, unmapped_inline_s, "client")
+	expect_equal(unmapped_inline.values, nil, "an unmapped inline section can't decode")
+	expect_equal(unmapped_inline.value_bytes, 8, "but its value bytes count")
+end)
+
+test("describe_packet contains a throwing or mismatched decode hook to its section's values, silently", function(env)
+	local s, c = env.server, env.client
+	local throwing = {
+		size = 8,
+		encode = inspect_f64_serdes.encode,
+		decode = function()
+			error("this decode refuses everything")
+		end,
+	}
+	-- a client declaring a different static size than the server encodes: decoding would read the wrong bytes
+	local mismatched = {
+		size = 4,
+		encode = function(value)
+			local buf = buffer.create(4)
+			buffer.writef32(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			return buffer.readf32(buf, 0)
+		end,
+	}
+	local throwing_s = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, throwing)
+	local mismatched_s = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, mismatched)
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, throwing_s, 4.5)
+	s.world:set(e, mismatched_s, 5.5)
+	s.world:set(e, s.defs.Health, 1)
+
+	local packet = s.net.generate_packets()[env.player_a]
+	local server = s.net.describe_packet(packet)
+	local client = c.net.describe_packet(deep_copy(packet))
+	expect_described_bytes(client, "client")
+
+	local thrown = described_section(client, throwing_s, "client")
+	expect_equal(thrown.values, nil, "a throwing decode leaves the section's values nil")
+	expect_equal(thrown.value_bytes, 8, "with its bytes intact")
+	expect_equal(thrown.bytes, described_section(server, throwing_s, "server").bytes, "sized like the server's")
+	local mismatch = described_section(client, mismatched_s, "client")
+	expect_equal(mismatch.values, nil, "values not filling exactly the section's value bytes are left nil")
+	expect_equal(described_section(client, s.defs.Health, "client").values[1], 1, "other sections still decode")
+	-- and nothing warns: the runner asserts silence for this test
+end)
+
+test("describe_packet sizes a wide section exactly", function(env)
+	local s, c = env.server, env.client
+	-- 70 values of 1 KiB overflow a section's 16-bit length, widening its counts to 32 bits
+	local kilobyte_serdes = {
+		size = 1024,
+		encode = function(value)
+			local buf = buffer.create(1024)
+			buffer.writeu8(buf, 0, value)
+			return buf
+		end,
+		decode = function(buf)
+			return buffer.readu8(buf, 0)
+		end,
+	}
+	local comp_s = make_inspected_component(env, s.net.Networked, kilobyte_serdes, kilobyte_serdes)
+	local values_by_id = {}
+	for i = 1, 70 do
+		local e = s.world:entity()
+		s.world:add(e, s.net.Replicated)
+		s.world:set(e, comp_s, i)
+		values_by_id[jecs.ECS_ID(e)] = i
+	end
+
+	local packet = s.net.generate_packets()[env.player_a]
+	for _, description in { s.net.describe_packet(packet), c.net.describe_packet(deep_copy(packet)) } do
+		local section = described_section(description, comp_s, "wide")
+		-- flags, a 32-bit length, the component, a 32-bit count, the ids, the values
+		expect_equal(section.bytes, 1 + 4 + id_width + 4 + 70 * id_width + 70 * 1024, "the wide section's bytes")
+		expect_equal(section.value_bytes, 70 * 1024, "its value bytes")
+		expect_equal(#section.ids, 70, "every id")
+		for index, id in section.ids do
+			expect_equal(section.values[index], values_by_id[id], "each value decodes against its id")
+		end
+		expect_described_bytes(description, "wide")
+	end
+end)
+
+test("describe_chunk reads every chunk of a split section on both halves", function(env)
+	local s, c = env.server, env.client
+	local comp_s, comp_c =
+		make_inspected_component(env, s.net.NetworkedUnreliable, inspect_f64_serdes, inspect_f64_serdes)
+	local values_by_id = {}
+	for i = 1, 11 do
+		local e = s.world:entity()
+		s.world:add(e, s.net.Replicated)
+		s.world:set(e, comp_s, i + 0.5)
+		values_by_id[jecs.ECS_ID(e)] = i + 0.5
+	end
+	local nulled_entity = s.world:entity()
+	s.world:add(nulled_entity, s.net.Replicated)
+	s.world:set(nulled_entity, comp_s, nil)
+	env.sync(env.player_a)
+
+	-- a 60-byte budget fits four values a chunk, so the section continues across chunks
+	local chunks = s.net.generate_unreliable_chunks(60)[env.player_a]
+	expect(#chunks > 1, "the values span several chunks")
+	local ids_seen = 0
+	local nulled_seen = 0
+	for _, chunk in chunks do
+		local server = s.net.describe_chunk(chunk)
+		local client = c.net.describe_chunk(chunk)
+		for _, description in { server, client } do
+			expect_equal(description.frame, c.net.get_chunk_frame(chunk), "the frame is the chunk frame")
+			expect_equal(description.bytes, buffer.len(chunk), "bytes is the chunk's length")
+			expect_equal(description.header_bytes, 5, "the chunk header")
+			expect_described_bytes(description, "chunk")
+			for _, section in description.sections do
+				expect_equal(section.component, comp_s, "every section carries the component")
+				expect_equal(section.layout, "plain", "chunk sections are plain")
+				expect_equal(section.removed, nil, "chunks carry no removals")
+				expect_equal(section.side_values, 0, "nor side values")
+				expect_equal(section.value_bytes, 8 * #section.ids, "static values, no prefixes")
+				for index, id in section.ids do
+					expect_equal(section.values[index], values_by_id[id], "each value decodes against its id")
+				end
+			end
+		end
+		for _, section in server.sections do
+			expect_equal(section.entity, comp_s, "the server resolves its own component")
+			ids_seen += #section.ids
+			nulled_seen += if section.nulled then #section.nulled else 0
+		end
+		for _, section in client.sections do
+			expect_equal(section.entity, comp_c, "the client resolves its mapped one")
+		end
+		local total = server.components[comp_s]
+		expect_equal(total.bytes, server.bytes - 5, "the chunk is one component's sections behind its header")
+	end
+	expect_equal(ids_seen, 11, "every value appears once across the chunks")
+	expect_equal(nulled_seen, 1, "and the nulled entity once")
+end)
+
+test("the byte counters read nil while off, follow set_packet_stats, and never accumulate", function(env)
+	local s = env.server
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 1)
+	s.net.generate_packets()
+	expect_equal(s.net.get_packet_stats(), nil, "off by default")
+	expect_equal(s.net.get_chunk_stats(), nil, "for both channels")
+
+	s.net.set_packet_stats(true)
+	expect_equal(s.net.get_packet_stats(), nil, "turning them on reads nothing until a call runs")
+	s.world:set(e, s.defs.Health, 2)
+	local packets = s.net.generate_packets()
+	local first = s.net.get_packet_stats()
+	expect_stats_add_up(first, packet_buffers(packets), "the first counted call")
+	expect_equal(first.packets, 2, "both players' packets")
+
+	-- each call builds its own reading: a quiet call reads empty rather than adding to the last
+	s.net.generate_packets()
+	local quiet = s.net.get_packet_stats()
+	expect(quiet ~= first, "a new table per call")
+	expect_equal(quiet.packets, 0, "a quiet call returns no packets")
+	expect_equal(quiet.sent_bytes, 0, "and sends nothing")
+	expect_equal(next(quiet.components), nil, "to no component")
+	expect_equal(first.packets, 2, "the earlier reading is left as it was")
+
+	-- with no unreliable definitions the chunk call still records an all-zero reading
+	s.net.generate_unreliable_chunks()
+	local chunk_stats = s.net.get_chunk_stats()
+	expect(chunk_stats ~= nil, "the chunk counters recorded the call")
+	expect_equal(chunk_stats.packets, 0, "no chunks")
+	expect_equal(chunk_stats.sent_bytes, 0, "no bytes")
+
+	s.net.set_packet_stats(false)
+	expect_equal(s.net.get_packet_stats(), nil, "turning them off discards the readings")
+	expect_equal(s.net.get_chunk_stats(), nil, "for both channels")
+	s.world:set(e, s.defs.Health, 3)
+	s.net.generate_packets()
+	expect_equal(s.net.get_packet_stats(), nil, "and calls while off record nothing")
+end)
+
+test("the byte counters charge a broadcast change once encoded and once per recipient sent", function(env)
+	local s = env.server
+	join_fillers(env, 28) -- 30 clients in all
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.net.generate_packets()
+
+	s.net.set_packet_stats(true)
+	s.world:set(e, s.defs.Health, 7)
+	local packets = s.net.generate_packets()
+	local stats = s.net.get_packet_stats()
+	expect_stats_add_up(stats, packet_buffers(packets), "broadcast")
+	-- the bandwidth guide's worked example, figure for figure: one 9-byte hookless section in 30 15-byte packets
+	expect_equal(stats.packets, 30, "one packet per client")
+	expect_equal(stats.sent_bytes, 450, "15 bytes each")
+	expect_equal(stats.overhead_bytes, 180, "6 of them header")
+	local health = stats.components[s.defs.Health]
+	expect_equal(health.encoded_bytes, 9, "the section is encoded once")
+	expect_equal(health.sent_bytes, 270, "and sent to all 30")
+	expect_equal(health.entries, 30, "one entry per recipient")
+	expect_equal(health.side_values, 30, "one side value per recipient")
+	local descriptions = {}
+	for _, packet in packets do
+		table.insert(descriptions, s.net.describe_packet(packet))
+	end
+	expect_stats_match_descriptions(stats, descriptions, "broadcast")
+end)
+
+-- a frame mixing broadcast and per-entity whitelisted changes -- unpaired hookless and inline values plus a
+-- pair -- shaped so the counters see many distinct groups of recipients; players is every allocated client
+local function stage_fragmented_frame(env, players, inline_s)
+	local s = env.server
+	local broadcast = s.world:entity()
+	s.world:add(broadcast, s.net.Replicated)
+	local target = s.world:entity()
+	s.world:add(target, s.net.Replicated)
+	s.net.generate_packets()
+
+	s.world:set(broadcast, s.defs.Inventory, { "shared" })
+	for i, player in players do
+		local e = s.world:entity()
+		-- each entity whitelists a distinct pair of clients, so every one is its own group
+		s.world:set(e, s.net.Private, { [player] = true, [players[(i * 7) % #players + 1]] = true })
+		s.world:add(e, s.net.Replicated)
+		s.world:set(e, s.defs.Health, i)
+		s.world:set(e, inline_s, i + 0.5)
+		s.world:set(e, pair(s.defs.Likes, target), `like{i}`)
+	end
+end
+
+local function expect_fragmented_counts(env, inline_s, players, label)
+	local s = env.server
+	s.net.set_packet_stats(true)
+	stage_fragmented_frame(env, players, inline_s)
+	local packets = s.net.generate_packets()
+	local stats = s.net.get_packet_stats()
+	expect_stats_add_up(stats, packet_buffers(packets), label)
+	local descriptions = {}
+	for _, packet in packets do
+		table.insert(descriptions, s.net.describe_packet(packet))
+	end
+	expect(expect_stats_match_descriptions(stats, descriptions, label) >= 4, `{label}: every component compared`)
+	-- broadcast reaches everyone: sent is exactly the client count times encoded
+	local inventory = stats.components[s.defs.Inventory]
+	expect_equal(
+		inventory.sent_bytes,
+		#players * inventory.encoded_bytes,
+		`{label}: a broadcast's sent is k times encoded`
+	)
+	-- a pair counts under its relation, and fragmented changes are encoded per group
+	local likes = stats.components[s.defs.Likes]
+	expect(likes ~= nil, `{label}: pairs count under their relation`)
+	expect(likes.sent_bytes > likes.encoded_bytes, `{label}: each group's bytes reach both of its clients`)
+	expect_equal(stats.components[inline_s].side_values, 0, `{label}: inline values ride no side array`)
+	expect_equal(stats.components[s.defs.Health].side_values, 2 * #players, `{label}: hookless values are counted`)
+end
+
+test("the byte counters add up over fragmented visibility in one shard", function(env)
+	local s = env.server
+	local inline_s = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, inspect_f64_serdes)
+	local players = join_named_fillers(env, 8)
+	table.insert(players, env.player_a)
+	table.insert(players, env.player_b)
+	expect_fragmented_counts(env, inline_s, players, "one shard")
+end)
+
+test("the byte counters add up across shards", function(env)
+	local s = env.server
+	local inline_s = make_inspected_component(env, s.net.Networked, inspect_f64_serdes, inspect_f64_serdes)
+	local players = join_named_fillers(env, 40) -- 42 clients over two shards
+	table.insert(players, env.player_a)
+	table.insert(players, env.player_b)
+	local second_shard = 0
+	for _, player in players do
+		if s.net._client_shard(player) == 2 then
+			second_shard += 1
+		end
+	end
+	expect_equal(second_shard, 10, "the population spans two shards")
+	expect_fragmented_counts(env, inline_s, players, "two shards")
+end)
+
+test("the byte counters count joiners' and fresh clients' full packets, not the deltas they replace", function(env)
+	local s = env.server
+	local e = s.world:entity()
+	s.world:add(e, s.net.Replicated)
+	s.world:set(e, s.defs.Health, 1)
+	s.net.generate_packets()
+
+	s.net.set_packet_stats(true)
+	s.world:set(e, s.defs.Health, 2) -- a delta for both A and B
+	s.net.mark_client_fresh(env.player_a) -- A's delta is replaced by a full
+	s.net.add_client(fake_player("Joiner"))
+	local packets = s.net.generate_packets()
+	local stats = s.net.get_packet_stats()
+	expect_stats_add_up(stats, packet_buffers(packets), "fulls")
+	expect_equal(stats.packets, 3, "B's delta and two fulls")
+	local descriptions = {}
+	for _, packet in packets do
+		table.insert(descriptions, s.net.describe_packet(packet))
+	end
+	expect_stats_match_descriptions(stats, descriptions, "fulls")
+	-- the delta's section is encoded once for A and B together, A's copy discarded; each full encodes its own
+	local health = stats.components[s.defs.Health]
+	expect_equal(health.encoded_bytes, 3 * 9, "the shared delta section plus each full's own")
+	expect_equal(health.sent_bytes, 3 * 9, "B's delta and the two fulls, A's replaced delta excluded")
+end)
+
+-- a frame of unreliable values split over several chunks, with one entity whitelisted to player A alone; the
+-- counters and the described chunks must agree byte for byte
+local function expect_chunk_counts(env, label)
+	local s = env.server
+	local comp_s = make_inspected_component(env, s.net.NetworkedUnreliable, inspect_f64_serdes, inspect_f64_serdes)
+	for i = 1, 11 do
+		local e = s.world:entity()
+		s.world:add(e, s.net.Replicated)
+		s.world:set(e, comp_s, i + 0.5)
+	end
+	local private = s.world:entity()
+	s.world:set(private, s.net.Private, { [env.player_a] = true })
+	s.world:add(private, s.net.Replicated)
+	s.world:set(private, comp_s, 0.25)
+	s.net.generate_packets()
+
+	s.net.set_packet_stats(true)
+	local chunks_by_client = s.net.generate_unreliable_chunks(60)
+	local stats = s.net.get_chunk_stats()
+	local buffers = chunk_buffers(chunks_by_client)
+	expect_stats_add_up(stats, buffers, label)
+	expect_equal(stats.overhead_bytes, 5 * #buffers, `{label}: every chunk header is overhead`)
+	local descriptions = {}
+	for _, chunk in buffers do
+		table.insert(descriptions, s.net.describe_chunk(chunk))
+	end
+	expect_stats_match_descriptions(stats, descriptions, label)
+
+	-- encoded counts each group's chunks once, continuation headers included: the broadcast values' chunks plus
+	-- the private value's own
+	local clients = 0
+	for _ in chunks_by_client do
+		clients += 1
+	end
+	local entry = stats.components[comp_s]
+	expect_equal(entry.entries, 11 * clients + 1, `{label}: every value once per recipient`)
+	expect(entry.encoded_bytes < entry.sent_bytes, `{label}: shared chunks are encoded once`)
+	return entry, chunks_by_client
+end
+
+test("the chunk counters add up across split chunks in one shard", function(env)
+	local entry, chunks_by_client = expect_chunk_counts(env, "chunks, one shard")
+	-- B sees only the broadcast values, so their chunks are exactly the shared encoding
+	local b_bytes = 0
+	for _, chunk in chunks_by_client[env.player_b] do
+		b_bytes += buffer.len(chunk) - 5
+	end
+	expect(entry.encoded_bytes > b_bytes, "the private value's chunk is encoded on top of the shared ones")
+	expect_equal(entry.sent_bytes, 2 * b_bytes + (entry.encoded_bytes - b_bytes), "shared twice, private once")
+end)
+
+test("the chunk counters add up across shards", function(env)
+	join_fillers(env, 40)
+	expect_chunk_counts(env, "chunks, two shards")
+end)
+
 -- 17) serdes
 
 -- symmetric hooks used by the serdes tests; sizeless (omits size entirely),
@@ -17549,8 +18320,8 @@ test("docs/api.md has a heading for every server and client export", function(en
 
 	-- the floors are today's public surfaces exactly, so an export that disappears from an instance fails here
 	-- too rather than quietly shrinking what this test covers; raise them when the surface really grows
-	expect(server_keys >= 26, `only {server_keys} server exports were checked against docs/api.md`)
-	expect(client_keys >= 14, `only {client_keys} client exports were checked against docs/api.md`)
+	expect(server_keys >= 31, `only {server_keys} server exports were checked against docs/api.md`)
+	expect(client_keys >= 16, `only {client_keys} client exports were checked against docs/api.md`)
 end)
 
 test("docs/api.md documents no module-root, server, or client export that no longer exists", function(env)
@@ -17574,7 +18345,7 @@ test("docs/api.md documents no module-root, server, or client export that no lon
 
 	-- today's count of side-qualified headings exactly: a heading that stops reading as one -- demoted a level,
 	-- reformatted out of its backticks -- fails here instead of leaving this direction with less to check
-	expect(checked >= 41, `only {checked} side-qualified api.md headings were checked against the instances`)
+	expect(checked >= 48, `only {checked} side-qualified api.md headings were checked against the instances`)
 end)
 
 test("the spec's warnings-and-errors appendix quotes every message the sources raise", function()

@@ -109,6 +109,47 @@ At the fragmented extreme every value is its own one-entry section — 6 bytes o
 
 Hookless values never enter the buffer: each hookless section contributes one array to the packet's `values`, and sending those is the transport's business. On a Roblox remote, every element costs a type tag plus its payload — a plain number lands around 9 bytes, and a table a multiple of that — plus framing for the arrays themselves, so a hookless value's true wire cost is usually several times its 3-byte buffer share. That is the deliberate day-one trade: ship without writing any encodings, then move your chattiest components onto [serdes hooks](008-serdes.md), where the same value costs its encoded bytes and nothing else. The tables above tell you which components are worth the trip — it is almost always the ones in the [unreliable channel](#the-unreliable-channel) and whatever dominates your join snapshot.
 
+## Measuring your own traffic
+
+The tables above price representative frames; your game's frames are your own. Two tools measure them directly. The server's byte counters total every `generate_packets` (and `generate_unreliable_chunks`) call per component, and are off until you turn them on:
+
+```lua
+net.set_packet_stats(true)
+
+RunService.Heartbeat:Connect(function()
+	for client, packet in net.generate_packets() do
+		remote:FireClient(client, packet)
+	end
+
+	local stats = net.get_packet_stats() -- this call's numbers only
+	if stats and stats.sent_bytes > 20_000 then
+		print(`{stats.packets} packets, {stats.sent_bytes} B, {stats.overhead_bytes} B of it overhead`)
+		for component, entry in stats.components do
+			local name = world:get(component, jecs.Name) or tostring(component)
+			print(`{name}: {entry.sent_bytes} B sent, {entry.encoded_bytes} B encoded, {entry.side_values} side values`)
+		end
+	end
+end)
+```
+
+Each component reports two byte counts. `encoded_bytes` counts its bytes once for every group of clients receiving the same bytes; `sent_bytes` counts them once per client, which is what actually leaves the server. Worked through for the smallest case — one hookless `Health` change on an entity all 30 connected clients can see — the change is one 9-byte section (6 bytes of framing and the entity's 3-byte id), so `Health` reports `encoded_bytes = 9` and `sent_bytes = 270`, with `entries = 30` and `side_values = 30`. The call returns 30 packets of 15 bytes: `sent_bytes = 450`, of which `overhead_bytes = 180` is each packet's 6-byte header, and the 270 left is exactly `Health`'s share. Had the same change been visible to only 10 of them, `encoded_bytes` would stay 9 while `sent_bytes` dropped to 90 — which is how filters show up in these numbers. Pairs count under their relation, and every byte of every packet lands in exactly one place: the per-component `sent_bytes` plus `overhead_bytes` always add up to the call's `sent_bytes`.
+
+The counters size what lands in packet buffers. Values without serdes hooks are counted (`side_values`) rather than sized, since their real cost is whatever your transport spends on [the side array](#the-side-array) — so a component with a large `side_values` count is your first candidate for hooks.
+
+To look inside a single packet, `describe_packet` turns it into a readable table — on the server right after generating it, or on a client as it arrives:
+
+```lua
+for client, packet in net.generate_packets() do
+	local description = net.describe_packet(packet)
+	for _, section in description.sections do
+		local label = section.name or `{section.relation_name}({section.target_name})`
+		print(label, section.bytes, #section.ids, section.value_bytes)
+	end
+end
+```
+
+Every section reports its bytes, how many of them are encoded values, and the entities and values it carries, with names resolved wherever the describing side knows them; `describe_chunk` does the same for an unreliable chunk. Neither changes anything, so both are safe to call on live traffic, and neither costs anything until called. The [spec](../spec.md#debugging-traffic-server--client) lists every field.
+
 ## Refreshing the numbers
 
 ```sh

@@ -248,6 +248,96 @@ Builds the always-replicate chunks (see Unreliable values under Concepts) in a s
 
 `chunk_bytes` caps each returned buffer's size and must be an integer in `[19, 65535]` — both bounds are what the wire layout allows rather than round numbers: 19 bytes is the smallest budget an empty chunk can fit one cell of any section into (a pair section's header is the widest), and a chunk section's length field is a `u16`. It defaults to 980, sized for Roblox's 1000-byte unreliable remote limit with headroom for the event's own envelope. Chunk buffers are **shared by reference** between clients with equal visibility and must never be mutated. Clients with nothing visible are omitted from the returned map, and generating with no `NetworkedUnreliable` definitions returns an empty map. A serdes `encode` failure during generation is contained like `generate_packets`' — the offending values are pruned with a warning and the rest of the call's chunks ship — and values without resolvable serdes hooks, or too large to fit even an empty chunk, are dropped the same way; the always-replicate cadence re-sends (and re-reports) the dropped values each call until the hook or value is fixed — see Serdes.
 
+## Debugging Traffic (server & client)
+
+Two tools answer "where do my bytes go" without reading wire buffers by hand: a **packet inspector** on both instances, turning one packet or chunk into a readable table, and opt-in **byte counters** on the server, totalling every call's output per component. Neither changes the wire format, and neither affects replication: describing never reconciles, mutates, or warns, and the counters only observe what the generate calls produce.
+
+The tables both return are part of the public API and follow its normal compatibility promise: a minor release may add fields to them, but never removes a field or changes what one means. Read the fields you need rather than comparing whole tables.
+
+### Packet inspection
+
+`describe_packet` and `describe_chunk` exist on both instances and share one implementation, differing only in how each side resolves the ids a packet carries: the server against its own world, the client through its entity mapping. Byte sizes never depend on that resolution — every size comes from the packet's own length and count fields — so a section whose ids don't resolve, whose serdes hooks are missing on the describing side, or whose `decode` hook throws still reports its exact bytes; only its values are left out.
+
+### `describe_packet(packet: Packet) -> PacketDescription`
+Describes one reliable packet. The version byte is validated first, exactly like `reconcile_packet` (a mismatched wire version, or a chunk passed here, errors). Returns:
+
+```lua
+{
+    frame: number,             -- the packet frame (see get_packet_frame)
+    bytes: number,             -- buffer.len(packet.data)
+    header_bytes: number,      -- version, frame, flags, and list counts
+    entity_list_bytes: number, -- the creation and deletion lists
+    names_bytes: number,       -- the name announcements and retractions
+    created: { EntityDescription },   -- in packet order: { id, entity?, name? }
+    deleted: { EntityDescription },
+    names: { NameDescription },       -- in packet order: { id, entity?, name?, retracted }
+    sections: { SectionDescription }, -- in packet order, below
+    components: { [number]: ComponentDescription }, -- per-component totals, below
+}
+```
+
+`header_bytes + entity_list_bytes + names_bytes` plus every section's `bytes` is exactly `bytes`.
+
+**Ids** are the raw ids the packet carries, never translated: section ids and the deletion list hold the dense (index) half of each server id, while the creation and names lists hold full generation-qualified ids — the same split described under `reconcile_packet`. Each id is paired with the **local entity** it names on the describing side, or `nil` when it names nothing: on the server, the live entity currently holding that dense id (a generation-qualified id resolves only while that exact entity lives), read as the world stands when `describe_packet` runs — so describing right after `generate_packets` names everything the packet carries, while an entity deleted since, typically a deletion entry's, resolves to `nil`; on the client, the live client entity mapped to the id (a generation-qualified id must match the mapping's generation, as in `get_client_entity`). A **name** is the packet's own announcement for the id when it carries one, else the local entity's `jecs.Name`, else `nil` — so a client describing a packet before reconciling it sees the names that packet is about to map even though the ids don't resolve yet. A names-list entry's `name` is the announced name; for a retraction (`retracted = true`) it is the name the describing world resolves for the id, if any.
+
+**Sections** appear in packet order, one entry per section — except that a pair section carrying several targets of one relation (`layout = "grouped"`) appears as one entry per target, consecutively, its shared framing (the section's flags, length, relation id, and target count) divided evenly across those entries with any remainder bytes going one each to the earliest, so the entries' `bytes` sum to the section's size. Every other section has `layout = "plain"`. Each entry:
+
+```lua
+{
+    component: number,        -- the component's raw id, or the packed pair id for a pair
+    relation: number?,        -- a pair's raw relation and target ids
+    target: number?,
+    name: string?,            -- the component's name (unpaired sections)
+    relation_name: string?,   -- a pair's relation and target names
+    target_name: string?,
+    entity: Id?,              -- the local component, or the local pair when both halves resolve
+    layout: "plain" | "grouped",
+    bytes: number,            -- the whole section's bytes (one target's, for "grouped")
+    value_bytes: number,      -- of those, the serdes-encoded values, length prefixes included
+    ids: { number },          -- entities whose value is set (empty when none)
+    values: { any }?,         -- their values, index-aligned with ids
+    nulled: { number }?,      -- entities holding the component with no value
+    removed: { number }?,     -- entities the component is removed from
+    side_values: number,      -- values riding the packet's side array rather than its buffer
+}
+```
+
+`values` holds the decoded values when the describing side resolves the section's component — both halves, for a pair — and has serdes hooks for it; decoding runs through that side's own hooks, contained: a `decode` hook that throws, or values that don't decode to exactly the section's value bytes (a static `size` declared differently on the two sides), leave `values` `nil` for that section alone, without a warning. Values without hooks are read off the packet's side array instead and are always present — as copies, never the packet's own arrays. `nulled` and `removed` are `nil` when the section carries none.
+
+**Per-component totals** (`components`) sum the sections sharing a `component` key: `{ bytes, value_bytes, entries, side_values, name?, relation_name?, target_name? }`, where `entries` counts every id the sections list (set, nulled, and removed alike). Each concrete pair is its own entry, keyed by its packed pair id like its sections — unlike the server's byte counters below, which total a relation's pairs under the relation.
+
+### `describe_chunk(chunk: buffer) -> ChunkDescription`
+Describes one unreliable chunk, validating its version byte first like `reconcile_chunk`. The same shape without the entity lists, names, and removals: `{ frame, bytes, header_bytes, sections, components }`, where `frame` is the chunk frame, `header_bytes` the chunk's 5-byte header, and every section is `"plain"` with `removed` always `nil` and `side_values` always 0 (chunk values are always serdes-encoded). A component whose values span several chunks appears once per chunk carrying it, each with its own section framing. `header_bytes` plus every section's `bytes` is exactly `bytes`.
+
+### Byte counters
+
+The server's counters total what each generate call produced, per component, in two numbers that answer different questions: the bytes **encoded** — a section is encoded once for every group of clients receiving the same bytes, so this is the server's encoding work, and what the traffic would cost if one copy reached everyone — and the bytes **sent**, summed over every recipient, which is the server's actual upload. A change visible to `k` clients has sent bytes exactly `k` times its encoded bytes.
+
+### `set_packet_stats(enabled: boolean)`
+Server only. Turns the counters on or off; they start off. While on, every `generate_packets` and `generate_unreliable_chunks` call builds a new stats table for that call alone — readings are never cumulative, so there is nothing to reset — and the getters below return the most recent one. Turning the counters off discards the last readings, so both getters return `nil` until a call runs with them on again; turning them on takes effect from the next call. While off they cost next to nothing — no work per value or per client, only a check per group of clients sharing bytes — and while on, the extra work grows with the number of sections and packets produced, not the number of values.
+
+### `get_packet_stats() -> PacketStats?`
+Server only. The counters for the most recent `generate_packets` call, or `nil` while the counters are off or before any call has run since they were turned on:
+
+```lua
+{
+    packets: number,          -- packets returned
+    sent_bytes: number,       -- their total bytes (buffer.len of every packet's data)
+    overhead_bytes: number,   -- of those, headers, entity lists, and name announcements, summed per packet
+    components: { [Id]: {    -- keyed by component definition; a pair counts under its relation
+        encoded_bytes: number,  -- section bytes, once per group of clients receiving them
+        sent_bytes: number,     -- section bytes summed over every recipient
+        entries: number,        -- set, nulled, and removed entries, summed over every recipient
+        side_values: number,    -- values riding the side array, summed over every recipient
+    } },
+}
+```
+
+Every byte of every returned packet is counted exactly once: `overhead_bytes` plus every component's `sent_bytes` equals `sent_bytes`. A **pair** counts under its relation's definition, every target together (a definition used both as a component and as a relation shares one entry), and a section's own framing counts toward its component. Values without serdes hooks are **counted, not sized** (`side_values`): their bytes are whatever your transport spends serializing the side array (see the bandwidth guide), so only the 3-byte entity id each one adds to the buffer is in the byte totals. Joiners' full packets and freshly-marked clients' fulls count in both numbers, each its own encoding sent to one recipient; a fresh client's delta, which the full replaces before the call returns, counts nowhere.
+
+### `get_chunk_stats() -> PacketStats?`
+Server only. The same table for the most recent `generate_unreliable_chunks` call: `packets` counts chunk buffers summed over every client, each chunk's 5-byte header is overhead, and a component whose values span several chunks counts the section framing each continuation chunk repeats. A call that produces nothing (no visible unreliable values) still records an all-zero table while the counters are on.
+
 ## Client Lifecycle (server)
 
 Client slots must be driven by the caller — on Roblox, typically from `Players.PlayerAdded`/`PlayerRemoving` in the same system that calls `generate_packets`. Drive both before calling `generate_packets`.
@@ -460,6 +550,12 @@ The value type of the `Serdes` component (see Serdes above). Values passed to th
 
 ### `RemovedOverride`
 `(Entity) -> ()` — signature of a removed override handler.
+
+### `PacketDescription`, `ChunkDescription`, `SectionDescription`, `ComponentDescription`, `EntityDescription`, `NameDescription`
+The tables `describe_packet` and `describe_chunk` return, and the records they are built from; every field is listed under Packet inspection above.
+
+### `PacketStats` & `ComponentStats`
+The table `get_packet_stats` and `get_chunk_stats` return, and its per-component entry; every field is listed under Byte counters above.
 
 ## Appendix: Warnings and Errors
 
