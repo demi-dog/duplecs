@@ -80,6 +80,10 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- (see delete_client_entities)
 	local ECS_ID_DELETE = jecs.ECS_ID_DELETE
 
+	-- the component-record flag bit jecs reads to make a relation's pairs replace one another on an entity (see
+	-- clear_exclusive)
+	local ECS_ID_IS_EXCLUSIVE = jecs.ECS_ID_IS_EXCLUSIVE
+
 	-- jecs never replaces this container on a live world (unlike world.archetypes, which world:cleanup
 	-- rebuilds), so the record walks share one fetch
 	local component_index = world.component_index
@@ -790,6 +794,50 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- RECONCILE
 
+	-- jecs 0.11.0 bug (jecs#323): giving an entity a pair of an exclusive relation (jecs.ChildOf, say) while it
+	-- holds another pair of that relation moves it along an archetype edge jecs links one way only, which
+	-- archetype destruction never unlinks -- whether world:cleanup reclaimed the destination while empty, or a
+	-- deletion of the target destroyed it and the next pair aimed at the target's recycled dense id is the same
+	-- pair id (pairs pack only dense halves). the next replacement along the edge moves the entity into the
+	-- destroyed archetype, where world:has still finds the pair but queries and world:target miss it, and
+	-- world:delete errors. a server-side retarget reaches the client as an add of the new pair, the old pair's
+	-- removal possibly arriving after it, so reconcile applies the replacement itself: the held pair is removed
+	-- first, as jecs's own replacement would, and the new one lands from an archetype holding no pair of the
+	-- relation, over edges jecs links both ways and unlinks on destruction. remove once a fixed jecs is pinned.
+
+	-- the pair(relation, Wildcard) record when relation is exclusive, else nil. the flag is jecs's own, set at
+	-- the record's creation (a relation tagged jecs.Exclusive later never replaces its pairs, in jecs or here).
+	-- resolved once per list: a relation with no record has no pairs anywhere, so no entity in the list holds one
+	-- to replace.
+	local function resolve_exclusive(relation: Id?): jecs.ComponentRecord?
+		if relation == nil then
+			return nil
+		end
+		local idr_relation = component_index[pair(relation, jecs.Wildcard)]
+		if idr_relation == nil or not bit32.btest(idr_relation.flags, ECS_ID_IS_EXCLUSIVE) then
+			return nil
+		end
+		return idr_relation
+	end
+
+	-- removes the pair of the exclusive relation the entity holds, unless it is component itself (see above).
+	-- exclusivity keeps the relation's slice in types to at most one pair, which the record indexes directly.
+	local function clear_exclusive(entity: Entity, component: Id, idr_relation: jecs.ComponentRecord)
+		local record: jecs.Record? = jecs.record(world, entity)
+		if record == nil then
+			return
+		end
+		local archetype = record.archetype
+		local index = idr_relation.records[archetype.id]
+		if index == nil then
+			return
+		end
+		local held = archetype.types[index]
+		if held ~= component then
+			world:remove(entity, held)
+		end
+	end
+
 	-- the fused parse-and-apply loop for one list of serdes-encoded values at data[offset] -- `count` ids with
 	-- their values following the id list. each value decodes from a fresh value-sized buffer, its length read
 	-- off the u16 prefix unless the registration declares a static size. unmapped entities hop the value without
@@ -798,7 +846,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- application. decode runs under pcall: the framing gives every value's length before it decodes, so a
 	-- throwing hook skips exactly its own value and the stream stays aligned, where a mid-reconcile unwind would
 	-- lose the rest of the packet unrecoverably (deltas are exactly-once). returns the offset past the values,
-	-- the skipped count, and the first error; the caller owns the warning.
+	-- the skipped count, and the first error; the caller owns the warning. exclusive is the relation record
+	-- clear_exclusive replaces a held pair through, nil where no set can replace one.
 	local function apply_values(
 		data: buffer,
 		offset: number,
@@ -806,7 +855,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		count: number,
 		serdes: Serdes,
 		changed_override: ChangedOverride?,
-		guarded: boolean
+		guarded: boolean,
+		exclusive: jecs.ComponentRecord?
 	): (number, number, any)
 		local decode = serdes.decode
 		local static: number? = serdes.size
@@ -835,6 +885,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				elseif changed_override then
 					changed_override(entity, value)
 				else
+					if exclusive then
+						clear_exclusive(entity, component, exclusive)
+					end
 					world:set(entity, component, value)
 				end
 			end
@@ -845,14 +898,15 @@ local function create_client(world: World, shared_record: get_shared.Record)
 
 	-- the nulled-list counterpart: `count` ids whose cells are present but hold no value. with no override a tag
 	-- is added and a data component set to nil (world:add is a no-op on a present component and would leave a
-	-- stale value). guarded as in apply_values.
+	-- stale value). guarded and exclusive as in apply_values.
 	local function apply_nulled(
 		data: buffer,
 		offset: number,
 		component: Id,
 		count: number,
 		changed_override: ChangedOverride?,
-		guarded: boolean
+		guarded: boolean,
+		exclusive: jecs.ComponentRecord?
 	): number
 		-- resolved once per list: tag-ness is the same for every entry
 		local is_tag = changed_override == nil and jecs.is_tag(world, component)
@@ -862,10 +916,15 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			if entity ~= nil and (not guarded or world:has(entity, component)) then
 				if changed_override then
 					changed_override(entity)
-				elseif is_tag then
-					world:add(entity, component)
 				else
-					world:set(entity, component, nil)
+					if exclusive then
+						clear_exclusive(entity, component, exclusive)
+					end
+					if is_tag then
+						world:add(entity, component)
+					else
+						world:set(entity, component, nil)
+					end
 				end
 			end
 		end
@@ -894,6 +953,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if changed_override == nil then
 			changed_override = relation_changed
 		end
+		-- an override owns application, retargets included
+		local exclusive = if changed_override == nil then resolve_exclusive(relation) else nil
 
 		if ids_count > 0 then
 			if inline then
@@ -905,8 +966,16 @@ local function create_client(world: World, shared_record: get_shared.Record)
 				end
 				-- cast: fail never returns, but the solver doesn't treat user functions as diverging. one warning per
 				-- list carries the first error
-				local values_end, skipped, first_error =
-					apply_values(data, offset, component, ids_count, serdes :: Serdes, changed_override, false)
+				local values_end, skipped, first_error = apply_values(
+					data,
+					offset,
+					component,
+					ids_count,
+					serdes :: Serdes,
+					changed_override,
+					false,
+					exclusive
+				)
 				offset = values_end
 				if skipped > 0 then
 					warn(
@@ -922,6 +991,9 @@ local function create_client(world: World, shared_record: get_shared.Record)
 						if changed_override then
 							changed_override(entity, side[side_base + i])
 						else
+							if exclusive then
+								clear_exclusive(entity, component, exclusive)
+							end
 							world:set(entity, component, side[side_base + i])
 						end
 					end
@@ -930,7 +1002,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		end
 
 		if nulled_count > 0 then
-			offset = apply_nulled(data, offset, component, nulled_count, changed_override, false)
+			offset = apply_nulled(data, offset, component, nulled_count, changed_override, false, exclusive)
 		end
 
 		if removed_count > 0 then
@@ -1091,7 +1163,8 @@ local function create_client(world: World, shared_record: get_shared.Record)
 	-- server would never correct, the cell no longer being streamed. an override is invoked unguarded; it owns
 	-- application. a throwing decode is contained under this path's own warning: a poisoned value would
 	-- otherwise error every chunk carrying it, and chunks self-heal frame to frame, so the skipped cell is only
-	-- stale.
+	-- stale. the guard also means a chunk never retargets an exclusive relation, so no exclusive record passes
+	-- down.
 	local function apply_chunk_lists(
 		data: buffer,
 		offset: number,
@@ -1115,7 +1188,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 			end
 			-- cast: fail never returns, but the solver doesn't treat user functions as diverging
 			local values_end, skipped, first_error =
-				apply_values(data, offset, component, ids_count, serdes :: Serdes, changed_override, guarded)
+				apply_values(data, offset, component, ids_count, serdes :: Serdes, changed_override, guarded, nil)
 			offset = values_end
 			if skipped > 0 then
 				warn(
@@ -1127,7 +1200,7 @@ local function create_client(world: World, shared_record: get_shared.Record)
 		if nulled_count > 0 then
 			-- unreliable cells on the wire are never tags (the server streams only value-carrying cells), so these
 			-- always apply as data nulls
-			offset = apply_nulled(data, offset, component, nulled_count, changed_override, guarded)
+			offset = apply_nulled(data, offset, component, nulled_count, changed_override, guarded, nil)
 		end
 
 		return offset

@@ -15734,6 +15734,397 @@ test(
 	end
 )
 
+-- exclusive retargets (jecs#323). jecs 0.11.0 moves an entity gaining a pair of an exclusive relation while it
+-- holds another along an archetype edge it links one way only, and destroying the destination never unlinks
+-- it: the next retarget along the edge moves the entity into the destroyed archetype. the destination dies to
+-- world:cleanup reclaiming it while empty, or to its target's deletion -- the edge then waiting for the
+-- target's recycled dense id, which packs into the same pair id. a server-side retarget reaches the client as
+-- the new pair's add and the old pair's removal, each in its target's run, so the client applies the
+-- replacement itself (resolve_exclusive / clear_exclusive in client.luau).
+
+-- the bug's signature on a world, asserted as the precondition the client's workaround exists for: the
+-- retargeted entity holds the pair by world:has, yet world:parent and the pair's query miss it, and
+-- world:delete errors
+local function expect_retarget_into_destroyed_archetype(world, entity, target, label)
+	local message =
+		`precondition no longer holds ({label}): jecs no longer retargets an exclusive relation into a destroyed archetype -- if jecs fixed #323, retire the client's exclusive-retarget workaround (resolve_exclusive / clear_exclusive in client.luau) along with this test`
+	expect(world:has(entity, pair(jecs.ChildOf, target)), message)
+	expect(world:parent(entity) ~= target, message)
+	for queried in world:query(pair(jecs.ChildOf, target)) do
+		expect(queried ~= entity, message)
+	end
+	expect(not pcall(world.delete, world, entity), message)
+end
+
+test("jecs-bug precondition: the pinned jecs retargets an exclusive relation into a destroyed archetype", function()
+	-- the shapes the client's exclusive-retarget workaround guards against, on bare jecs worlds. once jecs fixes
+	-- #323 these fail, and the workaround can go with them.
+
+	-- the cleanup destruction: e1's first retarget links {ChildOf a} to {ChildOf b} one way, its return leaves
+	-- {ChildOf b} empty for world:cleanup, and e2's retarget follows the dangling edge
+	local world = jecs.world()
+	local a = world:entity()
+	local b = world:entity()
+	local e1 = world:entity()
+	world:add(e1, pair(jecs.ChildOf, a))
+	world:add(e1, pair(jecs.ChildOf, b))
+	world:add(e1, pair(jecs.ChildOf, a))
+	world:cleanup()
+	local e2 = world:entity()
+	world:add(e2, pair(jecs.ChildOf, a))
+	world:add(e2, pair(jecs.ChildOf, b))
+	expect_retarget_into_destroyed_archetype(world, e2, b, "cleanup")
+
+	-- the recycle destruction: keep holds {ChildOf a} alive, b's deletion destroys {ChildOf b}, and b2 reuses
+	-- b's dense id, so its pair is the dead one's and e3's retarget follows the dangling edge
+	local world2 = jecs.world()
+	local a2 = world2:entity()
+	local b1 = world2:entity()
+	local e3 = world2:entity()
+	world2:add(e3, pair(jecs.ChildOf, a2))
+	local keep = world2:entity()
+	world2:add(keep, pair(jecs.ChildOf, a2))
+	world2:add(e3, pair(jecs.ChildOf, b1))
+	world2:remove(e3, pair(jecs.ChildOf, b1))
+	world2:delete(e3)
+	world2:delete(b1)
+	local b2 = mint_recycled(world2, b1)
+	local e4 = world2:entity()
+	world2:add(e4, pair(jecs.ChildOf, a2))
+	world2:add(e4, pair(jecs.ChildOf, b2))
+	expect_retarget_into_destroyed_archetype(world2, e4, b2, "recycle")
+end)
+
+-- moves the subject between two targets of an exclusive relation on the server, removing the old pair before
+-- adding the new one (or setting it, given a value): the server world never takes jecs's one-way edge, so a
+-- recycled target can't corrupt the server side of the scenario too -- only the client's reconcile retargets
+local function move_server_pair(world, subject, relation, from, to, value)
+	world:remove(subject, pair(relation, from))
+	if value == nil then
+		world:add(subject, pair(relation, to))
+	else
+		world:set(subject, pair(relation, to), value)
+	end
+end
+
+-- the precondition every retarget test below depends on: the packet carries the subject's new pair of the
+-- relation in a section ahead of its old pair's removal, so reconcile retargets an entity still holding the
+-- old pair -- applied the other way round, remove-then-add avoids the one-way edge on its own, and the test
+-- would pass without exercising the workaround. run order follows the server's walk of its staged cells, not
+-- anything a test controls, so a reordering fails here, loudly. returns the adding section.
+local function expect_add_before_removal(packet, relation, subject, from, to)
+	local dense_subject = jecs.ECS_ID(subject)
+	local added_at = nil
+	local removed_at = nil
+	for index, section in packet.sections do
+		if section.relation == relation then
+			if section.target == jecs.ECS_ID(to) then
+				local nulled = section.nulled
+				if table.find(section.ids, dense_subject) or (nulled ~= nil and table.find(nulled, dense_subject)) then
+					added_at = index
+				end
+			elseif section.target == jecs.ECS_ID(from) then
+				local removed = section.removed
+				if removed ~= nil and table.find(removed, dense_subject) then
+					removed_at = index
+				end
+			end
+		end
+	end
+	expect(added_at ~= nil, "the packet adds the subject's new pair")
+	expect(removed_at ~= nil, "and removes its old one")
+	expect(
+		added_at < removed_at,
+		"precondition: the packet applies the new pair before the old pair's removal, or the retarget never reaches jecs's replacement"
+	)
+	return packet.sections[added_at]
+end
+
+-- the retarget landed whole on the client: the relation's target, its pair's query, and the value, given one
+local function expect_client_retarget(world, subject, relation, target, value)
+	expect_equal(world:target(subject, relation), target, "the subject's target")
+	local queried = false
+	for entity in world:query(pair(relation, target)) do
+		if entity == subject then
+			queried = true
+		end
+	end
+	expect(queried, "the subject is in its new pair's query")
+	if value ~= nil then
+		expect_equal(world:get(subject, pair(relation, target)), value, "the new pair's value")
+	end
+end
+
+-- deletes the subject on the server and asserts A's client reconciles the deletion -- the call a subject
+-- stranded in a destroyed archetype errors out of
+local function expect_deletion_reconciles(env, subject, client_subject)
+	env.server.world:delete(subject)
+	local packet = env.frame()[env.player_a]
+	expect_equal(packet.unreplicated[1], subject, "the packet deletes the subject")
+	local ok, err = pcall(env.apply, packet)
+	expect(ok, `the deletion reconciles: {err}`)
+	expect_equal(env.client.world:contains(client_subject), false, "and the client entity is gone")
+end
+
+-- a data relation exclusive on the client alone -- tagged jecs.Exclusive before any of its pairs exist, since
+-- jecs reads the flag when the pair(relation, Wildcard) record is created -- mapped, given the serdes hooks on
+-- both sides when passed, and networked. the server's copy stays non-exclusive so retarget_across_packets can
+-- stage the add a packet ahead of the removal: which of a single packet's two runs applies first follows the
+-- server's walk of its staged cells, and for this relation's ids that walk puts the removal first
+local function make_exclusive_relation(env, serdes)
+	local s, c = env.server, env.client
+	local relation = s.world:component()
+	local client_relation = c.world:component()
+	c.world:add(client_relation, jecs.Exclusive)
+	c.net.set_client_entity(relation, client_relation)
+	if serdes ~= nil then
+		s.world:set(relation, s.net.Serdes, serdes)
+		c.world:set(client_relation, c.net.Serdes, serdes)
+	end
+	s.world:add(relation, s.net.Networked)
+	return relation, client_relation
+end
+
+-- retargets the subject's pair of a make_exclusive_relation relation across two packets: the new pair's set,
+-- the server still holding the old pair, then the old pair's removal -- so A's client meets the set with the
+-- old pair held, exactly as a single packet applying its add first would deliver it. returns the first
+-- packet's adding section.
+local function retarget_across_packets(env, subject, relation, from, to, value)
+	local s = env.server
+	s.world:set(subject, pair(relation, to), value)
+	local packet = env.frame()[env.player_a]
+	local dense_subject = jecs.ECS_ID(subject)
+	local added = nil
+	for _, section in packet.sections do
+		if section.relation == relation then
+			local removed = section.removed
+			expect(
+				removed == nil or table.find(removed, dense_subject) == nil,
+				"precondition: the first packet removes no pair from the subject"
+			)
+			if section.target == jecs.ECS_ID(to) and table.find(section.ids, dense_subject) then
+				added = section
+			end
+		end
+	end
+	expect(added ~= nil, "the first packet sets the subject's new pair")
+	env.apply(packet)
+	s.world:remove(subject, pair(relation, from))
+	env.sync(env.player_a)
+	return added
+end
+
+test("a ChildOf retarget survives the client's cleanup of the archetype its last retarget left", function(env)
+	-- the cleanup destruction through reconcile. ChildOf is a tag relation, so its adds arrive nulled
+	-- (apply_nulled's world:add): the item's first move links the client's A archetype to its B one, its return
+	-- empties the B archetype for the client's world:cleanup, and the second item's move retargets from A to B
+	local s, c = env.server, env.client
+	local storage_a = s.world:entity()
+	local storage_b = s.world:entity()
+	s.world:add(storage_a, s.net.Replicated)
+	s.world:add(storage_b, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:add(item, pair(jecs.ChildOf, storage_a))
+	env.sync(env.player_a)
+	local la = c.net.get_client_entity(storage_a)
+	local lb = c.net.get_client_entity(storage_b)
+	local li = c.net.get_client_entity(item)
+
+	move_server_pair(s.world, item, jecs.ChildOf, storage_a, storage_b)
+	local packet = env.frame()[env.player_a]
+	expect_add_before_removal(packet, jecs.ChildOf, item, storage_a, storage_b)
+	env.apply(packet)
+	expect_equal(c.world:parent(li), lb, "the item moved to B")
+	move_server_pair(s.world, item, jecs.ChildOf, storage_b, storage_a)
+	env.sync(env.player_a)
+	expect_equal(c.world:parent(li), la, "and back to A")
+	c.world:cleanup()
+
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:add(other, pair(jecs.ChildOf, storage_a))
+	env.sync(env.player_a)
+	local lo = c.net.get_client_entity(other)
+	move_server_pair(s.world, other, jecs.ChildOf, storage_a, storage_b)
+	local packet2 = env.frame()[env.player_a]
+	expect_add_before_removal(packet2, jecs.ChildOf, other, storage_a, storage_b)
+	env.apply(packet2)
+	expect_equal(c.world:parent(lo), lb, "the second item's parent is B")
+	expect_client_retarget(c.world, lo, jecs.ChildOf, lb)
+	local children = {}
+	for child in c.world:children(lb) do
+		table.insert(children, child)
+	end
+	expect(table.find(children, lo) ~= nil, "B's children list the second item")
+
+	expect_deletion_reconciles(env, other, lo)
+end)
+
+test("a ChildOf retarget to a target reusing a deleted target's client id lands on the new target", function(env)
+	-- the recycle destruction through reconcile: the item's first move links the client's A archetype to its B
+	-- one, the item returns to A (keeping the A archetype alive), B's deletion destroys the B archetype, and B2's
+	-- client entity reuses B's dense id -- so the item's move to B2 retargets by the dead pair id
+	local s, c = env.server, env.client
+	local storage_a = s.world:entity()
+	local storage_b = s.world:entity()
+	s.world:add(storage_a, s.net.Replicated)
+	s.world:add(storage_b, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:add(item, pair(jecs.ChildOf, storage_a))
+	env.sync(env.player_a)
+	local la = c.net.get_client_entity(storage_a)
+	local lb = c.net.get_client_entity(storage_b)
+	local li = c.net.get_client_entity(item)
+
+	move_server_pair(s.world, item, jecs.ChildOf, storage_a, storage_b)
+	local packet = env.frame()[env.player_a]
+	expect_add_before_removal(packet, jecs.ChildOf, item, storage_a, storage_b)
+	env.apply(packet)
+	expect_equal(c.world:parent(li), lb, "the item moved to B")
+	move_server_pair(s.world, item, jecs.ChildOf, storage_b, storage_a)
+	env.sync(env.player_a)
+	expect_equal(c.world:parent(li), la, "and back to A")
+
+	s.world:delete(storage_b)
+	env.sync(env.player_a)
+	expect_equal(c.world:contains(lb), false, "the client deleted B")
+	local storage_b2 = s.world:entity()
+	s.world:add(storage_b2, s.net.Replicated)
+	env.sync(env.player_a)
+	local lb2 = c.net.get_client_entity(storage_b2)
+	expect(
+		lb2 ~= nil and jecs.ECS_ID(lb2) == jecs.ECS_ID(lb) and lb2 ~= lb,
+		"precondition: the client did not recycle B's dense id for B2, scenario cannot be tested"
+	)
+
+	move_server_pair(s.world, item, jecs.ChildOf, storage_a, storage_b2)
+	local packet2 = env.frame()[env.player_a]
+	expect_add_before_removal(packet2, jecs.ChildOf, item, storage_a, storage_b2)
+	env.apply(packet2)
+	expect_equal(c.world:parent(li), lb2, "the item's parent is B2")
+	expect_client_retarget(c.world, li, jecs.ChildOf, lb2)
+	local children = {}
+	for child in c.world:children(lb2) do
+		table.insert(children, child)
+	end
+	expect(table.find(children, li) ~= nil, "B2's children list the item")
+
+	expect_deletion_reconciles(env, item, li)
+end)
+
+test("a hookless exclusive data pair's retarget survives the client's cleanup", function(env)
+	-- the cleanup destruction through the side-array set loop: a data relation without serdes hooks carries its
+	-- values hookless
+	local s, c = env.server, env.client
+	local Slot, CSlot = make_exclusive_relation(env, nil)
+	local container_a = s.world:entity()
+	local container_b = s.world:entity()
+	s.world:add(container_a, s.net.Replicated)
+	s.world:add(container_b, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, pair(Slot, container_a), 1)
+	env.sync(env.player_a)
+	local la = c.net.get_client_entity(container_a)
+	local lb = c.net.get_client_entity(container_b)
+	local li = c.net.get_client_entity(item)
+
+	retarget_across_packets(env, item, Slot, container_a, container_b, 2)
+	expect_equal(c.world:get(li, pair(CSlot, lb)), 2, "the item moved to B")
+	move_server_pair(s.world, item, Slot, container_b, container_a, 3)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(li, pair(CSlot, la)), 3, "and back to A")
+	c.world:cleanup()
+
+	local other = s.world:entity()
+	s.world:add(other, s.net.Replicated)
+	s.world:set(other, pair(Slot, container_a), 4)
+	env.sync(env.player_a)
+	local lo = c.net.get_client_entity(other)
+	local added = retarget_across_packets(env, other, Slot, container_a, container_b, 5)
+	expect_equal(added.side_values, 1, "the new pair's value rode the side array")
+	expect_client_retarget(c.world, lo, CSlot, lb, 5)
+
+	expect_deletion_reconciles(env, other, lo)
+end)
+
+test("an inline-serdes exclusive data pair's retarget to a recycled target's client id lands", function(env)
+	-- the recycle destruction through apply_values: the relation's serdes hooks pack its values inline
+	local s, c = env.server, env.client
+	local Slot, CSlot = make_exclusive_relation(env, f64_serdes)
+	local container_a = s.world:entity()
+	local container_b = s.world:entity()
+	s.world:add(container_a, s.net.Replicated)
+	s.world:add(container_b, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, pair(Slot, container_a), 1.5)
+	env.sync(env.player_a)
+	local la = c.net.get_client_entity(container_a)
+	local lb = c.net.get_client_entity(container_b)
+	local li = c.net.get_client_entity(item)
+
+	retarget_across_packets(env, item, Slot, container_a, container_b, 2.5)
+	expect_equal(c.world:get(li, pair(CSlot, lb)), 2.5, "the item moved to B")
+	move_server_pair(s.world, item, Slot, container_b, container_a, 3.5)
+	env.sync(env.player_a)
+	expect_equal(c.world:get(li, pair(CSlot, la)), 3.5, "and back to A")
+
+	s.world:delete(container_b)
+	env.sync(env.player_a)
+	expect_equal(c.world:contains(lb), false, "the client deleted B")
+	local container_b2 = s.world:entity()
+	s.world:add(container_b2, s.net.Replicated)
+	env.sync(env.player_a)
+	local lb2 = c.net.get_client_entity(container_b2)
+	expect(
+		lb2 ~= nil and jecs.ECS_ID(lb2) == jecs.ECS_ID(lb) and lb2 ~= lb,
+		"precondition: the client did not recycle B's dense id for B2, scenario cannot be tested"
+	)
+
+	local added = retarget_across_packets(env, item, Slot, container_a, container_b2, 4.5)
+	expect(added.side_values == 0 and added.value_bytes > 0, "the new pair's value was packed inline")
+	expect_client_retarget(c.world, li, CSlot, lb2, 4.5)
+
+	expect_deletion_reconciles(env, item, li)
+end)
+
+test("a changed override on an exclusive relation owns its retargets", function(env)
+	-- reconcile only replaces a held pair itself where it applies the new one: an override receives the
+	-- retarget with the old pair left in place, until its own removal arrives
+	local s, c = env.server, env.client
+	local Slot, CSlot = make_exclusive_relation(env, nil)
+	local container_a = s.world:entity()
+	local container_b = s.world:entity()
+	s.world:add(container_a, s.net.Replicated)
+	s.world:add(container_b, s.net.Replicated)
+	local item = s.world:entity()
+	s.world:add(item, s.net.Replicated)
+	s.world:set(item, pair(Slot, container_a), 1)
+	env.sync(env.player_a)
+	local la = c.net.get_client_entity(container_a)
+	local lb = c.net.get_client_entity(container_b)
+	local li = c.net.get_client_entity(item)
+
+	local calls = {}
+	c.net.set_changed_override(pair(CSlot, jecs.Wildcard), function(entity, value)
+		table.insert(calls, { entity = entity, value = value })
+	end)
+	s.world:set(item, pair(Slot, container_b), 2)
+	env.sync(env.player_a)
+	expect_equal(#calls, 1, "the override received the retarget")
+	expect_equal(calls[1].entity, li, "on the item")
+	expect_equal(calls[1].value, 2, "with the new pair's value")
+	expect_equal(c.world:get(li, pair(CSlot, la)), 1, "the item still holds its old pair")
+	expect_equal(c.world:has(li, pair(CSlot, lb)), false, "and the default set never applied")
+
+	s.world:remove(item, pair(Slot, container_a))
+	env.sync(env.player_a)
+	expect_equal(c.world:has(li, pair(CSlot, la)), false, "the old pair leaves with its own removal")
+end)
+
 -- 22) shared name mapping
 
 test("a named component auto-maps onto a same-named client component without set_client_entity", function(env)
